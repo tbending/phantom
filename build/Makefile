@@ -210,6 +210,33 @@ endif
     CONST_AV=yes
 endif
 
+#--GPU density solver (cosmoSPHere + Cornerstone octree)
+#  Usage: make GPU=yes GPU_TARGET=<a100|quadro_pascal|mi300>
+#         (cuda targets: module load cuda; hip targets: module load rocm/hipcc)
+#  GPU_TARGET selects a profile in Makefile_GPU (backend + arch) and is
+#  required when GPU=yes -- there is no default.  The same backend/arch is
+#  passed to the cosmoSPHere sub-make via the 'cosmosphere' target below.
+#  Default GPU=no preserves original phantom CPU behaviour with no code changes.
+GPU=no
+ifeq ($(GPU), yes)
+ifeq ($(GPU_TARGET),)
+    $(error GPU=yes requires GPU_TARGET to be set -- valid: a100, quadro_pascal, mi300 (see build/Makefile_GPU))
+endif
+    include Makefile_GPU
+    FPPFLAGS  += -DGPU
+    COSMO_DIR ?= $(RUNDIR)/../cosmoSPHere
+    LDFLAGS   += -L$(COSMO_DIR)/build -lcosmoSPHere
+ifeq ($(GPU_BACKEND), cuda)
+    CUDA_HOME ?= $(CUDA_INSTALL_PATH)
+    LDFLAGS   += -L$(CUDA_HOME)/lib64 -lcudart -lstdc++
+else ifeq ($(GPU_BACKEND), hip)
+    LDFLAGS   += -L$(ROCM_PATH)/lib -lamdhip64 -lstdc++
+else
+    $(error Unknown GPU_BACKEND=$(GPU_BACKEND) -- use 'cuda' or 'hip')
+endif
+    GPU_PREREQ = cosmosphere
+endif
+
 ifeq ($(DUST), yes)
     FPPFLAGS += -DDUST
     ifndef KERNEL
@@ -518,6 +545,7 @@ SOURCES= physcon.f90 ${CONFIG} ${SRCKERNEL} io.F90 units.f90 geometry.f90 \
          krome.F90 memory.f90 ${SRCRW_DUMPS} ${SRCINJECT} injection.f90 \
          H2regions.f90 subgroup.f90 \
          quitdump.f90 dens.F90\
+         gpu_dens_iface.F90\
          ptmass.F90 force.F90 deriv.f90 ${SRCAPR} readwrite_infile.f90 energies.f90 sort_particles.f90 \
          utils_shuffleparticles.F90 evwrite.f90 substepping.F90 step_leapfrog.f90 writeheader.f90 ${SRCAN} \
          mf_write.f90 egg.f90 evolve_utils.F90 evolve.f90 utils_linalg.f90 \
@@ -539,7 +567,14 @@ else
     .PHONY: phantom
 endif
 
-phantom: checksystem checkparams $(OBJECTS) phantom.o
+# Build the cosmoSPHere GPU density library with the same backend/arch that
+# GPU_TARGET selected, so a single `make GPU=yes` builds and links everything.
+.PHONY: cosmosphere
+cosmosphere:
+	$(MAKE) -C $(COSMO_DIR) lib GPU_BACKEND=$(GPU_BACKEND) \
+	    CUDA_ARCH="$(CUDA_ARCH)" HIP_ARCH=$(HIP_ARCH)
+
+phantom: checksystem checkparams $(GPU_PREREQ) $(OBJECTS) phantom.o
 	$(FC) $(FFLAGS) -o $(BINDIR)/$@ $(OBJECTS) phantom.o $(LDFLAGS)
 ifeq ($(UNAME), Darwin)
 	dsymutil $(BINDIR)/$@

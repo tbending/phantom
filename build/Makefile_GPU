@@ -1,0 +1,32 @@
+#----------------------------------------------------------------
+#  Makefile_GPU — named GPU target profiles for the cosmoSPHere
+#  density solver.  Selected with GPU_TARGET=<name> when GPU=yes.
+#
+#  Each profile sets:
+#     GPU_BACKEND   cuda | hip
+#     CUDA_ARCH     space-separated SM list (cuda backend; -> fat binary)
+#     HIP_ARCH      AMD gfx arch            (hip backend)
+#
+#  These are consumed both here (to pick the link libraries) and passed
+#  down to the cosmoSPHere sub-make so the library is built for the same
+#  target.  Analogous to how SYSTEM selects a compiler profile.
+#
+#  GPU_TARGET is required when GPU=yes; there is no default (the parent
+#  Makefile errors if it is unset).
+#----------------------------------------------------------------
+
+ifeq ($(GPU_TARGET), a100)
+#   NVIDIA A100 / A30 (Ampere GA100)
+    GPU_BACKEND = cuda
+    CUDA_ARCH   = 80
+else ifeq ($(GPU_TARGET), quadro_pascal)
+#   NVIDIA Quadro P-series (Pascal GP10x, e.g. P2000)
+    GPU_BACKEND = cuda
+    CUDA_ARCH   = 61
+else ifeq ($(GPU_TARGET), mi300)
+#   AMD Instinct MI300X / MI300A (CDNA3)
+    GPU_BACKEND = hip
+    HIP_ARCH    = gfx942
+else
+    $(error Unknown GPU_TARGET=$(GPU_TARGET) -- valid: a100, quadro_pascal, mi300)
+endif

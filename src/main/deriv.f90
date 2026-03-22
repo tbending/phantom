@@ -43,6 +43,7 @@ subroutine derivs(icall,npart,nactive,xyzh,vxyzu,fxyzu,fext,divcurlv,divcurlB,&
  use io,             only:iprint,fatal,error
  use neighkdtree,    only:build_tree
  use densityforce,   only:densityiterate
+ use gpu_dens_iface,  only:densityiterate_gpu,use_gpu_dens
  use ptmass,         only:ipart_rhomax,ptmass_calc_enclosed_mass,ptmass_boundary_crossing,get_pressure_on_sinks
  use externalforces, only:externalforce
  use part,           only:dustgasprop,Vrel_disp,dvdx,Bxyz,set_boundaries_to_active,&
@@ -132,15 +133,24 @@ subroutine derivs(icall,npart,nactive,xyzh,vxyzu,fxyzu,fext,divcurlv,divcurlB,&
 !
 
  if (icall==1) then
-    call densityiterate(1,npart,nactive,xyzh,vxyzu,divcurlv,divcurlB,Bevol,&
-                        stressmax,fxyzu,fext,alphaind,gradh,rad,radprop,dvdx,apr_level)
-    if (.not. fast_divcurlB) then
-       ! Repeat the call to calculate all the non-density-related quantities in densityiterate.
-       ! This needs to be separate for an accurate calculation of divcurlB which requires an up-to-date rho.
-       ! if fast_divcurlB = .false., then all additional quantities are calculated during the previous call
+    if (use_gpu_dens) then
+       !--GPU path: cosmoSPHere Newton-Raphson on GPU gives h and gradh(1,i)=1/omega
+       call densityiterate_gpu(npart,xyzh,gradh)
+       !--icall=3 always follows: recomputes divv, dvdx, alphaind, radprop
+       !  (quantities that would have been computed alongside density in icall=1
+       !   but are absent from the GPU solver output at this stage)
        call densityiterate(3,npart,nactive,xyzh,vxyzu,divcurlv,divcurlB,Bevol,&
                            stressmax,fxyzu,fext,alphaind,gradh,rad,radprop,dvdx,apr_level)
-       ! put a similar flag for pressure calculation from dens: call cons2primall/everyhting and densityiterate(3. Import pressure from eos_vars in dens and use it to calculate delta_v
+    else
+       !--CPU path: original phantom behaviour, unchanged
+       call densityiterate(1,npart,nactive,xyzh,vxyzu,divcurlv,divcurlB,Bevol,&
+                           stressmax,fxyzu,fext,alphaind,gradh,rad,radprop,dvdx,apr_level)
+       if (.not. fast_divcurlB) then
+          ! Repeat to calculate non-density quantities requiring up-to-date rho.
+          call densityiterate(3,npart,nactive,xyzh,vxyzu,divcurlv,divcurlB,Bevol,&
+                              stressmax,fxyzu,fext,alphaind,gradh,rad,radprop,dvdx,apr_level)
+          ! put a similar flag for pressure calculation from dens: call cons2primall/everyhting and densityiterate(3. Import pressure from eos_vars in dens and use it to calculate delta_v
+       endif
     endif
     set_boundaries_to_active = .false.     ! boundary particles are no longer treated as active
     call do_timing('dens',tlast,tcpulast)
