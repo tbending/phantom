@@ -1,6 +1,8 @@
 [submodule "octree-miniapp"]
 	path = octree-miniapp
-	url = https://github.com/sekelle/octree-miniapp.git
+	url = git@github.com:tbending/octree-miniapp.git
+	branch = phantom
 [submodule "cosmoSPHere"]
 	path = cosmoSPHere
 	url = git@github.com:tbending/cosmoSPHere.git
+	branch = phantom
