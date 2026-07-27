@@ -103,7 +103,9 @@ subroutine densityiterate_gpu(npart, xyzh, gradh)
                             real(massoftype(igas), kind=c_double))
 
  !--write results back to phantom arrays
+ !  Skip inactive/dead particles (xyzh(4,i) < 0 in phantom convention)
  do i = 1, npart
+    if (xyzh(4,i) < 0.) cycle   ! preserve negative h for inactive particles
     hi    = real(h8(i))
     rhoi  = real(rho8(i))
     drhoi = real(drhofh8(i))    ! d(rho)/d(h), normalised

@@ -44,6 +44,7 @@ subroutine derivs(icall,npart,nactive,xyzh,vxyzu,fxyzu,fext,divcurlv,divcurlB,&
  use neighkdtree,    only:build_tree
  use densityforce,   only:densityiterate
  use gpu_dens_iface,  only:densityiterate_gpu,use_gpu_dens
+ use dim,             only:calculate_density
  use ptmass,         only:ipart_rhomax,ptmass_calc_enclosed_mass,ptmass_boundary_crossing,get_pressure_on_sinks
  use externalforces, only:externalforce
  use part,           only:dustgasprop,Vrel_disp,dvdx,Bxyz,set_boundaries_to_active,&
@@ -136,11 +137,13 @@ subroutine derivs(icall,npart,nactive,xyzh,vxyzu,fxyzu,fext,divcurlv,divcurlB,&
     if (use_gpu_dens) then
        !--GPU path: cosmoSPHere Newton-Raphson on GPU gives h and gradh(1,i)=1/omega
        call densityiterate_gpu(npart,xyzh,gradh)
-       !--icall=3 always follows: recomputes divv, dvdx, alphaind, radprop
-       !  (quantities that would have been computed alongside density in icall=1
-       !   but are absent from the GPU solver output at this stage)
+       !--icall=3 computes divv/dvdx using GPU h; suppress CPU h-re-iteration
+       !  by clearing calculate_density (fast_divcurlB=.true. keeps it .true.
+       !  by default, which would re-iterate h and fight the GPU values)
+       calculate_density = .false.
        call densityiterate(3,npart,nactive,xyzh,vxyzu,divcurlv,divcurlB,Bevol,&
                            stressmax,fxyzu,fext,alphaind,gradh,rad,radprop,dvdx,apr_level)
+       calculate_density = .true.
     else
        !--CPU path: original phantom behaviour, unchanged
        call densityiterate(1,npart,nactive,xyzh,vxyzu,divcurlv,divcurlB,Bevol,&
