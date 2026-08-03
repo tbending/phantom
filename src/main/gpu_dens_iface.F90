@@ -86,6 +86,8 @@ subroutine densityiterate_gpu(npart, xyzh, vxyzu, fxyzu, fext, gradh, divcurlv, 
  use part, only:massoftype,igas
  use dim,  only:nalpha,maxdvdx,maxp
 #ifdef GPU
+ use io,   only:fatal
+ use dim,  only:curlv,mhd,use_dust,do_radiation,gravity
  use iso_c_binding, only:c_double,c_int
 #endif
  integer,      intent(in)    :: npart
@@ -106,6 +108,16 @@ subroutine densityiterate_gpu(npart, xyzh, vxyzu, fxyzu, fext, gradh, divcurlv, 
  integer :: i, c
 
  if (npart <= 0) return
+
+ !--the GPU sweep produces div v, dv/dx and d(div v)/dt for a single gas type.
+ !  Anything that needs a quantity it does not compute would silently get stale
+ !  values, so refuse rather than run: curl v (divcurlv(2:4)), div/curl B,
+ !  the 2-fluid dust density, radiation fluxes, and gradsoft in gradh(2,:).
+ if (curlv)        call fatal('densityiterate_gpu','curl v not computed on GPU (set curlv=F)')
+ if (mhd)          call fatal('densityiterate_gpu','divcurlB not computed on GPU')
+ if (use_dust)     call fatal('densityiterate_gpu','dust density not computed on GPU')
+ if (do_radiation) call fatal('densityiterate_gpu','radiation flux not computed on GPU')
+ if (gravity)      call fatal('densityiterate_gpu','gradsoft not computed on GPU')
 
  allocate(x8(npart), y8(npart), z8(npart), h8(npart))
  allocate(vx8(npart), vy8(npart), vz8(npart))
