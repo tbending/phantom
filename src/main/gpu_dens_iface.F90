@@ -23,11 +23,18 @@ module gpu_dens_iface
 !                                   without recompiling (useful for testing).
 !
 ! Outputs written back to phantom particle arrays:
-!   xyzh(4,i)  — converged smoothing length h_i
-!   gradh(1,i) — 1/omega_i  (phantom's Grad-h correction factor)
-!              where omega = 1 + (h/3*rho) * d(rho)/d(h)
+!   xyzh(4,i)     — converged smoothing length h_i
+!   gradh(1,i)    — 1/omega_i  (phantom's Grad-h correction factor)
+!                   where omega = 1 + (h/3*rho) * d(rho)/d(h)
+!   divcurlv(1,i) — div v
+!   dvdx(1:9,i)   — velocity gradient tensor
+!   alphaind(3,i) — d(div v)/dt, source term of the Cullen & Dehnen switch
 !
-! :Dependencies: iso_c_binding, part
+! The last three used to be produced by a CPU densityiterate(icall=3) sweep
+! run after the GPU solve; they are now computed on the GPU in one sweep at
+! the converged h, so the CPU no longer re-walks the kd-tree.
+!
+! :Dependencies: dim, iso_c_binding, kdtree, neighkdtree, part
 !
  implicit none
 
@@ -40,11 +47,15 @@ module gpu_dens_iface
 #ifdef GPU
 !--C interface to cosmoSPHere/src/dens_c_api.cu
  interface
-  subroutine densityiterate_gpu_c(h, rho, gradh_out, x, y, z, n, pmass) bind(C)
+  subroutine densityiterate_gpu_c(h, rho, gradh_out, divv, dvdx_out, ddivvdt, &
+                                  x, y, z, vx, vy, vz, ax, ay, az, n, pmass) bind(C)
    use iso_c_binding, only:c_double,c_int
    real(c_double), intent(inout) :: h(*)
    real(c_double), intent(out)   :: rho(*), gradh_out(*)
+   real(c_double), intent(out)   :: divv(*), dvdx_out(*), ddivvdt(*)
    real(c_double), intent(in)    :: x(*), y(*), z(*)
+   real(c_double), intent(in)    :: vx(*), vy(*), vz(*)
+   real(c_double), intent(in)    :: ax(*), ay(*), az(*)
    integer(c_int), value         :: n
    real(c_double), value         :: pmass
   end subroutine densityiterate_gpu_c
@@ -61,9 +72,7 @@ contains
 !  GPU density iteration: replaces densityiterate(icall=1,...).
 !
 !  Calls the cosmoSPHere Newton-Raphson + Cornerstone GPU solver,
-!  then converts outputs to phantom's array conventions:
-!    xyzh(4,i)  <- h_i   (converged smoothing length)
-!    gradh(1,i) <- 1/omega_i
+!  then converts outputs to phantom's array conventions.
 !
 !  Only gas particles (igas type) are passed to the GPU.
 !  pmass = massoftype(igas) from the part module.
@@ -73,37 +82,64 @@ contains
 !  is used in cosmoSPHere/include/kernel.hpp before compiling libcosmoSPHere.a.
 !+
 !-------------------------------------------------------------
-subroutine densityiterate_gpu(npart, xyzh, gradh)
+subroutine densityiterate_gpu(npart, xyzh, vxyzu, fxyzu, fext, gradh, divcurlv, dvdx, alphaind)
  use part, only:massoftype,igas
+ use dim,  only:nalpha,maxdvdx,maxp
 #ifdef GPU
  use iso_c_binding, only:c_double,c_int
 #endif
  integer,      intent(in)    :: npart
  real,         intent(inout) :: xyzh(:,:)
+ real,         intent(in)    :: vxyzu(:,:),fxyzu(:,:),fext(:,:)
  real(kind=4), intent(inout) :: gradh(:,:)
+ real(kind=4), intent(inout) :: divcurlv(:,:)
+ real(kind=4), intent(inout) :: dvdx(:,:)
+ real(kind=4), intent(inout) :: alphaind(:,:)
 
 #ifdef GPU
  real(c_double), allocatable :: x8(:), y8(:), z8(:), h8(:)
+ real(c_double), allocatable :: vx8(:), vy8(:), vz8(:)
+ real(c_double), allocatable :: ax8(:), ay8(:), az8(:)
  real(c_double), allocatable :: rho8(:), drhofh8(:)
+ real(c_double), allocatable :: divv8(:), dvdx8(:), ddivvdt8(:)
  real    :: hi, rhoi, drhoi, omega
- integer :: i
+ integer :: i, c
+
+ if (npart <= 0) return
 
  allocate(x8(npart), y8(npart), z8(npart), h8(npart))
+ allocate(vx8(npart), vy8(npart), vz8(npart))
+ allocate(ax8(npart), ay8(npart), az8(npart))
  allocate(rho8(npart), drhofh8(npart))
+ allocate(divv8(npart), dvdx8(9*npart), ddivvdt8(npart))
 
+ !$omp parallel do default(none) private(i) &
+ !$omp shared(npart,xyzh,vxyzu,fxyzu,fext,x8,y8,z8,h8,vx8,vy8,vz8,ax8,ay8,az8)
  do i = 1, npart
     x8(i) = real(xyzh(1,i), kind=c_double)
     y8(i) = real(xyzh(2,i), kind=c_double)
     z8(i) = real(xyzh(3,i), kind=c_double)
     h8(i) = real(abs(xyzh(4,i)), kind=c_double)
+    vx8(i) = real(vxyzu(1,i), kind=c_double)
+    vy8(i) = real(vxyzu(2,i), kind=c_double)
+    vz8(i) = real(vxyzu(3,i), kind=c_double)
+    !--the Cullen & Dehnen switch differentiates the TOTAL acceleration
+    ax8(i) = real(fxyzu(1,i) + fext(1,i), kind=c_double)
+    ay8(i) = real(fxyzu(2,i) + fext(2,i), kind=c_double)
+    az8(i) = real(fxyzu(3,i) + fext(3,i), kind=c_double)
  enddo
+ !$omp end parallel do
 
- call densityiterate_gpu_c(h8, rho8, drhofh8, x8, y8, z8, &
+ call densityiterate_gpu_c(h8, rho8, drhofh8, divv8, dvdx8, ddivvdt8, &
+                            x8, y8, z8, vx8, vy8, vz8, ax8, ay8, az8, &
                             int(npart, kind=c_int), &
                             real(massoftype(igas), kind=c_double))
 
  !--write results back to phantom arrays
  !  Skip inactive/dead particles (xyzh(4,i) < 0 in phantom convention)
+ !$omp parallel do default(none) private(i,c,hi,rhoi,drhoi,omega) &
+ !$omp shared(npart,xyzh,gradh,divcurlv,dvdx,alphaind) &
+ !$omp shared(h8,rho8,drhofh8,divv8,dvdx8,ddivvdt8,maxdvdx,maxp)
  do i = 1, npart
     if (xyzh(4,i) < 0.) cycle   ! preserve negative h for inactive particles
     hi    = real(h8(i))
@@ -112,6 +148,8 @@ subroutine densityiterate_gpu(npart, xyzh, gradh)
     xyzh(4,i) = hi
     !--convert to phantom's gradh(1,i) = 1/omega
     !  omega = 1 + (h/3*rho) * d(rho)/d(h)
+    !  NB: the GPU forms the same omega internally to normalise the gradients
+    !  below (sphGradientsKernel) -- keep the two in step.
     if (rhoi > 0. .and. hi > 0.) then
        omega = 1.0 + (hi / (3.0 * rhoi)) * drhoi
        if (omega > 0.) then
@@ -122,9 +160,21 @@ subroutine densityiterate_gpu(npart, xyzh, gradh)
     else
        gradh(1,i) = 1.0_4
     endif
+    divcurlv(1,i) = real(divv8(i), kind=4)
+    if (maxdvdx == maxp) then
+       do c = 1, 9
+          dvdx(c,i) = real(dvdx8(9*(i-1) + c), kind=4)
+       enddo
+    endif
+    if (nalpha >= 3) alphaind(3,i) = real(ddivvdt8(i), kind=4)
  enddo
+ !$omp end parallel do
 
- deallocate(x8, y8, z8, h8, rho8, drhofh8)
+ deallocate(x8, y8, z8, h8, vx8, vy8, vz8, ax8, ay8, az8)
+ deallocate(rho8, drhofh8, divv8, dvdx8, ddivvdt8)
+
+ !--the CPU kd-tree still serves the force loop, and it caches h
+ call sync_tree_h(xyzh)
 
 #else
  !--stub: should never be reached (use_gpu_dens is .false. without GPU)
@@ -133,5 +183,54 @@ subroutine densityiterate_gpu(npart, xyzh, gradh)
 #endif
 
 end subroutine densityiterate_gpu
+
+#ifdef GPU
+!-------------------------------------------------------------
+!+
+!  Push GPU-updated smoothing lengths back into the kd-tree.
+!
+!  The force loop reads neighbour smoothing lengths from treecache
+!  (kdtree.F90 fills xyzcache(4,:) = 1/treecache(4,:), which force.F90
+!  then uses as hj1), and sizes its neighbour search from each node's
+!  hmax.  Both were set when the tree was built, i.e. from the PREDICTED
+!  h, so without this the force loop would silently mix stale cached h
+!  with the converged h.  On the CPU path store_results/set_hmaxcell do
+!  the same refresh as the density iteration proceeds.
+!+
+!-------------------------------------------------------------
+subroutine sync_tree_h(xyzh)
+ use dim,         only:maxpsph
+ use part,        only:treecache
+ use kdtree,      only:inodeparts,inoderange
+ use neighkdtree, only:ncells,leaf_is_active,set_hmaxcell,get_hmaxcell
+ real, intent(in) :: xyzh(:,:)
+ integer :: icell,ip,i
+ real    :: hmaxcell,hmaxold
+
+ !$omp parallel do default(none) schedule(runtime) private(icell,ip,i,hmaxcell,hmaxold) &
+ !$omp shared(xyzh,treecache,inodeparts,inoderange,ncells,leaf_is_active,maxpsph)
+ do icell = 1, int(ncells)
+    if (leaf_is_active(icell) == 0) cycle   ! internal node or empty cell
+    hmaxcell = 0.
+    do ip = inoderange(1,icell), inoderange(2,icell)
+       i = inodeparts(ip)
+       if (i < 0 .or. i > maxpsph) cycle
+       treecache(4,ip) = xyzh(4,i)
+       hmaxcell = max(hmaxcell, xyzh(4,i))
+    enddo
+    !--only widen the search radius, never narrow it: hmax has to be an upper
+    !  bound on h in the cell, and set_hmaxcell walks to the root through a
+    !  critical section, so doing it for every cell every step serialises.
+    !  A cell whose h shrank keeps a conservative (too large) hmax, exactly as
+    !  on the CPU path, where set_hmaxcell only fires when h outgrows the cell.
+    if (hmaxcell > 0.) then
+       call get_hmaxcell(icell, hmaxold)
+       if (hmaxcell > hmaxold) call set_hmaxcell(icell, hmaxcell)
+    endif
+ enddo
+ !$omp end parallel do
+
+end subroutine sync_tree_h
+#endif
 
 end module gpu_dens_iface
