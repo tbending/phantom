@@ -106,6 +106,10 @@ subroutine densityiterate_gpu(npart, xyzh, vxyzu, fxyzu, fext, gradh, divcurlv, 
  real(c_double), allocatable :: divv8(:), dvdx8(:), ddivvdt8(:)
  real    :: hi, rhoi, drhoi, omega
  integer :: i, c
+ integer(kind=8) :: ic0,ic1,ic2,ic3,ic4,crate
+ character(len=8) :: statsenv
+ logical, save    :: stats = .false.
+ logical, save    :: stats_checked = .false.
 
  if (npart <= 0) return
 
@@ -118,6 +122,14 @@ subroutine densityiterate_gpu(npart, xyzh, vxyzu, fxyzu, fext, gradh, divcurlv, 
  if (use_dust)     call fatal('densityiterate_gpu','dust density not computed on GPU')
  if (do_radiation) call fatal('densityiterate_gpu','radiation flux not computed on GPU')
  if (gravity)      call fatal('densityiterate_gpu','gradsoft not computed on GPU')
+
+ !--COSMO_DENS_STATS=1 also reports the phantom-side cost of the GPU call
+ if (.not. stats_checked) then
+    call get_environment_variable('COSMO_DENS_STATS', statsenv)
+    stats = (len_trim(statsenv) > 0)
+    stats_checked = .true.
+ endif
+ call system_clock(ic0, crate)
 
  allocate(x8(npart), y8(npart), z8(npart), h8(npart))
  allocate(vx8(npart), vy8(npart), vz8(npart))
@@ -141,11 +153,13 @@ subroutine densityiterate_gpu(npart, xyzh, vxyzu, fxyzu, fext, gradh, divcurlv, 
     az8(i) = real(fxyzu(3,i) + fext(3,i), kind=c_double)
  enddo
  !$omp end parallel do
+ call system_clock(ic1)
 
  call densityiterate_gpu_c(h8, rho8, drhofh8, divv8, dvdx8, ddivvdt8, &
                             x8, y8, z8, vx8, vy8, vz8, ax8, ay8, az8, &
                             int(npart, kind=c_int), &
                             real(massoftype(igas), kind=c_double))
+ call system_clock(ic2)
 
  !--write results back to phantom arrays
  !  Skip inactive/dead particles (xyzh(4,i) < 0 in phantom convention)
@@ -182,11 +196,23 @@ subroutine densityiterate_gpu(npart, xyzh, vxyzu, fxyzu, fext, gradh, divcurlv, 
  enddo
  !$omp end parallel do
 
+ call system_clock(ic3)
+
  deallocate(x8, y8, z8, h8, vx8, vy8, vz8, ax8, ay8, az8)
  deallocate(rho8, drhofh8, divv8, dvdx8, ddivvdt8)
 
  !--the CPU kd-tree still serves the force loop, and it caches h
  call sync_tree_h(xyzh)
+ call system_clock(ic4)
+
+ if (stats) then
+    write(0,'(a,f8.2,a,f8.2,a,f8.2,a,f8.2,a,f8.2)') &
+       'COSMO_FORT stage=', 1.e3*real(ic1-ic0)/real(crate), &
+       ' capi=',            1.e3*real(ic2-ic1)/real(crate), &
+       ' writeback=',       1.e3*real(ic3-ic2)/real(crate), &
+       ' treesync=',        1.e3*real(ic4-ic3)/real(crate), &
+       ' total=',           1.e3*real(ic4-ic0)/real(crate)
+ endif
 
 #else
  !--stub: should never be reached (use_gpu_dens is .false. without GPU)
