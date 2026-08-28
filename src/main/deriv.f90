@@ -44,6 +44,7 @@ subroutine derivs(icall,npart,nactive,xyzh,vxyzu,fxyzu,fext,divcurlv,divcurlB,&
  use neighkdtree,    only:build_tree
  use densityforce,   only:densityiterate
  use gpu_dens_iface,  only:densityiterate_gpu,use_gpu_dens
+ use gpu_force_iface, only:force_gpu
  use ptmass,         only:ipart_rhomax,ptmass_calc_enclosed_mass,ptmass_boundary_crossing,get_pressure_on_sinks
  use externalforces, only:externalforce
  use part,           only:dustgasprop,Vrel_disp,dvdx,Bxyz,set_boundaries_to_active,&
@@ -192,6 +193,11 @@ subroutine derivs(icall,npart,nactive,xyzh,vxyzu,fxyzu,fext,divcurlv,divcurlB,&
  !
  stressmax = 0.
  if (sinks_have_heating(nptmass,xyzmh_ptmass)) call ptmass_calc_enclosed_mass(nptmass,npart,xyzh)
+ !--Build the symmetric (gather+scatter) j-leaf list the GPU force sum will need.
+ !  No forces computed and nothing written back yet — this is here to measure the
+ !  walk.  Guarded on use_gpu_dens because it consumes the octree and hmax that
+ !  densityiterate_gpu leaves behind; it becomes its own switch with the kernel.
+ if (use_gpu_dens) call force_gpu(npart)
  call force(icall,npart,xyzh,vxyzu,fxyzu,divcurlv,divcurlB,Bevol,dBevol,&
             rad,drad,radprop,dustprop,dustgasprop,Vrel_disp,dustfrac,ddustevol,fext,fxyz_drag,&
             ipart_rhomax,dt,stressmax,eos_vars,dens,metrics,apr_level)

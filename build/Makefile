@@ -545,7 +545,7 @@ SOURCES= physcon.f90 ${CONFIG} ${SRCKERNEL} io.F90 units.f90 geometry.f90 \
          krome.F90 memory.f90 ${SRCRW_DUMPS} ${SRCINJECT} injection.f90 \
          H2regions.f90 subgroup.f90 \
          quitdump.f90 dens.F90\
-         gpu_dens_iface.F90\
+         gpu_dens_iface.F90 gpu_force_iface.F90\
          ptmass.F90 force.F90 deriv.f90 ${SRCAPR} readwrite_infile.f90 energies.f90 sort_particles.f90 \
          utils_shuffleparticles.F90 evwrite.f90 substepping.F90 step_leapfrog.f90 writeheader.f90 ${SRCAN} \
          mf_write.f90 egg.f90 evolve_utils.F90 evolve.f90 utils_linalg.f90 \
