@@ -15,7 +15,7 @@ module gpu_force_iface
 ! STATUS: the GPU force kernel does not exist yet.  force_gpu currently builds
 ! only the SYMMETRIC (gather+scatter) j-leaf list that the force sum will need
 ! — the list the density walk cannot produce, because density asks only "is j
-! inside my kernel?" while force also needs "am I inside theirs?".  It computes
+! inside my kernel?" while force also needs "am I inside theirs?" (pun intended).  It computes
 ! no forces and writes nothing back, so phantom's results are unaffected.  It
 ! is called so the cost of the walk can be measured before the kernel lands.
 !
@@ -32,14 +32,15 @@ module gpu_force_iface
 ! :Dependencies: iso_c_binding
 !
  implicit none
-
+!update 0829
 #ifdef GPU
-!--C interface to cosmoSPHere/src/force_c_api.cu
  interface
-  subroutine force_gpu_c(n, pmass) bind(C)
+  subroutine force_gpu_c(n,pmass,pro2,fx,fy,fz,f4) bind(C)
    use iso_c_binding, only:c_double,c_int
-   integer(c_int), value :: n
-   real(c_double), value :: pmass
+   integer(c_int), value       :: n
+   real(c_double), value       :: pmass
+   real(c_double), intent(in)  :: pro2(*)
+   real(c_double), intent(out) :: fx(*),fy(*),fz(*),f4(*)
   end subroutine force_gpu_c
  end interface
 #endif
@@ -54,15 +55,40 @@ contains
 !  Build the symmetric j-leaf list on the GPU, and time it.
 !+
 !-----------------------------------------------------------------------
-subroutine force_gpu(npart)
+subroutine force_gpu(npart,pro2,fxyzu)
  use part, only:massoftype,igas
 #ifdef GPU
- use iso_c_binding, only:c_double
+ use iso_c_binding, only:c_double,c_int
 #endif
- integer, intent(in) :: npart
+ integer, intent(in)    :: npart
+ real,    intent(in)    :: pro2(:)
+ real,    intent(inout) :: fxyzu(:,:)
 
 #ifdef GPU
- call force_gpu_c(npart, real(massoftype(igas), kind=c_double))
+ real(c_double), allocatable :: pro2_8(:)
+ real(c_double), allocatable :: fx8(:),fy8(:),fz8(:), f48(:)
+ integer :: i
+
+ if (npart <= 0) return
+
+ allocate(pro2_8(npart))
+
+ allocate(fx8(npart),fy8(npart),fz8(npart),f48(npart))
+
+ pro2_8 = real(pro2(1:npart),kind=c_double)
+
+ call force_gpu_c(int(npart,kind=c_int),                               &
+                  real(massoftype(igas),kind=c_double),                &
+                  pro2_8,fx8,fy8,fz8,f48)
+
+ do i = 1,npart
+    fxyzu(1,i) = real(fx8(i),kind=kind(fxyzu))
+    fxyzu(2,i) = real(fy8(i),kind=kind(fxyzu))
+    fxyzu(3,i) = real(fz8(i),kind=kind(fxyzu))
+    fxyzu(4,i) = real(f48(i),kind=kind(fxyzu))
+ enddo
+
+ deallocate(pro2_8,fx8,fy8,fz8,f48)
 #else
  print *, 'ERROR: force_gpu called but phantom not compiled with GPU=yes'
  stop
