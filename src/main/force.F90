@@ -57,7 +57,7 @@ module forces
 
  integer, parameter :: maxcellcache = 1000
 
- public :: force, reconstruct_dv, get_drag_terms ! latter to avoid compiler warning
+ public :: force, reconstruct_dv, get_drag_terms, prepare_pro2_gpu ! latter to avoid compiler warning
 
  !--indexing for xpartveci array
  integer, parameter :: &
@@ -2168,6 +2168,31 @@ subroutine get_stress(pri,spsoundi,rhoi,rho1i,xi,yi,zi, &
 end subroutine get_stress
 
 !----------------------------------------------------------------
+
+
+!----------------------------------------------------------------
+! Prepare the pro=P/rho^2 array required by the GPU force kernel.
+! No MHD/radiation/physical viscosity branch of
+! get_stress at lines 2156--2161.
+!----------------------------------------------------------------
+subroutine prepare_pro2_gpu(npart,xyzh,eos_vars,pro2)
+ use part, only:igas,igasP,massoftype,rhoh
+ integer, intent(in)  :: npart
+ real,    intent(in)  :: xyzh(:,:),eos_vars(:,:)
+ real,    intent(out) :: pro2(:)
+
+ integer :: i
+ real    :: rhoi,rho1i
+
+ do i = 1,npart
+    rhoi     = rhoh(xyzh(4,i),massoftype(igas))
+    rho1i    = 1.0/rhoi
+    pro2(i)  = eos_vars(igasP,i)*rho1i*rho1i
+ enddo
+
+end subroutine prepare_pro2_gpu
+
+!-----------------------------------
 
 subroutine start_cell(cell,iphase,xyzh,vxyzu,gradh,divcurlv,divcurlB,dvdx,Bevol, &
                      dustfrac,dustprop,fxyz_drag,eta_nimhd,eos_vars,alphaind,stressmax,&

@@ -228,7 +228,7 @@ endif
     LDFLAGS   += -L$(COSMO_DIR)/build -lcosmoSPHere
 ifeq ($(GPU_BACKEND), cuda)
     CUDA_HOME ?= $(CUDA_INSTALL_PATH)
-    LDFLAGS   += -L$(CUDA_HOME)/lib64 -lcudart -lstdc++
+    LDFLAGS   += -L$(CUDA_HOME)/lib64 -lcudart -lstdc++ -ldl
 else ifeq ($(GPU_BACKEND), hip)
     LDFLAGS   += -L$(ROCM_PATH)/lib -lamdhip64 -lstdc++
 else

@@ -56,7 +56,7 @@ subroutine derivs(icall,npart,nactive,xyzh,vxyzu,fxyzu,fext,divcurlv,divcurlB,&
  use porosity,         only:get_disruption,get_probastick
  use ptmass_radiation, only:get_dust_temperature
  use timing,         only:get_timings
- use forces,         only:force
+ use forces,         only:force, prepare_pro2_gpu
  use part,           only:mhd,gradh,alphaind,igas,iradxi,ifluxx,ifluxy,ifluxz,ithick
  use derivutils,     only:do_timing
  use cons2prim,      only:cons2primall,cons2prim_everything
@@ -91,6 +91,9 @@ subroutine derivs(icall,npart,nactive,xyzh,vxyzu,fxyzu,fext,divcurlv,divcurlB,&
  integer(kind=1), intent(in)    :: apr_level(:)
  integer                     :: ierr,i
  real(kind=4)                :: t1,tcpu1,tlast,tcpulast
+
+
+ real, allocatable :: pro2_gpu(:)
 
  t1    = 0.
  tcpu1 = 0.
@@ -192,17 +195,32 @@ subroutine derivs(icall,npart,nactive,xyzh,vxyzu,fxyzu,fext,divcurlv,divcurlB,&
  ! compute SPH forces
  !
  stressmax = 0.
+
  if (sinks_have_heating(nptmass,xyzmh_ptmass)) call ptmass_calc_enclosed_mass(nptmass,npart,xyzh)
+
  !--Build the symmetric (gather+scatter) j-leaf list the GPU force sum will need.
  !  No forces computed and nothing written back yet — this is here to measure the
  !  walk.  Guarded on use_gpu_dens because it consumes the octree and hmax that
  !  densityiterate_gpu leaves behind; it becomes its own switch with the kernel.
- if (use_gpu_dens) call force_gpu(npart)
- call force(icall,npart,xyzh,vxyzu,fxyzu,divcurlv,divcurlB,Bevol,dBevol,&
-            rad,drad,radprop,dustprop,dustgasprop,Vrel_disp,dustfrac,ddustevol,fext,fxyz_drag,&
-            ipart_rhomax,dt,stressmax,eos_vars,dens,metrics,apr_level)
- call do_timing('force',tlast,tcpulast)
 
+ if (use_gpu_dens) then
+    allocate(pro2_gpu(npart))
+
+   ! eos_vars was updated by cons2prim immediately above this section.
+    call prepare_pro2_gpu(npart,xyzh,eos_vars,pro2_gpu)
+
+   ! Returns only the first three components of fxyzu.
+    call force_gpu(npart,pro2_gpu,fxyzu)
+
+    deallocate(pro2_gpu)
+
+    call fatal('deriv', &
+        'GPU force and fxyzu(4,:) was computed but time-step size was not computed, time integration cannot proceed')
+ else
+    call force(icall,npart,xyzh,vxyzu,fxyzu,divcurlv,divcurlB,Bevol,dBevol,&
+              rad,drad,radprop,dustprop,dustgasprop,Vrel_disp,dustfrac,ddustevol,fext,fxyz_drag,&
+              ipart_rhomax,dt,stressmax,eos_vars,dens,metrics,apr_level)
+ endif
  !
  ! compute growth rate of dust particles
  !
