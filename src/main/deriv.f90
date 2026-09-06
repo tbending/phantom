@@ -44,7 +44,7 @@ subroutine derivs(icall,npart,nactive,xyzh,vxyzu,fxyzu,fext,divcurlv,divcurlB,&
  use neighkdtree,    only:build_tree
  use densityforce,   only:densityiterate
  use gpu_dens_iface,  only:densityiterate_gpu,use_gpu_dens
- use gpu_force_iface, only:force_gpu
+ use gpu_force_iface, only:force_gpu,finish_gpu_force_timesteps
  use ptmass,         only:ipart_rhomax,ptmass_calc_enclosed_mass,ptmass_boundary_crossing,get_pressure_on_sinks
  use externalforces, only:externalforce
  use part,           only:dustgasprop,Vrel_disp,dvdx,Bxyz,set_boundaries_to_active,&
@@ -62,7 +62,8 @@ subroutine derivs(icall,npart,nactive,xyzh,vxyzu,fxyzu,fext,divcurlv,divcurlB,&
  use cons2prim,      only:cons2primall,cons2prim_everything
  use metric_tools,   only:init_metric
  use radiation_implicit, only:do_radiation_implicit,ierr_failed_to_converge
- use options,        only:implicit_radiation,implicit_radiation_store_drad,use_porosity,need_pressure_on_sinks
+ use options, only:implicit_radiation,implicit_radiation_store_drad, &
+                   use_porosity,need_pressure_on_sinks,beta,alphau
  use HIIRegion,      only:HIIupdateflag,iH2R,HII_feedback
  integer,         intent(in)    :: icall
  integer,         intent(inout) :: npart
@@ -92,8 +93,13 @@ subroutine derivs(icall,npart,nactive,xyzh,vxyzu,fxyzu,fext,divcurlv,divcurlB,&
  integer                     :: ierr,i
  real(kind=4)                :: t1,tcpu1,tlast,tcpulast
 
+ integer :: ifxyzu_unit,ifxyzu_ios !--for checking outputting force arrays
 
  real, allocatable :: pro2_gpu(:)
+ real, allocatable :: spsound_gpu(:)
+ real, allocatable :: alphaAV_gpu(:)
+ real, allocatable :: u_gpu(:)
+ real, allocatable :: vsigmax_gpu(:) 
 
  t1    = 0.
  tcpu1 = 0.
@@ -205,21 +211,68 @@ subroutine derivs(icall,npart,nactive,xyzh,vxyzu,fxyzu,fext,divcurlv,divcurlB,&
 
  if (use_gpu_dens) then
     allocate(pro2_gpu(npart))
+	allocate(spsound_gpu(npart))
+	allocate(alphaAV_gpu(npart))
+	allocate(u_gpu(npart))
+	allocate(vsigmax_gpu(npart))
 
-   ! eos_vars was updated by cons2prim immediately above this section.
-    call prepare_pro2_gpu(npart,xyzh,eos_vars,pro2_gpu)
+	call prepare_pro2_gpu(npart,xyzh,vxyzu,eos_vars,alphaind, &
+                      pro2_gpu,spsound_gpu,alphaAV_gpu,u_gpu)
 
-   ! Returns only the first three components of fxyzu.
-    call force_gpu(npart,pro2_gpu,fxyzu)
+	call force_gpu(npart,pro2_gpu,spsound_gpu,alphaAV_gpu,u_gpu, &
+               beta,alphau,fxyzu,vsigmax_gpu)
 
-    deallocate(pro2_gpu)
 
-    call fatal('deriv', &
-        'GPU force and fxyzu(4,:) was computed but time-step size was not computed, time integration cannot proceed')
+    call finish_gpu_force_timesteps( &
+        	   npart,xyzh,fxyzu,spsound_gpu,vsigmax_gpu)
+
+	deallocate(pro2_gpu)
+	deallocate(spsound_gpu)
+	deallocate(alphaAV_gpu)
+	deallocate(u_gpu)
+	deallocate(vsigmax_gpu)
+
+	open(newunit=ifxyzu_unit,                         &
+     	 file='gpu_fxyzu.dat',                        &
+     	 status='replace',                            &
+     	 action='write',                              &
+     	 form='formatted',                            &
+     	 iostat=ifxyzu_ios)
+
+	if (ifxyzu_ios /= 0) then
+    	call fatal('deriv','could not open gpu_fxyzu.dat')
+    endif
+
+	write(ifxyzu_unit,'(a)') &
+    '# particle_index  fxyzu(1)  fxyzu(2)  fxyzu(3)  fxyzu(4)'
+
+	do i=1,npart
+      write(ifxyzu_unit,'(i10,1x,4(es24.16e3,1x))') &
+      i,                                         &
+      fxyzu(1,i),                                &
+      fxyzu(2,i),                                &
+      fxyzu(3,i),                                &
+      fxyzu(4,i)
+    enddo
+
+	close(ifxyzu_unit,iostat=ifxyzu_ios)
+
+	if (ifxyzu_ios /= 0) then
+   		call fatal('deriv','error closing gpu_fxyzu.dat')
+	endif
+
+	!call fatal('deriv', &
+    !'wrote fxyzu(1:4,:) to gpu_fxyzu.dat; terminating deliberately')
+
+
+    !--call fatal('deriv', &
+        !'GPU force and fxyzu(4,:) was computed but time-step size was not computed, time integration cannot proceed')
+    !--stop
  else
     call force(icall,npart,xyzh,vxyzu,fxyzu,divcurlv,divcurlB,Bevol,dBevol,&
               rad,drad,radprop,dustprop,dustgasprop,Vrel_disp,dustfrac,ddustevol,fext,fxyz_drag,&
               ipart_rhomax,dt,stressmax,eos_vars,dens,metrics,apr_level)
+
  endif
  !
  ! compute growth rate of dust particles
@@ -257,10 +310,196 @@ subroutine derivs(icall,npart,nactive,xyzh,vxyzu,fxyzu,fext,divcurlv,divcurlB,&
     dtnew = min(dtforce,dtcourant,dtrad,dtmax)
  endif
 
+ if (use_gpu_dens) then
+   call write_gpu_force_snapshot( &
+        icall,npart,time,dt,dtnew,dtcourant,dtforce,fxyzu)
+ else
+   call write_cpu_force_snapshot( &
+        icall,npart,time,dt,dtnew,dtcourant,dtforce,fxyzu)
+ endif
+
  call do_timing('total',t1,tcpu1,lunit=iprint)
 
 end subroutine derivs
 
+!-----------------------------------------------------------------------
+!+
+!  Append one complete GPU force evaluation to a formatted text file.
+!+
+!-----------------------------------------------------------------------
+subroutine write_gpu_force_snapshot(icall,npart,time,dt,dtnew, &
+                                    dtcourant,dtforce,fxyzu)
+ use io, only:fatal
+
+ integer, intent(in) :: icall,npart
+ real,    intent(in) :: time,dt,dtnew,dtcourant,dtforce
+ real,    intent(in) :: fxyzu(:,:)
+
+ integer, save :: force_call_count = 0
+ integer, save :: clock_start = 0
+ logical, save :: clock_started = .false.
+
+ integer :: i,iunit,ios
+ integer :: clock_now,clock_rate
+ real    :: wall_elapsed
+
+ call system_clock(count=clock_now,count_rate=clock_rate)
+
+ if (.not.clock_started) then
+    clock_start   = clock_now
+    clock_started = .true.
+ endif
+
+ wall_elapsed = real(clock_now-clock_start) / real(clock_rate)
+
+ force_call_count = force_call_count + 1
+
+ ! Start a new file on the first force call of this program execution.
+ if (force_call_count == 1) then
+    open(newunit=iunit,                         &
+         file='gpu_force_history.dat',          &
+         status='replace',                      &
+         action='write',                        &
+         form='formatted',                      &
+         iostat=ios)
+ else
+    open(newunit=iunit,                         &
+         file='gpu_force_history.dat',          &
+         status='old',                          &
+         position='append',                     &
+         action='write',                        &
+         form='formatted',                      &
+         iostat=ios)
+ endif
+
+ if (ios /= 0) then
+    call fatal('write_gpu_force_snapshot', &
+               'could not open gpu_force_history.dat')
+ endif
+
+ write(iunit,'(a)') '# BEGIN_GPU_FORCE_CALL'
+ write(iunit,'(a,i0)') '# force_call = ',force_call_count
+ write(iunit,'(a,i0)') '# icall = ',icall
+ write(iunit,'(a,es24.16e3)') '# simulation_time = ',time
+ write(iunit,'(a,es24.16e3)') '# input_dt = ',dt
+ write(iunit,'(a,es24.16e3)') '# proposed_dtnew = ',dtnew
+ write(iunit,'(a,es24.16e3)') '# dtcourant = ',dtcourant
+ write(iunit,'(a,es24.16e3)') '# dtforce = ',dtforce
+ write(iunit,'(a,es24.16e3)') '# wall_elapsed_seconds = ', &
+                               wall_elapsed
+
+ write(iunit,'(a)') &
+      '# particle_index  fxyzu(1)  fxyzu(2)  fxyzu(3)  fxyzu(4)'
+
+ do i = 1,npart
+    write(iunit,'(i10,1x,4(es24.16e3,1x))') &
+         i,                                  &
+         fxyzu(1,i),                         &
+         fxyzu(2,i),                         &
+         fxyzu(3,i),                         &
+         fxyzu(4,i)
+ enddo
+
+ write(iunit,'(a)') '# END_GPU_FORCE_CALL'
+ write(iunit,'(a)') ''
+
+ close(iunit,iostat=ios)
+
+ if (ios /= 0) then
+    call fatal('write_gpu_force_snapshot', &
+               'could not close gpu_force_history.dat')
+ endif
+
+end subroutine write_gpu_force_snapshot
+
+!-----------------------------------------------------------------------
+!+
+!  Append one complete CPU force evaluation to a formatted text file.
+!+
+!-----------------------------------------------------------------------
+subroutine write_cpu_force_snapshot(icall,npart,time,dt,dtnew, &
+                                    dtcourant,dtforce,fxyzu)
+ use io, only:fatal
+
+ integer, intent(in) :: icall,npart
+ real,    intent(in) :: time,dt,dtnew,dtcourant,dtforce
+ real,    intent(in) :: fxyzu(:,:)
+
+ integer, save :: force_call_count = 0
+ integer, save :: clock_start = 0
+ logical, save :: clock_started = .false.
+
+ integer :: i,iunit,ios
+ integer :: clock_now,clock_rate
+ real    :: wall_elapsed
+
+ call system_clock(count=clock_now,count_rate=clock_rate)
+
+ if (.not.clock_started) then
+    clock_start   = clock_now
+    clock_started = .true.
+ endif
+
+ wall_elapsed = real(clock_now-clock_start) / real(clock_rate)
+
+ force_call_count = force_call_count + 1
+
+ if (force_call_count == 1) then
+    open(newunit=iunit,                         &
+         file='cpu_force_history.dat',          &
+         status='replace',                      &
+         action='write',                        &
+         form='formatted',                      &
+         iostat=ios)
+ else
+    open(newunit=iunit,                         &
+         file='cpu_force_history.dat',          &
+         status='old',                          &
+         position='append',                     &
+         action='write',                        &
+         form='formatted',                      &
+         iostat=ios)
+ endif
+
+ if (ios /= 0) then
+    call fatal('write_cpu_force_snapshot', &
+               'could not open cpu_force_history.dat')
+ endif
+
+ write(iunit,'(a)') '# BEGIN_CPU_FORCE_CALL'
+ write(iunit,'(a,i0)') '# force_call = ',force_call_count
+ write(iunit,'(a,i0)') '# icall = ',icall
+ write(iunit,'(a,es24.16e3)') '# simulation_time = ',time
+ write(iunit,'(a,es24.16e3)') '# input_dt = ',dt
+ write(iunit,'(a,es24.16e3)') '# proposed_dtnew = ',dtnew
+ write(iunit,'(a,es24.16e3)') '# dtcourant = ',dtcourant
+ write(iunit,'(a,es24.16e3)') '# dtforce = ',dtforce
+ write(iunit,'(a,es24.16e3)') '# wall_elapsed_seconds = ', &
+                               wall_elapsed
+
+ write(iunit,'(a)') &
+      '# particle_index  fxyzu(1)  fxyzu(2)  fxyzu(3)  fxyzu(4)'
+
+ do i = 1,npart
+    write(iunit,'(i10,1x,4(es24.16e3,1x))') &
+         i,                                  &
+         fxyzu(1,i),                         &
+         fxyzu(2,i),                         &
+         fxyzu(3,i),                         &
+         fxyzu(4,i)
+ enddo
+
+ write(iunit,'(a)') '# END_CPU_FORCE_CALL'
+ write(iunit,'(a)') ''
+
+ close(iunit,iostat=ios)
+
+ if (ios /= 0) then
+    call fatal('write_cpu_force_snapshot', &
+               'could not close cpu_force_history.dat')
+ endif
+
+end subroutine write_cpu_force_snapshot
 !--------------------------------------
 !+
 !  wrapper for the call to derivs

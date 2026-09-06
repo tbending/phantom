@@ -2175,19 +2175,38 @@ end subroutine get_stress
 ! No MHD/radiation/physical viscosity branch of
 ! get_stress at lines 2156--2161.
 !----------------------------------------------------------------
-subroutine prepare_pro2_gpu(npart,xyzh,eos_vars,pro2)
- use part, only:igas,igasP,massoftype,rhoh
- integer, intent(in)  :: npart
- real,    intent(in)  :: xyzh(:,:),eos_vars(:,:)
- real,    intent(out) :: pro2(:)
+subroutine prepare_pro2_gpu(npart,xyzh,vxyzu,eos_vars,alphaind, &
+                            pro2,spsound,alphaAV,u)
+ use dim,     only:maxalpha,maxp
+ use options, only:alpha
+ use part,    only:igas,igasP,ics,massoftype,rhoh
+
+ integer,      intent(in)  :: npart
+ real,         intent(in)  :: xyzh(:,:)
+ real,         intent(in)  :: vxyzu(:,:)
+ real,         intent(in)  :: eos_vars(:,:)
+ real(kind=4), intent(in)  :: alphaind(:,:)
+ real,         intent(out) :: pro2(:)
+ real,         intent(out) :: spsound(:)
+ real,         intent(out) :: alphaAV(:)
+ real,         intent(out) :: u(:)
 
  integer :: i
  real    :: rhoi,rho1i
 
  do i = 1,npart
-    rhoi     = rhoh(xyzh(4,i),massoftype(igas))
-    rho1i    = 1.0/rhoi
-    pro2(i)  = eos_vars(igasP,i)*rho1i*rho1i
+    rhoi       = rhoh(xyzh(4,i),massoftype(igas))
+    rho1i      = 1.0/rhoi
+
+    pro2(i)    = eos_vars(igasP,i)*rho1i*rho1i
+    spsound(i) = eos_vars(ics,i)
+    u(i)       = vxyzu(4,i)
+
+    if (maxalpha == maxp) then
+       alphaAV(i) = real(alphaind(1,i),kind=kind(alphaAV(i)))
+    else
+       alphaAV(i) = alpha
+    endif
  enddo
 
 end subroutine prepare_pro2_gpu
@@ -3162,7 +3181,7 @@ subroutine finish_cell_and_store_results(icall,cell,fxyzu,xyzh,vxyzu,poten,dt,dv
        ! timestep based on Courant condition
        vsigdtc = max(vsigmax,vwavei)
        if (vsigdtc > tiny(vsigdtc)) then
-          dtc = C_cour*hi/(vsigdtc*max(alpha,1.0))
+          dtc = C_cour*hi/(vsigdtc*max(alpha,1.0))!Eqn.(72) in PHANTOM paper
        endif
 
        ! cooling timestep dt < fac*u/(du/dt)
