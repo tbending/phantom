@@ -219,8 +219,8 @@ subroutine derivs(icall,npart,nactive,xyzh,vxyzu,fxyzu,fext,divcurlv,divcurlB,&
 	call prepare_pro2_gpu(npart,xyzh,vxyzu,eos_vars,alphaind, &
                       pro2_gpu,spsound_gpu,alphaAV_gpu,u_gpu)
 
-	call force_gpu(npart,pro2_gpu,spsound_gpu,alphaAV_gpu,u_gpu, &
-               beta,alphau,fxyzu,vsigmax_gpu)
+	call force_gpu(npart,xyzh,vxyzu,pro2_gpu,spsound_gpu,alphaAV_gpu,u_gpu, &
+	               beta,alphau,fxyzu,vsigmax_gpu,divcurlv)
 
 
     call finish_gpu_force_timesteps( &
@@ -232,34 +232,34 @@ subroutine derivs(icall,npart,nactive,xyzh,vxyzu,fxyzu,fext,divcurlv,divcurlB,&
 	deallocate(u_gpu)
 	deallocate(vsigmax_gpu)
 
-	open(newunit=ifxyzu_unit,                         &
-     	 file='gpu_fxyzu.dat',                        &
-     	 status='replace',                            &
-     	 action='write',                              &
-     	 form='formatted',                            &
-     	 iostat=ifxyzu_ios)
+	!open(newunit=ifxyzu_unit,                         &
+    ! 	 file='gpu_fxyzu.dat',                        &
+    ! 	 status='replace',                            &
+    ! 	 action='write',                              &
+    ! 	 form='formatted',                            &
+    ! !	 iostat=ifxyzu_ios)
 
-	if (ifxyzu_ios /= 0) then
-    	call fatal('deriv','could not open gpu_fxyzu.dat')
-    endif
+	!if (ifxyzu_ios /= 0) then
+    !	call fatal('deriv','could not open gpu_fxyzu.dat')
+    !endif
 
-	write(ifxyzu_unit,'(a)') &
-    '# particle_index  fxyzu(1)  fxyzu(2)  fxyzu(3)  fxyzu(4)'
+	!write(ifxyzu_unit,'(a)') &
+    !'# particle_index  fxyzu(1)  fxyzu(2)  fxyzu(3)  fxyzu(4)'
 
-	do i=1,npart
-      write(ifxyzu_unit,'(i10,1x,4(es24.16e3,1x))') &
-      i,                                         &
-      fxyzu(1,i),                                &
-      fxyzu(2,i),                                &
-      fxyzu(3,i),                                &
-      fxyzu(4,i)
-    enddo
+	!--do i=1,npart
+    !  write(ifxyzu_unit,'(i10,1x,4(es24.16e3,1x))') &
+    !  i,                                         &
+    !  fxyzu(1,i),                                &
+    !  fxyzu(2,i),                                &
+    !  fxyzu(3,i),                                &
+    !  fxyzu(4,i)
+    !--enddo
 
-	close(ifxyzu_unit,iostat=ifxyzu_ios)
+	!close(ifxyzu_unit,iostat=ifxyzu_ios)
 
-	if (ifxyzu_ios /= 0) then
-   		call fatal('deriv','error closing gpu_fxyzu.dat')
-	endif
+	!if (ifxyzu_ios /= 0) then
+   	!	call fatal('deriv','error closing gpu_fxyzu.dat')
+	!endif
 
 	!call fatal('deriv', &
     !'wrote fxyzu(1:4,:) to gpu_fxyzu.dat; terminating deliberately')
@@ -310,13 +310,13 @@ subroutine derivs(icall,npart,nactive,xyzh,vxyzu,fxyzu,fext,divcurlv,divcurlB,&
     dtnew = min(dtforce,dtcourant,dtrad,dtmax)
  endif
 
- if (use_gpu_dens) then
-   call write_gpu_force_snapshot( &
-        icall,npart,time,dt,dtnew,dtcourant,dtforce,fxyzu)
- else
-   call write_cpu_force_snapshot( &
-        icall,npart,time,dt,dtnew,dtcourant,dtforce,fxyzu)
- endif
+ !if (use_gpu_dens) then
+ !  call write_gpu_force_snapshot( &
+ !       icall,npart,time,dt,dtnew,dtcourant,dtforce,fxyzu)
+ !else
+ !  call write_cpu_force_snapshot( &
+ !       icall,npart,time,dt,dtnew,dtcourant,dtforce,fxyzu)
+ !endif
 
  call do_timing('total',t1,tcpu1,lunit=iprint)
 
