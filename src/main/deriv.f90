@@ -44,7 +44,7 @@ subroutine derivs(icall,npart,nactive,xyzh,vxyzu,fxyzu,fext,divcurlv,divcurlB,&
  use neighkdtree,    only:build_tree
  use densityforce,   only:densityiterate
  use gpu_dens_iface,  only:densityiterate_gpu,use_gpu_dens
- use gpu_force_iface, only:force_gpu,finish_gpu_force_timesteps
+ use gpu_force_iface, only:force_gpu
  use ptmass,         only:ipart_rhomax,ptmass_calc_enclosed_mass,ptmass_boundary_crossing,get_pressure_on_sinks
  use externalforces, only:externalforce
  use part,           only:dustgasprop,Vrel_disp,dvdx,Bxyz,set_boundaries_to_active,&
@@ -56,14 +56,13 @@ subroutine derivs(icall,npart,nactive,xyzh,vxyzu,fxyzu,fext,divcurlv,divcurlB,&
  use porosity,         only:get_disruption,get_probastick
  use ptmass_radiation, only:get_dust_temperature
  use timing,         only:get_timings
- use forces,         only:force, prepare_pro2_gpu
+ use forces,         only:force
  use part,           only:mhd,gradh,alphaind,igas,iradxi,ifluxx,ifluxy,ifluxz,ithick
  use derivutils,     only:do_timing
  use cons2prim,      only:cons2primall,cons2prim_everything
  use metric_tools,   only:init_metric
  use radiation_implicit, only:do_radiation_implicit,ierr_failed_to_converge
- use options, only:implicit_radiation,implicit_radiation_store_drad, &
-                   use_porosity,need_pressure_on_sinks,beta,alphau
+ use options,        only:implicit_radiation,implicit_radiation_store_drad,use_porosity,need_pressure_on_sinks
  use HIIRegion,      only:HIIupdateflag,iH2R,HII_feedback
  integer,         intent(in)    :: icall
  integer,         intent(inout) :: npart
@@ -92,12 +91,6 @@ subroutine derivs(icall,npart,nactive,xyzh,vxyzu,fxyzu,fext,divcurlv,divcurlB,&
  integer(kind=1), intent(in)    :: apr_level(:)
  integer                     :: ierr,i
  real(kind=4)                :: t1,tcpu1,tlast,tcpulast
-
- real, allocatable :: pro2_gpu(:)
- real, allocatable :: spsound_gpu(:)
- real, allocatable :: alphaAV_gpu(:)
- real, allocatable :: u_gpu(:)
- real, allocatable :: vsigmax_gpu(:) 
 
  t1    = 0.
  tcpu1 = 0.
@@ -199,42 +192,16 @@ subroutine derivs(icall,npart,nactive,xyzh,vxyzu,fxyzu,fext,divcurlv,divcurlB,&
  ! compute SPH forces
  !
  stressmax = 0.
-
  if (sinks_have_heating(nptmass,xyzmh_ptmass)) call ptmass_calc_enclosed_mass(nptmass,npart,xyzh)
-
- !--Build the symmetric (gather+scatter) j-leaf list the GPU force sum will need.
- !  No forces computed and nothing written back yet — this is here to measure the
- !  walk.  Guarded on use_gpu_dens because it consumes the octree and hmax that
- !  densityiterate_gpu leaves behind; it becomes its own switch with the kernel.
-
+ !--Evaluate the SPH force on the GPU rather than by a CPU kd-tree sweep.  Guarded
+ !  on use_gpu_dens because it consumes the octree and hmax that densityiterate_gpu
+ !  leaves behind; it becomes its own switch in due course.
  if (use_gpu_dens) then
-    allocate(pro2_gpu(npart))
-	allocate(spsound_gpu(npart))
-	allocate(alphaAV_gpu(npart))
-	allocate(u_gpu(npart))
-	allocate(vsigmax_gpu(npart))
-
-	call prepare_pro2_gpu(npart,xyzh,vxyzu,eos_vars,alphaind, &
-                      pro2_gpu,spsound_gpu,alphaAV_gpu,u_gpu)
-
-	call force_gpu(npart,xyzh,vxyzu,pro2_gpu,spsound_gpu,alphaAV_gpu,u_gpu, &
-	               beta,alphau,fxyzu,vsigmax_gpu,divcurlv)
-
-
-    call finish_gpu_force_timesteps( &
-        	   npart,xyzh,fxyzu,spsound_gpu,vsigmax_gpu)
-
-	deallocate(pro2_gpu)
-	deallocate(spsound_gpu)
-	deallocate(alphaAV_gpu)
-	deallocate(u_gpu)
-	deallocate(vsigmax_gpu)
-
+    call force_gpu(npart,xyzh,vxyzu,eos_vars,alphaind,fxyzu,divcurlv)
  else
     call force(icall,npart,xyzh,vxyzu,fxyzu,divcurlv,divcurlB,Bevol,dBevol,&
-              rad,drad,radprop,dustprop,dustgasprop,Vrel_disp,dustfrac,ddustevol,fext,fxyz_drag,&
-              ipart_rhomax,dt,stressmax,eos_vars,dens,metrics,apr_level)
-
+               rad,drad,radprop,dustprop,dustgasprop,Vrel_disp,dustfrac,ddustevol,fext,fxyz_drag,&
+               ipart_rhomax,dt,stressmax,eos_vars,dens,metrics,apr_level)
  endif
  !
  ! compute growth rate of dust particles
