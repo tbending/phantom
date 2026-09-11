@@ -203,6 +203,8 @@ subroutine derivs(icall,npart,nactive,xyzh,vxyzu,fxyzu,fext,divcurlv,divcurlB,&
                rad,drad,radprop,dustprop,dustgasprop,Vrel_disp,dustfrac,ddustevol,fext,fxyz_drag,&
                ipart_rhomax,dt,stressmax,eos_vars,dens,metrics,apr_level)
  endif
+ call do_timing('force',tlast,tcpulast)
+
  !
  ! compute growth rate of dust particles
  !
