@@ -19,8 +19,10 @@ module gpu_dens_iface
 !              never be called from deriv.f90 in normal builds).
 !
 ! Runtime control:
-!   gpu_dens_iface::use_gpu_dens  — set .false. to fall back to CPU density
-!                                   without recompiling (useful for testing).
+!   COSMO_GPU=0 (or n/N/f/F) in the environment runs a GPU=yes binary on the
+!   CPU path instead; any other value, or unset, keeps the compiled-in default.
+!   One binary can then run both arms of a GPU-vs-CPU comparison, which a pair
+!   of binaries would confound with build differences.  Ignored when GPU=no.
 !
 ! Outputs written back to phantom particle arrays:
 !   xyzh(4,i)     — converged smoothing length h_i
@@ -62,10 +64,38 @@ module gpu_dens_iface
  end interface
 #endif
 
- public :: densityiterate_gpu
+ public :: densityiterate_gpu, init_gpu_switch
  private
 
 contains
+
+!-------------------------------------------------------------
+!+
+!  Apply COSMO_GPU from the environment to use_gpu_dens, once.
+!  Cheap to call on every derivs: only the first call reads the
+!  environment.
+!+
+!-------------------------------------------------------------
+subroutine init_gpu_switch()
+#ifdef GPU
+ use io, only:iprint
+ character(len=16) :: val
+ integer           :: ln,ierr
+ logical, save     :: done = .false.
+
+ if (done) return
+ done = .true.
+ call get_environment_variable('COSMO_GPU',val,ln,ierr)
+ if (ierr == 0 .and. ln > 0) then
+    select case(val(1:1))
+    case('0','n','N','f','F')
+       use_gpu_dens = .false.
+    end select
+ endif
+ write(iprint,'(a,l1)') ' cosmoSPHere: use_gpu_dens = ',use_gpu_dens
+#endif
+
+end subroutine init_gpu_switch
 
 !-------------------------------------------------------------
 !+

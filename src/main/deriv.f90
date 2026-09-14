@@ -43,7 +43,7 @@ subroutine derivs(icall,npart,nactive,xyzh,vxyzu,fxyzu,fext,divcurlv,divcurlB,&
  use io,             only:iprint,fatal,error
  use neighkdtree,    only:build_tree
  use densityforce,   only:densityiterate
- use gpu_dens_iface,  only:densityiterate_gpu,use_gpu_dens
+ use gpu_dens_iface,  only:densityiterate_gpu,use_gpu_dens,init_gpu_switch
  use gpu_force_iface, only:force_gpu
  use ptmass,         only:ipart_rhomax,ptmass_calc_enclosed_mass,ptmass_boundary_crossing,get_pressure_on_sinks
  use externalforces, only:externalforce
@@ -112,6 +112,7 @@ subroutine derivs(icall,npart,nactive,xyzh,vxyzu,fxyzu,fext,divcurlv,divcurlB,&
 !
 ! build tree to prepare neighbour finding
 !
+ call init_gpu_switch()
  if (icall==1 .or. icall==0) then
     call build_tree(npart,nactive,xyzh,vxyzu)
 
