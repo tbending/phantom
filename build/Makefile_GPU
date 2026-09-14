@@ -19,6 +19,10 @@ ifeq ($(GPU_TARGET), a100)
 #   NVIDIA A100 / A30 (Ampere GA100)
     GPU_BACKEND = cuda
     CUDA_ARCH   = 80
+else ifeq ($(GPU_TARGET), hopper)
+#   NVIDIA GH200 / H100 (Hopper GH100)
+    GPU_BACKEND = cuda
+    CUDA_ARCH   = 90
 else ifeq ($(GPU_TARGET), quadro_pascal)
 #   NVIDIA Quadro P-series (Pascal GP10x, e.g. P2000)
     GPU_BACKEND = cuda
@@ -28,5 +32,5 @@ else ifeq ($(GPU_TARGET), mi300)
     GPU_BACKEND = hip
     HIP_ARCH    = gfx942
 else
-    $(error Unknown GPU_TARGET=$(GPU_TARGET) -- valid: a100, quadro_pascal, mi300)
+    $(error Unknown GPU_TARGET=$(GPU_TARGET) -- valid: a100, hopper, quadro_pascal, mi300)
 endif

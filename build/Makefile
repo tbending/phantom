@@ -211,7 +211,7 @@ endif
 endif
 
 #--GPU density solver (cosmoSPHere + Cornerstone octree)
-#  Usage: make GPU=yes GPU_TARGET=<a100|quadro_pascal|mi300>
+#  Usage: make GPU=yes GPU_TARGET=<a100|hopper|quadro_pascal|mi300>
 #         (cuda targets: module load cuda; hip targets: module load rocm/hipcc)
 #  GPU_TARGET selects a profile in Makefile_GPU (backend + arch) and is
 #  required when GPU=yes -- there is no default.  The same backend/arch is
@@ -220,7 +220,7 @@ endif
 GPU=no
 ifeq ($(GPU), yes)
 ifeq ($(GPU_TARGET),)
-    $(error GPU=yes requires GPU_TARGET to be set -- valid: a100, quadro_pascal, mi300 (see build/Makefile_GPU))
+    $(error GPU=yes requires GPU_TARGET to be set -- valid: a100, hopper, quadro_pascal, mi300 (see build/Makefile_GPU))
 endif
     include Makefile_GPU
     FPPFLAGS  += -DGPU
