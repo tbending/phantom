@@ -38,6 +38,9 @@ module gpu_dens_iface
 !
 ! :Dependencies: dim, HIIRegion, io, iso_c_binding, part, ptmass, ptmass_radiation
 !
+#ifdef GPU
+ use iso_c_binding, only:c_double
+#endif
  implicit none
 
 #ifdef GPU
@@ -66,6 +69,21 @@ module gpu_dens_iface
 
  public :: densityiterate_gpu, init_gpu_switch
  private
+
+#ifdef GPU
+!
+! Staging buffers for the C call, module level and reused across calls:
+! allocated on the first solve and grown only if npart rises.  Allocating and
+! freeing ~17 arrays of npart (dvdx8 alone is 9*npart) every solve made every
+! write into them a first touch of fresh pages.
+!
+ integer :: nbuf = 0
+ real(c_double), allocatable :: x8(:), y8(:), z8(:), h8(:)
+ real(c_double), allocatable :: vx8(:), vy8(:), vz8(:)
+ real(c_double), allocatable :: ax8(:), ay8(:), az8(:)
+ real(c_double), allocatable :: rho8(:), drhofh8(:)
+ real(c_double), allocatable :: divv8(:), dvdx8(:), ddivvdt8(:)
+#endif
 
 contains
 
@@ -132,11 +150,6 @@ subroutine densityiterate_gpu(npart, xyzh, vxyzu, fxyzu, fext, gradh, divcurlv, 
  real(kind=4), intent(inout) :: alphaind(:,:)
 
 #ifdef GPU
- real(c_double), allocatable :: x8(:), y8(:), z8(:), h8(:)
- real(c_double), allocatable :: vx8(:), vy8(:), vz8(:)
- real(c_double), allocatable :: ax8(:), ay8(:), az8(:)
- real(c_double), allocatable :: rho8(:), drhofh8(:)
- real(c_double), allocatable :: divv8(:), dvdx8(:), ddivvdt8(:)
  real    :: hi, rhoi, drhoi, omega
  integer :: i, c
  integer(kind=8) :: ic0,ic1,ic2,ic3,ic4,crate
@@ -174,11 +187,7 @@ subroutine densityiterate_gpu(npart, xyzh, vxyzu, fxyzu, fext, gradh, divcurlv, 
  endif
  call system_clock(ic0, crate)
 
- allocate(x8(npart), y8(npart), z8(npart), h8(npart))
- allocate(vx8(npart), vy8(npart), vz8(npart))
- allocate(ax8(npart), ay8(npart), az8(npart))
- allocate(rho8(npart), drhofh8(npart))
- allocate(divv8(npart), dvdx8(9*npart), ddivvdt8(npart))
+ call ensure_buffers(npart)
 
  !$omp parallel do default(none) private(i) &
  !$omp shared(npart,xyzh,vxyzu,fxyzu,fext,x8,y8,z8,h8,vx8,vy8,vz8,ax8,ay8,az8)
@@ -244,8 +253,6 @@ subroutine densityiterate_gpu(npart, xyzh, vxyzu, fxyzu, fext, gradh, divcurlv, 
 
  call system_clock(ic3)
 
- deallocate(x8, y8, z8, h8, vx8, vy8, vz8, ax8, ay8, az8)
- deallocate(rho8, drhofh8, divv8, dvdx8, ddivvdt8)
  call system_clock(ic4)
 
  if (stats) then
@@ -263,5 +270,31 @@ subroutine densityiterate_gpu(npart, xyzh, vxyzu, fxyzu, fext, gradh, divcurlv, 
 #endif
 
 end subroutine densityiterate_gpu
+
+#ifdef GPU
+!-------------------------------------------------------------
+!+
+!  Grow the staging buffers to hold at least n particles.  No-op once
+!  they are big enough, so the allocation happens on the first solve only.
+!+
+!-------------------------------------------------------------
+subroutine ensure_buffers(n)
+ integer, intent(in) :: n
+
+ if (nbuf >= n) return
+
+ if (allocated(x8)) then
+    deallocate(x8, y8, z8, h8, vx8, vy8, vz8, ax8, ay8, az8, &
+               rho8, drhofh8, divv8, dvdx8, ddivvdt8)
+ endif
+
+ allocate(x8(n), y8(n), z8(n), h8(n), vx8(n), vy8(n), vz8(n), &
+          ax8(n), ay8(n), az8(n), rho8(n), drhofh8(n), &
+          divv8(n), dvdx8(9*n), ddivvdt8(n))
+
+ nbuf = n
+
+end subroutine ensure_buffers
+#endif
 
 end module gpu_dens_iface
