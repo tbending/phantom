@@ -36,7 +36,7 @@ module gpu_dens_iface
 ! run after the GPU solve; they are now computed on the GPU in one sweep at
 ! the converged h, so the CPU no longer re-walks the kd-tree.
 !
-! :Dependencies: dim, iso_c_binding, kdtree, neighkdtree, part
+! :Dependencies: dim, HIIRegion, io, iso_c_binding, part, ptmass, ptmass_radiation
 !
  implicit none
 
@@ -117,7 +117,10 @@ subroutine densityiterate_gpu(npart, xyzh, vxyzu, fxyzu, fext, gradh, divcurlv, 
  use dim,  only:nalpha,maxdvdx,maxp
 #ifdef GPU
  use io,   only:fatal
- use dim,  only:curlv,mhd,use_dust,do_radiation,gravity,ind_timesteps
+ use dim,  only:curlv,mhd,use_dust,do_radiation,gravity,ind_timesteps,use_apr
+ use ptmass,           only:icreate_sinks
+ use HIIRegion,        only:iH2R
+ use ptmass_radiation, only:iget_tdust
  use iso_c_binding, only:c_double,c_int
 #endif
  integer,      intent(in)    :: npart
@@ -155,6 +158,13 @@ subroutine densityiterate_gpu(npart, xyzh, vxyzu, fxyzu, fext, gradh, divcurlv, 
  !--the GPU force pass evaluates and overwrites every particle, not just the
  !  active ones, so individual timesteps would advance inactive particles
  if (ind_timesteps) call fatal('densityiterate_gpu','individual timesteps not supported on GPU (IND_TIMESTEPS=no)')
+ !--the GPU path builds no kd-tree, so refuse everything that queries it
+ !  during a step: sink creation, HII regions, APR's merge tree, and the
+ !  sink-radiation ray tracer (iget_tdust 3 and 4)
+ if (icreate_sinks > 0) call fatal('densityiterate_gpu','sink creation needs the kd-tree (icreate_sinks=0)')
+ if (iH2R > 0)          call fatal('densityiterate_gpu','HII regions need the kd-tree (iH2R=0)')
+ if (use_apr)           call fatal('densityiterate_gpu','APR needs the kd-tree')
+ if (iget_tdust >= 3)   call fatal('densityiterate_gpu','ray-traced dust temperature needs the kd-tree (iget_tdust<3)')
 
  !--COSMO_DENS_STATS=1 also reports the phantom-side cost of the GPU call
  if (.not. stats_checked) then
@@ -236,17 +246,13 @@ subroutine densityiterate_gpu(npart, xyzh, vxyzu, fxyzu, fext, gradh, divcurlv, 
 
  deallocate(x8, y8, z8, h8, vx8, vy8, vz8, ax8, ay8, az8)
  deallocate(rho8, drhofh8, divv8, dvdx8, ddivvdt8)
-
- !--the CPU kd-tree still serves the force loop, and it caches h
- call sync_tree_h(xyzh)
  call system_clock(ic4)
 
  if (stats) then
-    write(0,'(a,f8.2,a,f8.2,a,f8.2,a,f8.2,a,f8.2)') &
+    write(0,'(a,f8.2,a,f8.2,a,f8.2,a,f8.2)') &
        'COSMO_FORT stage=', 1.e3*real(ic1-ic0)/real(crate), &
        ' capi=',            1.e3*real(ic2-ic1)/real(crate), &
        ' writeback=',       1.e3*real(ic3-ic2)/real(crate), &
-       ' treesync=',        1.e3*real(ic4-ic3)/real(crate), &
        ' total=',           1.e3*real(ic4-ic0)/real(crate)
  endif
 
@@ -257,54 +263,5 @@ subroutine densityiterate_gpu(npart, xyzh, vxyzu, fxyzu, fext, gradh, divcurlv, 
 #endif
 
 end subroutine densityiterate_gpu
-
-#ifdef GPU
-!-------------------------------------------------------------
-!+
-!  Push GPU-updated smoothing lengths back into the kd-tree.
-!
-!  The force loop reads neighbour smoothing lengths from treecache
-!  (kdtree.F90 fills xyzcache(4,:) = 1/treecache(4,:), which force.F90
-!  then uses as hj1), and sizes its neighbour search from each node's
-!  hmax.  Both were set when the tree was built, i.e. from the PREDICTED
-!  h, so without this the force loop would silently mix stale cached h
-!  with the converged h.  On the CPU path store_results/set_hmaxcell do
-!  the same refresh as the density iteration proceeds.
-!+
-!-------------------------------------------------------------
-subroutine sync_tree_h(xyzh)
- use dim,         only:maxpsph
- use part,        only:treecache
- use kdtree,      only:inodeparts,inoderange
- use neighkdtree, only:ncells,leaf_is_active,set_hmaxcell,get_hmaxcell
- real, intent(in) :: xyzh(:,:)
- integer :: icell,ip,i
- real    :: hmaxcell,hmaxold
-
- !$omp parallel do default(none) schedule(runtime) private(icell,ip,i,hmaxcell,hmaxold) &
- !$omp shared(xyzh,treecache,inodeparts,inoderange,ncells,leaf_is_active,maxpsph)
- do icell = 1, int(ncells)
-    if (leaf_is_active(icell) == 0) cycle   ! internal node or empty cell
-    hmaxcell = 0.
-    do ip = inoderange(1,icell), inoderange(2,icell)
-       i = inodeparts(ip)
-       if (i < 0 .or. i > maxpsph) cycle
-       treecache(4,ip) = xyzh(4,i)
-       hmaxcell = max(hmaxcell, xyzh(4,i))
-    enddo
-    !--only widen the search radius, never narrow it: hmax has to be an upper
-    !  bound on h in the cell, and set_hmaxcell walks to the root through a
-    !  critical section, so doing it for every cell every step serialises.
-    !  A cell whose h shrank keeps a conservative (too large) hmax, exactly as
-    !  on the CPU path, where set_hmaxcell only fires when h outgrows the cell.
-    if (hmaxcell > 0.) then
-       call get_hmaxcell(icell, hmaxold)
-       if (hmaxcell > hmaxold) call set_hmaxcell(icell, hmaxcell)
-    endif
- enddo
- !$omp end parallel do
-
-end subroutine sync_tree_h
-#endif
 
 end module gpu_dens_iface

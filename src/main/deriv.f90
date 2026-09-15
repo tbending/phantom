@@ -114,7 +114,10 @@ subroutine derivs(icall,npart,nactive,xyzh,vxyzu,fxyzu,fext,divcurlv,divcurlB,&
 !
  call init_gpu_switch()
  if (icall==1 .or. icall==0) then
-    call build_tree(npart,nactive,xyzh,vxyzu)
+    !--the GPU path finds neighbours with cosmoSPHere's own octree, for density and
+    !  force alike, so nothing reads the kd-tree (densityiterate_gpu refuses the
+    !  options that would)
+    if (.not.use_gpu_dens) call build_tree(npart,nactive,xyzh,vxyzu)
 
     if (gr) then
        ! update time-dependent metric (e.g. binary BH) and repack at particle positions
