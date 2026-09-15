@@ -36,7 +36,8 @@ module gpu_dens_iface
 ! run after the GPU solve; they are now computed on the GPU in one sweep at
 ! the converged h, so the CPU no longer re-walks the kd-tree.
 !
-! :Dependencies: dim, HIIRegion, io, iso_c_binding, part, ptmass, ptmass_radiation
+! :Dependencies: dim, HIIRegion, io, iso_c_binding, part, ptmass, ptmass_radiation,
+!   viscosity
 !
  use iso_c_binding, only:c_double
  implicit none
@@ -146,7 +147,8 @@ subroutine densityiterate_gpu(npart, xyzh, vxyzu, fxyzu, fext, gradh, divcurlv, 
  use dim,  only:nalpha,maxdvdx,maxp
 #ifdef GPU
  use io,   only:fatal
- use dim,  only:curlv,mhd,use_dust,do_radiation,gravity,ind_timesteps,use_apr
+ use dim,  only:curlv,mhd,use_dust,do_radiation,gravity,ind_timesteps,use_apr,gr
+ use viscosity,        only:irealvisc
  use ptmass,           only:icreate_sinks
  use HIIRegion,        only:iH2R
  use ptmass_radiation, only:iget_tdust
@@ -189,6 +191,9 @@ subroutine densityiterate_gpu(npart, xyzh, vxyzu, fxyzu, fext, gradh, divcurlv, 
  if (iH2R > 0)          call fatal('densityiterate_gpu','HII regions need the kd-tree (iH2R=0)')
  if (use_apr)           call fatal('densityiterate_gpu','APR needs the kd-tree')
  if (iget_tdust >= 3)   call fatal('densityiterate_gpu','ray-traced dust temperature needs the kd-tree (iget_tdust<3)')
+ !--the GPU force pass has neither physical viscosity nor general relativity
+ if (irealvisc > 0)     call fatal('densityiterate_gpu','physical viscosity not computed on GPU (irealvisc=0)')
+ if (gr)                call fatal('densityiterate_gpu','general relativity not supported on GPU')
 
  !--COSMO_DENS_STATS=1 also reports the phantom-side cost of the GPU call
  if (.not. stats_checked) then
