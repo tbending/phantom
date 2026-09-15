@@ -37,8 +37,13 @@ module gpu_dens_iface
 ! run after the GPU solve; they are now computed on the GPU in one sweep at
 ! the converged h, so the CPU no longer re-walks the kd-tree.
 !
-! :Dependencies: dim, HIIRegion, io, iso_c_binding, part, ptmass, ptmass_radiation,
-!   viscosity
+! Periodic boundaries (PERIODIC=yes) are handled on the GPU: pairs and tree
+! nodes are taken at their nearest image, as in dens.F90 and force.F90.  All
+! that is needed from here is the switch, the box, and wrapping the particles
+! into it, which the kd-tree build does on the CPU path.
+!
+! :Dependencies: boundary, dim, HIIRegion, io, iso_c_binding, mpidomain, part,
+!   ptmass, ptmass_radiation, viscosity
 !
  use iso_c_binding, only:c_double
  implicit none
@@ -53,7 +58,8 @@ module gpu_dens_iface
 !--C interface to cosmoSPHere/src/dens_c_api.cu
  interface
   subroutine densityiterate_gpu_c(h, rho, gradh_out, divv, xi_out, ddivvdt, &
-                                  x, y, z, vx, vy, vz, ax, ay, az, n, pmass) bind(C)
+                                  x, y, z, vx, vy, vz, ax, ay, az, n, pmass, &
+                                  periodic, box) bind(C)
    use iso_c_binding, only:c_double,c_int
    real(c_double), intent(inout) :: h(*)
    real(c_double), intent(out)   :: rho(*), gradh_out(*)
@@ -63,6 +69,8 @@ module gpu_dens_iface
    real(c_double), intent(in)    :: ax(*), ay(*), az(*)
    integer(c_int), value         :: n
    real(c_double), value         :: pmass
+   integer(c_int), value         :: periodic
+   real(c_double), intent(in)    :: box(6)
   end subroutine densityiterate_gpu_c
 
 !--C interface to cosmoSPHere/src/pin_c_api.cu
@@ -156,6 +164,10 @@ subroutine densityiterate_gpu(npart, xyzh, vxyzu, fxyzu, fext, gradh, divcurlv, 
  use dim,  only:nalpha
 #ifdef GPU
  use io,   only:fatal
+ use dim,  only:periodic
+ use part, only:isdead_or_accreted
+ use boundary,  only:cross_boundary,xmin,xmax,ymin,ymax,zmin,zmax
+ use mpidomain, only:isperiodic
  use dim,  only:curlv,mhd,use_dust,do_radiation,gravity,ind_timesteps,use_apr,gr
  use viscosity,        only:irealvisc
  use ptmass,           only:icreate_sinks
@@ -172,7 +184,7 @@ subroutine densityiterate_gpu(npart, xyzh, vxyzu, fxyzu, fext, gradh, divcurlv, 
 
 #ifdef GPU
  real    :: hi, rhoi, drhoi, omega
- integer :: i
+ integer :: i, ncross
  integer(kind=8) :: ic0,ic1,ic2,ic3,ic4,crate
  character(len=8) :: statsenv
  logical, save    :: stats = .false.
@@ -213,9 +225,15 @@ subroutine densityiterate_gpu(npart, xyzh, vxyzu, fxyzu, fext, gradh, divcurlv, 
 
  call ensure_buffers(npart)
 
+ ncross = 0
  !$omp parallel do default(none) private(i) &
- !$omp shared(npart,xyzh,vxyzu,fxyzu,fext,x8,y8,z8,h8,vx8,vy8,vz8,ax8,ay8,az8)
+ !$omp shared(npart,xyzh,vxyzu,fxyzu,fext,x8,y8,z8,h8,vx8,vy8,vz8,ax8,ay8,az8) &
+ !$omp shared(isperiodic) reduction(+:ncross)
  do i = 1, npart
+    !--the GPU tree is built in the periodic box, so particles must be inside it
+    if (periodic) then
+       if (.not.isdead_or_accreted(xyzh(4,i))) call cross_boundary(isperiodic,xyzh(:,i),ncross)
+    endif
     x8(i) = real(xyzh(1,i), kind=c_double)
     y8(i) = real(xyzh(2,i), kind=c_double)
     z8(i) = real(xyzh(3,i), kind=c_double)
@@ -237,7 +255,9 @@ subroutine densityiterate_gpu(npart, xyzh, vxyzu, fxyzu, fext, gradh, divcurlv, 
  call densityiterate_gpu_c(h8, rho8, drhofh8, divv8, xi8, ddivvdt8, &
                             x8, y8, z8, vx8, vy8, vz8, ax8, ay8, az8, &
                             int(npart, kind=c_int), &
-                            real(massoftype(igas), kind=c_double))
+                            real(massoftype(igas), kind=c_double), &
+                            merge(1_c_int, 0_c_int, periodic), &
+                            real([xmin,xmax,ymin,ymax,zmin,zmax], kind=c_double))
  call system_clock(ic2)
 
  !--write results back to phantom arrays
