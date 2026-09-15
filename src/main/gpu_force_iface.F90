@@ -39,14 +39,13 @@ module gpu_force_iface
 
 #ifdef GPU
  interface
-    subroutine force_gpu_c(n,pmass,x,y,z,h,vx,vy,vz, &
+    subroutine force_gpu_c(n,pmass,vx,vy,vz, &
                          pro2,spsound,alphaAV,u,beta,alphau, &
                          fx,fy,fz,f4,vsigmax,divv) bind(C)
     use iso_c_binding, only:c_double,c_int
 
     integer(c_int), value       :: n
     real(c_double), value       :: pmass
-    real(c_double), intent(in)  :: x(*),y(*),z(*),h(*)
     real(c_double), intent(in)  :: vx(*),vy(*),vz(*)
     real(c_double), intent(in)  :: pro2(*)
     real(c_double), intent(in)  :: spsound(*)
@@ -71,7 +70,6 @@ module gpu_force_iface
 ! They are registered with the driver while allocated (gpu_dens_iface pin_buffer).
 !
  integer :: nbuf = 0
- real(c_double), allocatable, target :: x8(:),y8(:),z8(:),h8(:)
  real(c_double), allocatable, target :: vx8(:),vy8(:),vz8(:)
  real(c_double), allocatable, target :: pro2_8(:),spsound_8(:),alphaAV_8(:),u_8(:)
  real(c_double), allocatable, target :: fx8(:),fy8(:),fz8(:),f48(:)
@@ -104,17 +102,15 @@ subroutine force_gpu(npart,xyzh,vxyzu,eos_vars,alphaind,fxyzu,divcurlv)
  call ensure_buffers(npart)
  call prepare_pro2_gpu(npart,xyzh,vxyzu,eos_vars,alphaind)
 
- x8(1:npart)  = real(xyzh(1,1:npart),kind=c_double)
- y8(1:npart)  = real(xyzh(2,1:npart),kind=c_double)
- z8(1:npart)  = real(xyzh(3,1:npart),kind=c_double)
- h8(1:npart)  = real(xyzh(4,1:npart),kind=c_double)
+ !--positions and h are not sent: the GPU uses its copies from the density solve,
+ !  and it reads these velocities only when they may differ from the solve's
  vx8(1:npart) = real(vxyzu(1,1:npart),kind=c_double)
  vy8(1:npart) = real(vxyzu(2,1:npart),kind=c_double)
  vz8(1:npart) = real(vxyzu(3,1:npart),kind=c_double)
 
  call force_gpu_c(int(npart,kind=c_int),                &
                   real(massoftype(igas),kind=c_double), &
-                  x8,y8,z8,h8,vx8,vy8,vz8,              &
+                  vx8,vy8,vz8,                          &
                   pro2_8,spsound_8,alphaAV_8,u_8,       &
                   real(beta,kind=c_double),             &
                   real(alphau,kind=c_double),           &
@@ -148,24 +144,22 @@ subroutine ensure_buffers(n)
 
  if (nbuf >= n) return
 
- if (allocated(x8)) then
-    call unpin_buffer(x8);        call unpin_buffer(y8);         call unpin_buffer(z8)
-    call unpin_buffer(h8);        call unpin_buffer(vx8);        call unpin_buffer(vy8)
+ if (allocated(vx8)) then
+    call unpin_buffer(vx8);       call unpin_buffer(vy8)
     call unpin_buffer(vz8);       call unpin_buffer(pro2_8);     call unpin_buffer(spsound_8)
     call unpin_buffer(alphaAV_8); call unpin_buffer(u_8);        call unpin_buffer(fx8)
     call unpin_buffer(fy8);       call unpin_buffer(fz8);        call unpin_buffer(f48)
     call unpin_buffer(vsigmax8);  call unpin_buffer(divv8)
-    deallocate(x8,y8,z8,h8,vx8,vy8,vz8, &
+    deallocate(vx8,vy8,vz8, &
                pro2_8,spsound_8,alphaAV_8,u_8, &
                fx8,fy8,fz8,f48,vsigmax8,divv8)
  endif
 
- allocate(x8(n),y8(n),z8(n),h8(n),vx8(n),vy8(n),vz8(n), &
+ allocate(vx8(n),vy8(n),vz8(n), &
           pro2_8(n),spsound_8(n),alphaAV_8(n),u_8(n), &
           fx8(n),fy8(n),fz8(n),f48(n),vsigmax8(n),divv8(n))
 
- call pin_buffer(x8);        call pin_buffer(y8);         call pin_buffer(z8)
- call pin_buffer(h8);        call pin_buffer(vx8);        call pin_buffer(vy8)
+ call pin_buffer(vx8);       call pin_buffer(vy8)
  call pin_buffer(vz8);       call pin_buffer(pro2_8);     call pin_buffer(spsound_8)
  call pin_buffer(alphaAV_8); call pin_buffer(u_8);        call pin_buffer(fx8)
  call pin_buffer(fy8);       call pin_buffer(fz8);        call pin_buffer(f48)
