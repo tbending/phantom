@@ -29,7 +29,8 @@ module gpu_dens_iface
 !   gradh(1,i)    — 1/omega_i  (phantom's Grad-h correction factor)
 !                   where omega = 1 + (h/3*rho) * d(rho)/d(h)
 !   divcurlv(1,i) — div v
-!   dvdx(1:9,i)   — velocity gradient tensor
+!   xi_gpu(i)     — Cullen & Dehnen xi limiter, from the velocity gradient
+!                   tensor, which never leaves the GPU (see cons2prim)
 !   alphaind(3,i) — d(div v)/dt, source term of the Cullen & Dehnen switch
 !
 ! The last three used to be produced by a CPU densityiterate(icall=3) sweep
@@ -51,12 +52,12 @@ module gpu_dens_iface
 #ifdef GPU
 !--C interface to cosmoSPHere/src/dens_c_api.cu
  interface
-  subroutine densityiterate_gpu_c(h, rho, gradh_out, divv, dvdx_out, ddivvdt, &
+  subroutine densityiterate_gpu_c(h, rho, gradh_out, divv, xi_out, ddivvdt, &
                                   x, y, z, vx, vy, vz, ax, ay, az, n, pmass) bind(C)
    use iso_c_binding, only:c_double,c_int
    real(c_double), intent(inout) :: h(*)
    real(c_double), intent(out)   :: rho(*), gradh_out(*)
-   real(c_double), intent(out)   :: divv(*), dvdx_out(*), ddivvdt(*)
+   real(c_double), intent(out)   :: divv(*), xi_out(*), ddivvdt(*)
    real(c_double), intent(in)    :: x(*), y(*), z(*)
    real(c_double), intent(in)    :: vx(*), vy(*), vz(*)
    real(c_double), intent(in)    :: ax(*), ay(*), az(*)
@@ -81,11 +82,19 @@ module gpu_dens_iface
  public :: densityiterate_gpu, init_gpu_switch, pin_buffer, unpin_buffer
  private
 
+!
+! xi limiter per particle from the last GPU density solve, for cons2prim.  On the
+! GPU path the Cullen & Dehnen switch is the only reader of dv/dx (everything else
+! that needs it is refused), so the GPU forms xi and the 9-component tensor stays
+! on the device.  Set to 1 (xi of a zero tensor) until first computed.
+!
+ real, allocatable, public :: xi_gpu(:)
+
 #ifdef GPU
 !
 ! Staging buffers for the C call, module level and reused across calls:
 ! allocated on the first solve and grown only if npart rises.  Allocating and
-! freeing ~17 arrays of npart (dvdx8 alone is 9*npart) every solve made every
+! freeing ~15 arrays of npart every solve made every
 ! write into them a first touch of fresh pages.  They are registered with the
 ! driver for as long as they are allocated (see pin_buffer).
 !
@@ -94,7 +103,7 @@ module gpu_dens_iface
  real(c_double), allocatable, target :: vx8(:), vy8(:), vz8(:)
  real(c_double), allocatable, target :: ax8(:), ay8(:), az8(:)
  real(c_double), allocatable, target :: rho8(:), drhofh8(:)
- real(c_double), allocatable, target :: divv8(:), dvdx8(:), ddivvdt8(:)
+ real(c_double), allocatable, target :: divv8(:), xi8(:), ddivvdt8(:)
 #endif
 
 contains
@@ -142,9 +151,9 @@ end subroutine init_gpu_switch
 !  is used in cosmoSPHere/include/kernel.hpp before compiling libcosmoSPHere.a.
 !+
 !-------------------------------------------------------------
-subroutine densityiterate_gpu(npart, xyzh, vxyzu, fxyzu, fext, gradh, divcurlv, dvdx, alphaind)
+subroutine densityiterate_gpu(npart, xyzh, vxyzu, fxyzu, fext, gradh, divcurlv, alphaind)
  use part, only:massoftype,igas
- use dim,  only:nalpha,maxdvdx,maxp
+ use dim,  only:nalpha
 #ifdef GPU
  use io,   only:fatal
  use dim,  only:curlv,mhd,use_dust,do_radiation,gravity,ind_timesteps,use_apr,gr
@@ -159,12 +168,11 @@ subroutine densityiterate_gpu(npart, xyzh, vxyzu, fxyzu, fext, gradh, divcurlv, 
  real,         intent(in)    :: vxyzu(:,:),fxyzu(:,:),fext(:,:)
  real(kind=4), intent(inout) :: gradh(:,:)
  real(kind=4), intent(inout) :: divcurlv(:,:)
- real(kind=4), intent(inout) :: dvdx(:,:)
  real(kind=4), intent(inout) :: alphaind(:,:)
 
 #ifdef GPU
  real    :: hi, rhoi, drhoi, omega
- integer :: i, c
+ integer :: i
  integer(kind=8) :: ic0,ic1,ic2,ic3,ic4,crate
  character(len=8) :: statsenv
  logical, save    :: stats = .false.
@@ -226,7 +234,7 @@ subroutine densityiterate_gpu(npart, xyzh, vxyzu, fxyzu, fext, gradh, divcurlv, 
  !$omp end parallel do
  call system_clock(ic1)
 
- call densityiterate_gpu_c(h8, rho8, drhofh8, divv8, dvdx8, ddivvdt8, &
+ call densityiterate_gpu_c(h8, rho8, drhofh8, divv8, xi8, ddivvdt8, &
                             x8, y8, z8, vx8, vy8, vz8, ax8, ay8, az8, &
                             int(npart, kind=c_int), &
                             real(massoftype(igas), kind=c_double))
@@ -234,9 +242,9 @@ subroutine densityiterate_gpu(npart, xyzh, vxyzu, fxyzu, fext, gradh, divcurlv, 
 
  !--write results back to phantom arrays
  !  Skip inactive/dead particles (xyzh(4,i) < 0 in phantom convention)
- !$omp parallel do default(none) private(i,c,hi,rhoi,drhoi,omega) &
- !$omp shared(npart,xyzh,gradh,divcurlv,dvdx,alphaind) &
- !$omp shared(h8,rho8,drhofh8,divv8,dvdx8,ddivvdt8,maxdvdx,maxp)
+ !$omp parallel do default(none) private(i,hi,rhoi,drhoi,omega) &
+ !$omp shared(npart,xyzh,gradh,divcurlv,alphaind,xi_gpu) &
+ !$omp shared(h8,rho8,drhofh8,divv8,xi8,ddivvdt8)
  do i = 1, npart
     if (xyzh(4,i) < 0.) cycle   ! preserve negative h for inactive particles
     hi    = real(h8(i))
@@ -258,11 +266,7 @@ subroutine densityiterate_gpu(npart, xyzh, vxyzu, fxyzu, fext, gradh, divcurlv, 
        gradh(1,i) = 1.0_4
     endif
     divcurlv(1,i) = real(divv8(i), kind=4)
-    if (maxdvdx == maxp) then
-       do c = 1, 9
-          dvdx(c,i) = real(dvdx8(9*(i-1) + c), kind=4)
-       enddo
-    endif
+    xi_gpu(i) = real(xi8(i))
     if (nalpha >= 3) alphaind(3,i) = real(ddivvdt8(i), kind=4)
  enddo
  !$omp end parallel do
@@ -304,20 +308,21 @@ subroutine ensure_buffers(n)
     call unpin_buffer(h8);   call unpin_buffer(vx8);  call unpin_buffer(vy8)
     call unpin_buffer(vz8);  call unpin_buffer(ax8);  call unpin_buffer(ay8)
     call unpin_buffer(az8);  call unpin_buffer(rho8); call unpin_buffer(drhofh8)
-    call unpin_buffer(divv8); call unpin_buffer(dvdx8); call unpin_buffer(ddivvdt8)
+    call unpin_buffer(divv8); call unpin_buffer(xi8); call unpin_buffer(ddivvdt8)
     deallocate(x8, y8, z8, h8, vx8, vy8, vz8, ax8, ay8, az8, &
-               rho8, drhofh8, divv8, dvdx8, ddivvdt8)
+               rho8, drhofh8, divv8, xi8, ddivvdt8, xi_gpu)
  endif
 
  allocate(x8(n), y8(n), z8(n), h8(n), vx8(n), vy8(n), vz8(n), &
           ax8(n), ay8(n), az8(n), rho8(n), drhofh8(n), &
-          divv8(n), dvdx8(9*n), ddivvdt8(n))
+          divv8(n), xi8(n), ddivvdt8(n), xi_gpu(n))
+ xi_gpu = 1.
 
  call pin_buffer(x8);   call pin_buffer(y8);   call pin_buffer(z8)
  call pin_buffer(h8);   call pin_buffer(vx8);  call pin_buffer(vy8)
  call pin_buffer(vz8);  call pin_buffer(ax8);  call pin_buffer(ay8)
  call pin_buffer(az8);  call pin_buffer(rho8); call pin_buffer(drhofh8)
- call pin_buffer(divv8); call pin_buffer(dvdx8); call pin_buffer(ddivvdt8)
+ call pin_buffer(divv8); call pin_buffer(xi8); call pin_buffer(ddivvdt8)
 
  nbuf = n
 
