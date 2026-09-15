@@ -117,7 +117,7 @@ subroutine densityiterate_gpu(npart, xyzh, vxyzu, fxyzu, fext, gradh, divcurlv, 
  use dim,  only:nalpha,maxdvdx,maxp
 #ifdef GPU
  use io,   only:fatal
- use dim,  only:curlv,mhd,use_dust,do_radiation,gravity
+ use dim,  only:curlv,mhd,use_dust,do_radiation,gravity,ind_timesteps
  use iso_c_binding, only:c_double,c_int
 #endif
  integer,      intent(in)    :: npart
@@ -152,6 +152,9 @@ subroutine densityiterate_gpu(npart, xyzh, vxyzu, fxyzu, fext, gradh, divcurlv, 
  if (use_dust)     call fatal('densityiterate_gpu','dust density not computed on GPU')
  if (do_radiation) call fatal('densityiterate_gpu','radiation flux not computed on GPU')
  if (gravity)      call fatal('densityiterate_gpu','gradsoft not computed on GPU')
+ !--the GPU force pass evaluates and overwrites every particle, not just the
+ !  active ones, so individual timesteps would advance inactive particles
+ if (ind_timesteps) call fatal('densityiterate_gpu','individual timesteps not supported on GPU (IND_TIMESTEPS=no)')
 
  !--COSMO_DENS_STATS=1 also reports the phantom-side cost of the GPU call
  if (.not. stats_checked) then
@@ -173,7 +176,10 @@ subroutine densityiterate_gpu(npart, xyzh, vxyzu, fxyzu, fext, gradh, divcurlv, 
     x8(i) = real(xyzh(1,i), kind=c_double)
     y8(i) = real(xyzh(2,i), kind=c_double)
     z8(i) = real(xyzh(3,i), kind=c_double)
-    h8(i) = real(abs(xyzh(4,i)), kind=c_double)
+    !--h passed SIGNED: h <= 0 marks dead and accreted particles
+    !  (isdead_or_accreted), which the GPU sorts out of the tree.  abs() here
+    !  used to make them look alive.
+    h8(i) = real(xyzh(4,i), kind=c_double)
     vx8(i) = real(vxyzu(1,i), kind=c_double)
     vy8(i) = real(vxyzu(2,i), kind=c_double)
     vz8(i) = real(vxyzu(3,i), kind=c_double)

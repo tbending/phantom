@@ -205,8 +205,9 @@ end subroutine prepare_pro2_gpu
 !-----------------------------------------------------------------------
 subroutine finish_gpu_force_timesteps(npart,xyzh,fxyzu)
  use options,  only:alpha
- use timestep, only:C_cour,C_force,bignumber, &
+ use timestep, only:C_cour,C_force,bignumber,dtmax, &
                     dtcourant,dtforce,dtrad
+ use part,     only:isdead_or_accreted
 
  integer, intent(in) :: npart
  real,    intent(in) :: xyzh(:,:)
@@ -221,11 +222,19 @@ subroutine finish_gpu_force_timesteps(npart,xyzh,fxyzu)
 
  do i = 1,npart
     hi = xyzh(4,i)
+    !--as force.F90: dead and accreted particles (h <= 0) set no constraint.
+    !  Left in, one of them makes dtc negative and dtf the sqrt of a negative
+    !  number, which poisons the global timestep.
+    if (isdead_or_accreted(hi)) cycle
 
     vsigdtc = max(vsigmax8(i),spsound_8(i))
 
-    dtc = C_cour*hi / &
-          (vsigdtc*max(alpha,1.0))
+    !--as force.F90: no signal speed means no Courant constraint, not a
+    !  division by zero
+    dtc = dtmax
+    if (vsigdtc > tiny(vsigdtc)) then
+       dtc = C_cour*hi/(vsigdtc*max(alpha,1.0))
+    endif
 
     f2i = fxyzu(1,i)*fxyzu(1,i) + &
           fxyzu(2,i)*fxyzu(2,i) + &
