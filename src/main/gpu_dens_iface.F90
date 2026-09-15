@@ -38,9 +38,7 @@ module gpu_dens_iface
 !
 ! :Dependencies: dim, HIIRegion, io, iso_c_binding, part, ptmass, ptmass_radiation
 !
-#ifdef GPU
  use iso_c_binding, only:c_double
-#endif
  implicit none
 
 #ifdef GPU
@@ -64,10 +62,22 @@ module gpu_dens_iface
    integer(c_int), value         :: n
    real(c_double), value         :: pmass
   end subroutine densityiterate_gpu_c
+
+!--C interface to cosmoSPHere/src/pin_c_api.cu
+  subroutine cosmo_pin_host(ptr, nbytes) bind(C)
+   use iso_c_binding, only:c_ptr,c_size_t
+   type(c_ptr),       value :: ptr
+   integer(c_size_t), value :: nbytes
+  end subroutine cosmo_pin_host
+
+  subroutine cosmo_unpin_host(ptr) bind(C)
+   use iso_c_binding, only:c_ptr
+   type(c_ptr), value :: ptr
+  end subroutine cosmo_unpin_host
  end interface
 #endif
 
- public :: densityiterate_gpu, init_gpu_switch
+ public :: densityiterate_gpu, init_gpu_switch, pin_buffer, unpin_buffer
  private
 
 #ifdef GPU
@@ -75,14 +85,15 @@ module gpu_dens_iface
 ! Staging buffers for the C call, module level and reused across calls:
 ! allocated on the first solve and grown only if npart rises.  Allocating and
 ! freeing ~17 arrays of npart (dvdx8 alone is 9*npart) every solve made every
-! write into them a first touch of fresh pages.
+! write into them a first touch of fresh pages.  They are registered with the
+! driver for as long as they are allocated (see pin_buffer).
 !
  integer :: nbuf = 0
- real(c_double), allocatable :: x8(:), y8(:), z8(:), h8(:)
- real(c_double), allocatable :: vx8(:), vy8(:), vz8(:)
- real(c_double), allocatable :: ax8(:), ay8(:), az8(:)
- real(c_double), allocatable :: rho8(:), drhofh8(:)
- real(c_double), allocatable :: divv8(:), dvdx8(:), ddivvdt8(:)
+ real(c_double), allocatable, target :: x8(:), y8(:), z8(:), h8(:)
+ real(c_double), allocatable, target :: vx8(:), vy8(:), vz8(:)
+ real(c_double), allocatable, target :: ax8(:), ay8(:), az8(:)
+ real(c_double), allocatable, target :: rho8(:), drhofh8(:)
+ real(c_double), allocatable, target :: divv8(:), dvdx8(:), ddivvdt8(:)
 #endif
 
 contains
@@ -284,6 +295,11 @@ subroutine ensure_buffers(n)
  if (nbuf >= n) return
 
  if (allocated(x8)) then
+    call unpin_buffer(x8);   call unpin_buffer(y8);   call unpin_buffer(z8)
+    call unpin_buffer(h8);   call unpin_buffer(vx8);  call unpin_buffer(vy8)
+    call unpin_buffer(vz8);  call unpin_buffer(ax8);  call unpin_buffer(ay8)
+    call unpin_buffer(az8);  call unpin_buffer(rho8); call unpin_buffer(drhofh8)
+    call unpin_buffer(divv8); call unpin_buffer(dvdx8); call unpin_buffer(ddivvdt8)
     deallocate(x8, y8, z8, h8, vx8, vy8, vz8, ax8, ay8, az8, &
                rho8, drhofh8, divv8, dvdx8, ddivvdt8)
  endif
@@ -292,9 +308,45 @@ subroutine ensure_buffers(n)
           ax8(n), ay8(n), az8(n), rho8(n), drhofh8(n), &
           divv8(n), dvdx8(9*n), ddivvdt8(n))
 
+ call pin_buffer(x8);   call pin_buffer(y8);   call pin_buffer(z8)
+ call pin_buffer(h8);   call pin_buffer(vx8);  call pin_buffer(vy8)
+ call pin_buffer(vz8);  call pin_buffer(ax8);  call pin_buffer(ay8)
+ call pin_buffer(az8);  call pin_buffer(rho8); call pin_buffer(drhofh8)
+ call pin_buffer(divv8); call pin_buffer(dvdx8); call pin_buffer(ddivvdt8)
+
  nbuf = n
 
 end subroutine ensure_buffers
 #endif
+
+!-------------------------------------------------------------
+!+
+!  Register a staging buffer with the GPU driver, so the device
+!  copies into and out of it are not slowed by on-demand page
+!  population (catastrophically so on GH200 at 11.3M particles).
+!  Must be undone with unpin_buffer before the buffer is freed.
+!  Failure is silent: the copies still work, unpinned.  No-ops in a
+!  GPU=no build.
+!+
+!-------------------------------------------------------------
+subroutine pin_buffer(a)
+ use iso_c_binding, only:c_loc,c_size_t,c_sizeof
+ real(c_double), intent(in), target :: a(:)
+
+#ifdef GPU
+ if (size(a) > 0) call cosmo_pin_host(c_loc(a(1)), int(size(a),kind=c_size_t)*c_sizeof(a(1)))
+#endif
+
+end subroutine pin_buffer
+
+subroutine unpin_buffer(a)
+ use iso_c_binding, only:c_loc
+ real(c_double), intent(in), target :: a(:)
+
+#ifdef GPU
+ if (size(a) > 0) call cosmo_unpin_host(c_loc(a(1)))
+#endif
+
+end subroutine unpin_buffer
 
 end module gpu_dens_iface

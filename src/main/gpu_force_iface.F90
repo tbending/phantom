@@ -32,7 +32,7 @@ module gpu_force_iface
 !
 ! :Runtime parameters: None
 !
-! :Dependencies: dim, iso_c_binding, options, part, timestep
+! :Dependencies: dim, gpu_dens_iface, iso_c_binding, options, part, timestep
 !
  use iso_c_binding, only:c_double,c_int
  implicit none
@@ -68,13 +68,14 @@ module gpu_force_iface
 !
 ! Staging buffers shared by the routines below.  nbuf is their current capacity;
 ! ensure_buffers grows them when npart exceeds it and is otherwise a no-op.
+! They are registered with the driver while allocated (gpu_dens_iface pin_buffer).
 !
  integer :: nbuf = 0
- real(c_double), allocatable :: x8(:),y8(:),z8(:),h8(:)
- real(c_double), allocatable :: vx8(:),vy8(:),vz8(:)
- real(c_double), allocatable :: pro2_8(:),spsound_8(:),alphaAV_8(:),u_8(:)
- real(c_double), allocatable :: fx8(:),fy8(:),fz8(:),f48(:)
- real(c_double), allocatable :: vsigmax8(:),divv8(:)
+ real(c_double), allocatable, target :: x8(:),y8(:),z8(:),h8(:)
+ real(c_double), allocatable, target :: vx8(:),vy8(:),vz8(:)
+ real(c_double), allocatable, target :: pro2_8(:),spsound_8(:),alphaAV_8(:),u_8(:)
+ real(c_double), allocatable, target :: fx8(:),fy8(:),fz8(:),f48(:)
+ real(c_double), allocatable, target :: vsigmax8(:),divv8(:)
 
 contains
 
@@ -142,11 +143,18 @@ end subroutine force_gpu
 !+
 !-----------------------------------------------------------------------
 subroutine ensure_buffers(n)
+ use gpu_dens_iface, only:pin_buffer,unpin_buffer
  integer, intent(in) :: n
 
  if (nbuf >= n) return
 
  if (allocated(x8)) then
+    call unpin_buffer(x8);        call unpin_buffer(y8);         call unpin_buffer(z8)
+    call unpin_buffer(h8);        call unpin_buffer(vx8);        call unpin_buffer(vy8)
+    call unpin_buffer(vz8);       call unpin_buffer(pro2_8);     call unpin_buffer(spsound_8)
+    call unpin_buffer(alphaAV_8); call unpin_buffer(u_8);        call unpin_buffer(fx8)
+    call unpin_buffer(fy8);       call unpin_buffer(fz8);        call unpin_buffer(f48)
+    call unpin_buffer(vsigmax8);  call unpin_buffer(divv8)
     deallocate(x8,y8,z8,h8,vx8,vy8,vz8, &
                pro2_8,spsound_8,alphaAV_8,u_8, &
                fx8,fy8,fz8,f48,vsigmax8,divv8)
@@ -155,6 +163,13 @@ subroutine ensure_buffers(n)
  allocate(x8(n),y8(n),z8(n),h8(n),vx8(n),vy8(n),vz8(n), &
           pro2_8(n),spsound_8(n),alphaAV_8(n),u_8(n), &
           fx8(n),fy8(n),fz8(n),f48(n),vsigmax8(n),divv8(n))
+
+ call pin_buffer(x8);        call pin_buffer(y8);         call pin_buffer(z8)
+ call pin_buffer(h8);        call pin_buffer(vx8);        call pin_buffer(vy8)
+ call pin_buffer(vz8);       call pin_buffer(pro2_8);     call pin_buffer(spsound_8)
+ call pin_buffer(alphaAV_8); call pin_buffer(u_8);        call pin_buffer(fx8)
+ call pin_buffer(fy8);       call pin_buffer(fz8);        call pin_buffer(f48)
+ call pin_buffer(vsigmax8);  call pin_buffer(divv8)
 
  nbuf = n
 
