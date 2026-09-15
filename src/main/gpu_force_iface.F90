@@ -104,9 +104,13 @@ subroutine force_gpu(npart,xyzh,vxyzu,eos_vars,alphaind,fxyzu,divcurlv)
 
  !--positions and h are not sent: the GPU uses its copies from the density solve,
  !  and it reads these velocities only when they may differ from the solve's
- vx8(1:npart) = real(vxyzu(1,1:npart),kind=c_double)
- vy8(1:npart) = real(vxyzu(2,1:npart),kind=c_double)
- vz8(1:npart) = real(vxyzu(3,1:npart),kind=c_double)
+ !$omp parallel do default(none) schedule(static) private(i) shared(npart,vxyzu,vx8,vy8,vz8)
+ do i = 1,npart
+    vx8(i) = real(vxyzu(1,i),kind=c_double)
+    vy8(i) = real(vxyzu(2,i),kind=c_double)
+    vz8(i) = real(vxyzu(3,i),kind=c_double)
+ enddo
+ !$omp end parallel do
 
  call force_gpu_c(int(npart,kind=c_int),                &
                   real(massoftype(igas),kind=c_double), &
@@ -116,6 +120,8 @@ subroutine force_gpu(npart,xyzh,vxyzu,eos_vars,alphaind,fxyzu,divcurlv)
                   real(alphau,kind=c_double),           &
                   fx8,fy8,fz8,f48,vsigmax8,divv8)
 
+ !$omp parallel do default(none) schedule(static) private(i) &
+ !$omp shared(npart,fxyzu,divcurlv,fx8,fy8,fz8,f48,divv8)
  do i = 1,npart
     fxyzu(1,i)    = real(fx8(i),kind=kind(fxyzu))
     fxyzu(2,i)    = real(fy8(i),kind=kind(fxyzu))
@@ -123,6 +129,7 @@ subroutine force_gpu(npart,xyzh,vxyzu,eos_vars,alphaind,fxyzu,divcurlv)
     fxyzu(4,i)    = real(f48(i),kind=kind(fxyzu))
     divcurlv(1,i) = real(divv8(i),kind=kind(divcurlv))
  enddo
+ !$omp end parallel do
 
  call finish_gpu_force_timesteps(npart,xyzh,fxyzu)
 #else
@@ -189,6 +196,9 @@ subroutine prepare_pro2_gpu(npart,xyzh,vxyzu,eos_vars,alphaind)
  integer :: i
  real    :: rhoi,rho1i
 
+ !$omp parallel do default(none) schedule(static) private(i,rhoi,rho1i) &
+ !$omp shared(npart,xyzh,vxyzu,eos_vars,alphaind,massoftype,alpha,maxalpha,maxp) &
+ !$omp shared(pro2_8,spsound_8,u_8,alphaAV_8)
  do i = 1,npart
     rhoi         = rhoh(xyzh(4,i),massoftype(igas))
     rho1i        = 1.0/rhoi
@@ -203,6 +213,7 @@ subroutine prepare_pro2_gpu(npart,xyzh,vxyzu,eos_vars,alphaind)
        alphaAV_8(i) = alpha
     endif
  enddo
+ !$omp end parallel do
 
 end subroutine prepare_pro2_gpu
 
@@ -223,12 +234,16 @@ subroutine finish_gpu_force_timesteps(npart,xyzh,fxyzu)
  real,    intent(in) :: fxyzu(:,:)
 
  integer :: i
- real    :: hi,vsigdtc,f2i,dtc,dtf
+ real    :: hi,vsigdtc,f2i,dtc,dtf,dtcmin,dtfmin
 
- dtcourant = bignumber
- dtforce   = bignumber
- dtrad     = bignumber
+ dtcmin = bignumber
+ dtfmin = bignumber
+ dtrad  = bignumber
 
+ !--min is exact under reduction, so this is bit-identical to the serial loop
+ !$omp parallel do default(none) schedule(static) private(i,hi,vsigdtc,f2i,dtc,dtf) &
+ !$omp shared(npart,xyzh,fxyzu,vsigmax8,spsound_8,dtmax,C_cour,C_force,alpha) &
+ !$omp reduction(min:dtcmin,dtfmin)
  do i = 1,npart
     hi = xyzh(4,i)
     !--as force.F90: dead and accreted particles (h <= 0) set no constraint.
@@ -255,9 +270,13 @@ subroutine finish_gpu_force_timesteps(npart,xyzh,fxyzu)
        dtf = C_force*sqrt(hi/sqrt(f2i))
     endif
 
-    dtcourant = min(dtcourant,dtc)
-    dtforce   = min(dtforce,dtf)
+    dtcmin = min(dtcmin,dtc)
+    dtfmin = min(dtfmin,dtf)
  enddo
+ !$omp end parallel do
+
+ dtcourant = dtcmin
+ dtforce   = dtfmin
 
 end subroutine finish_gpu_force_timesteps
 
