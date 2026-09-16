@@ -40,7 +40,7 @@ module gpu_force_iface
 #ifdef GPU
  interface
     subroutine force_gpu_c(n,pmass,vx,vy,vz, &
-                         pro2,spsound,alphaAV,u,beta,alphau, &
+                         pro2,spsound,alphaAV,u,beta,alphau,disc_viscosity, &
                          fx,fy,fz,f4,vsigmax,divv) bind(C)
     use iso_c_binding, only:c_double,c_int
 
@@ -53,6 +53,7 @@ module gpu_force_iface
     real(c_double), intent(in)  :: u(*)
     real(c_double), value       :: beta
     real(c_double), value       :: alphau
+    integer(c_int), value       :: disc_viscosity
     real(c_double), intent(out) :: fx(*),fy(*),fz(*),f4(*)
     real(c_double), intent(out) :: vsigmax(*)
     real(c_double), intent(out) :: divv(*)
@@ -86,7 +87,7 @@ contains
 subroutine force_gpu(npart,xyzh,vxyzu,eos_vars,alphaind,fxyzu,divcurlv)
  use part,    only:massoftype,igas
  use options, only:beta,alphau
- use dim,     only:maxvxyzu,driving
+ use dim,     only:maxvxyzu,driving,disc_viscosity
 
  integer,      intent(in)    :: npart
  real,         intent(in)    :: xyzh(:,:),vxyzu(:,:)
@@ -119,6 +120,7 @@ subroutine force_gpu(npart,xyzh,vxyzu,eos_vars,alphaind,fxyzu,divcurlv)
                   pro2_8,spsound_8,alphaAV_8,u_8,       &
                   real(beta,kind=c_double),             &
                   real(alphau,kind=c_double),           &
+                  merge(1_c_int,0_c_int,disc_viscosity), &
                   fx8,fy8,fz8,f48,vsigmax8,divv8)
 
  !--as force.F90: with driving, fxyzu already holds the driving force (forceit
