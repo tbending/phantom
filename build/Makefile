@@ -572,7 +572,7 @@ endif
 .PHONY: cosmosphere
 cosmosphere:
 	$(MAKE) -C $(COSMO_DIR) lib GPU_BACKEND=$(GPU_BACKEND) \
-	    CUDA_ARCH="$(CUDA_ARCH)" HIP_ARCH=$(HIP_ARCH)
+	    CUDA_ARCH="$(CUDA_ARCH)" HIP_ARCH=$(HIP_ARCH) KERNEL=$(KERNEL)
 
 phantom: checksystem checkparams $(GPU_PREREQ) $(OBJECTS) phantom.o
 	$(FC) $(FFLAGS) -o $(BINDIR)/$@ $(OBJECTS) phantom.o $(LDFLAGS)
