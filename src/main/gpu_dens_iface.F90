@@ -42,8 +42,8 @@ module gpu_dens_iface
 ! that is needed from here is the switch, the box, and wrapping the particles
 ! into it, which the kd-tree build does on the CPU path.
 !
-! :Dependencies: boundary, dim, HIIRegion, io, iso_c_binding, mpidomain, part,
-!   ptmass, ptmass_radiation, viscosity
+! :Dependencies: boundary, dim, HIIRegion, io, iso_c_binding, kernel, mpidomain,
+!   options, part, ptmass, ptmass_radiation, viscosity
 !
  use iso_c_binding, only:c_double
  implicit none
@@ -59,7 +59,7 @@ module gpu_dens_iface
  interface
   subroutine densityiterate_gpu_c(h, rho, gradh_out, divv, xi_out, ddivvdt, &
                                   x, y, z, vx, vy, vz, ax, ay, az, n, pmass, &
-                                  periodic, box) bind(C)
+                                  periodic, box, tolh) bind(C)
    use iso_c_binding, only:c_double,c_int
    real(c_double), intent(inout) :: h(*)
    real(c_double), intent(out)   :: rho(*), gradh_out(*)
@@ -71,6 +71,7 @@ module gpu_dens_iface
    real(c_double), value         :: pmass
    integer(c_int), value         :: periodic
    real(c_double), intent(in)    :: box(6)
+   real(c_double), value         :: tolh
   end subroutine densityiterate_gpu_c
 
 !--C interface to cosmoSPHere/src/pin_c_api.cu
@@ -168,11 +169,14 @@ subroutine densityiterate_gpu(npart, xyzh, vxyzu, fxyzu, fext, gradh, divcurlv, 
  use part, only:isdead_or_accreted
  use boundary,  only:cross_boundary,xmin,xmax,ymin,ymax,zmin,zmax
  use mpidomain, only:isperiodic
+ use options,   only:tolh
  use dim,  only:curlv,mhd,use_dust,do_radiation,gravity,ind_timesteps,use_apr,gr
  use viscosity,        only:irealvisc
  use ptmass,           only:icreate_sinks
  use HIIRegion,        only:iH2R
  use ptmass_radiation, only:iget_tdust
+ use kernel,           only:kernelname
+ use part,             only:hfact
  use iso_c_binding, only:c_double,c_int
 #endif
  integer,      intent(in)    :: npart
@@ -214,6 +218,11 @@ subroutine densityiterate_gpu(npart, xyzh, vxyzu, fxyzu, fext, gradh, divcurlv, 
  !--the GPU force pass has neither physical viscosity nor general relativity
  if (irealvisc > 0)     call fatal('densityiterate_gpu','physical viscosity not computed on GPU (irealvisc=0)')
  if (gr)                call fatal('densityiterate_gpu','general relativity not supported on GPU')
+ !--cosmoSPHere hard-codes the M_4 cubic spline and hfact = 1.2 (include/kernel.hpp);
+ !  any other kernel or hfact would silently use the wrong one
+ if (trim(kernelname) /= 'M_4 cubic') call fatal('densityiterate_gpu', &
+    'only the M_4 cubic kernel is implemented on GPU (build with KERNEL=cubic), not '//trim(kernelname))
+ if (abs(hfact - 1.2) > 1.e-6) call fatal('densityiterate_gpu','GPU kernel assumes hfact = 1.2',var='hfact',val=hfact)
 
  !--COSMO_DENS_STATS=1 also reports the phantom-side cost of the GPU call
  if (.not. stats_checked) then
@@ -257,7 +266,8 @@ subroutine densityiterate_gpu(npart, xyzh, vxyzu, fxyzu, fext, gradh, divcurlv, 
                             int(npart, kind=c_int), &
                             real(massoftype(igas), kind=c_double), &
                             merge(1_c_int, 0_c_int, periodic), &
-                            real([xmin,xmax,ymin,ymax,zmin,zmax], kind=c_double))
+                            real([xmin,xmax,ymin,ymax,zmin,zmax], kind=c_double), &
+                            real(tolh, kind=c_double))
  call system_clock(ic2)
 
  !--write results back to phantom arrays
