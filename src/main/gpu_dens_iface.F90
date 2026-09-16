@@ -177,6 +177,8 @@ subroutine densityiterate_gpu(npart, xyzh, vxyzu, fxyzu, fext, gradh, divcurlv, 
  use ptmass_radiation, only:iget_tdust
  use kernel,           only:kernelname
  use part,             only:hfact
+ use part,             only:iphase,iamtype,iamboundary
+ use dim,              only:maxphase,maxp
  use iso_c_binding, only:c_double,c_int
 #endif
  integer,      intent(in)    :: npart
@@ -188,7 +190,7 @@ subroutine densityiterate_gpu(npart, xyzh, vxyzu, fxyzu, fext, gradh, divcurlv, 
 
 #ifdef GPU
  real    :: hi, rhoi, drhoi, omega
- integer :: i, ncross
+ integer :: i, ncross, nbound
  integer(kind=8) :: ic0,ic1,ic2,ic3,ic4,crate
  character(len=8) :: statsenv
  logical, save    :: stats = .false.
@@ -223,6 +225,20 @@ subroutine densityiterate_gpu(npart, xyzh, vxyzu, fxyzu, fext, gradh, divcurlv, 
  if (trim(kernelname) /= 'M_4 cubic') call fatal('densityiterate_gpu', &
     'only the M_4 cubic kernel is implemented on GPU (build with KERNEL=cubic), not '//trim(kernelname))
  if (abs(hfact - 1.2) > 1.e-6) call fatal('densityiterate_gpu','GPU kernel assumes hfact = 1.2',var='hfact',val=hfact)
+
+ !--boundary particles (wind shells, BHL inflow): on the CPU path they are inactive
+ !  after the first call -- no force, no timestep constraint, h left as it was --
+ !  but the GPU path would evolve them as gas.  Checked every call, as injection
+ !  adds them during a run.
+ if (maxphase == maxp) then
+    nbound = 0
+    !$omp parallel do default(none) shared(npart,iphase) private(i) reduction(+:nbound)
+    do i = 1, npart
+       if (iamboundary(iamtype(iphase(i)))) nbound = nbound + 1
+    enddo
+    !$omp end parallel do
+    if (nbound > 0) call fatal('densityiterate_gpu','boundary particles not supported on GPU',ival=nbound)
+ endif
 
  !--COSMO_DENS_STATS=1 also reports the phantom-side cost of the GPU call
  if (.not. stats_checked) then
