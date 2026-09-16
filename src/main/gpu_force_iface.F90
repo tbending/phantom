@@ -86,6 +86,7 @@ contains
 subroutine force_gpu(npart,xyzh,vxyzu,eos_vars,alphaind,fxyzu,divcurlv)
  use part,    only:massoftype,igas
  use options, only:beta,alphau
+ use dim,     only:maxvxyzu,driving
 
  integer,      intent(in)    :: npart
  real,         intent(in)    :: xyzh(:,:),vxyzu(:,:)
@@ -120,18 +121,27 @@ subroutine force_gpu(npart,xyzh,vxyzu,eos_vars,alphaind,fxyzu,divcurlv)
                   real(alphau,kind=c_double),           &
                   fx8,fy8,fz8,f48,vsigmax8,divv8)
 
+ !--as force.F90: with driving, fxyzu already holds the driving force (forceit
+ !  runs first), so the SPH force is added to it.  Isothermal builds have no
+ !  u, so fxyzu has no fourth row and du/dt is discarded.
  !$omp parallel do default(none) schedule(static) private(i) &
  !$omp shared(npart,fxyzu,divcurlv,fx8,fy8,fz8,f48,divv8)
  do i = 1,npart
-    fxyzu(1,i)    = real(fx8(i),kind=kind(fxyzu))
-    fxyzu(2,i)    = real(fy8(i),kind=kind(fxyzu))
-    fxyzu(3,i)    = real(fz8(i),kind=kind(fxyzu))
-    fxyzu(4,i)    = real(f48(i),kind=kind(fxyzu))
+    if (driving) then
+       fxyzu(1,i) = fxyzu(1,i) + real(fx8(i),kind=kind(fxyzu))
+       fxyzu(2,i) = fxyzu(2,i) + real(fy8(i),kind=kind(fxyzu))
+       fxyzu(3,i) = fxyzu(3,i) + real(fz8(i),kind=kind(fxyzu))
+    else
+       fxyzu(1,i) = real(fx8(i),kind=kind(fxyzu))
+       fxyzu(2,i) = real(fy8(i),kind=kind(fxyzu))
+       fxyzu(3,i) = real(fz8(i),kind=kind(fxyzu))
+    endif
+    if (maxvxyzu >= 4) fxyzu(4,i) = real(f48(i),kind=kind(fxyzu))
     divcurlv(1,i) = real(divv8(i),kind=kind(divcurlv))
  enddo
  !$omp end parallel do
 
- call finish_gpu_force_timesteps(npart,xyzh,fxyzu)
+ call finish_gpu_force_timesteps(npart,xyzh)
 #else
  print *, 'ERROR: force_gpu called but phantom not compiled with GPU=yes'
  stop
@@ -183,7 +193,7 @@ end subroutine ensure_buffers
 !+
 !-----------------------------------------------------------------------
 subroutine prepare_pro2_gpu(npart,xyzh,vxyzu,eos_vars,alphaind)
- use dim,     only:maxalpha,maxp
+ use dim,     only:maxalpha,maxp,maxvxyzu
  use options, only:alpha
  use part,    only:igas,igasP,ics,massoftype,rhoh
 
@@ -205,7 +215,13 @@ subroutine prepare_pro2_gpu(npart,xyzh,vxyzu,eos_vars,alphaind)
 
     pro2_8(i)    = eos_vars(igasP,i)*rho1i*rho1i
     spsound_8(i) = eos_vars(ics,i)
-    u_8(i)       = vxyzu(4,i)
+    !--isothermal: no u to read; u enters only the conductivity term of du/dt,
+    !  which is discarded
+    if (maxvxyzu >= 4) then
+       u_8(i) = vxyzu(4,i)
+    else
+       u_8(i) = 0.
+    endif
 
     if (maxalpha == maxp) then
        alphaAV_8(i) = real(alphaind(1,i),kind=c_double)
@@ -223,7 +239,7 @@ end subroutine prepare_pro2_gpu
 !  and the sound speed come from the staging buffers the kernel just filled.
 !+
 !-----------------------------------------------------------------------
-subroutine finish_gpu_force_timesteps(npart,xyzh,fxyzu)
+subroutine finish_gpu_force_timesteps(npart,xyzh)
  use options,  only:alpha
  use timestep, only:C_cour,C_force,bignumber,dtmax, &
                     dtcourant,dtforce,dtrad
@@ -231,7 +247,6 @@ subroutine finish_gpu_force_timesteps(npart,xyzh,fxyzu)
 
  integer, intent(in) :: npart
  real,    intent(in) :: xyzh(:,:)
- real,    intent(in) :: fxyzu(:,:)
 
  integer :: i
  real    :: hi,vsigdtc,f2i,dtc,dtf,dtcmin,dtfmin
@@ -242,7 +257,7 @@ subroutine finish_gpu_force_timesteps(npart,xyzh,fxyzu)
 
  !--min is exact under reduction, so this is bit-identical to the serial loop
  !$omp parallel do default(none) schedule(static) private(i,hi,vsigdtc,f2i,dtc,dtf) &
- !$omp shared(npart,xyzh,fxyzu,vsigmax8,spsound_8,dtmax,C_cour,C_force,alpha) &
+ !$omp shared(npart,xyzh,fx8,fy8,fz8,vsigmax8,spsound_8,dtmax,C_cour,C_force,alpha) &
  !$omp reduction(min:dtcmin,dtfmin)
  do i = 1,npart
     hi = xyzh(4,i)
@@ -260,9 +275,10 @@ subroutine finish_gpu_force_timesteps(npart,xyzh,fxyzu)
        dtc = C_cour*hi/(vsigdtc*max(alpha,1.0))
     endif
 
-    f2i = fxyzu(1,i)*fxyzu(1,i) + &
-          fxyzu(2,i)*fxyzu(2,i) + &
-          fxyzu(3,i)*fxyzu(3,i)
+    !--as force.F90, from the SPH force alone (before any driving force is added)
+    f2i = fx8(i)*fx8(i) + &
+          fy8(i)*fy8(i) + &
+          fz8(i)*fz8(i)
 
     dtf = bignumber
 
