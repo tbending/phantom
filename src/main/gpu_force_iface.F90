@@ -32,21 +32,20 @@ module gpu_force_iface
 !
 ! :Runtime parameters: None
 !
-! :Dependencies: dim, iso_c_binding, options, part, timestep
+! :Dependencies: dim, gpu_dens_iface, iso_c_binding, options, part, timestep
 !
  use iso_c_binding, only:c_double,c_int
  implicit none
 
 #ifdef GPU
  interface
-    subroutine force_gpu_c(n,pmass,x,y,z,h,vx,vy,vz, &
+    subroutine force_gpu_c(n,pmass,vx,vy,vz, &
                          pro2,spsound,alphaAV,u,beta,alphau, &
                          fx,fy,fz,f4,vsigmax,divv) bind(C)
     use iso_c_binding, only:c_double,c_int
 
     integer(c_int), value       :: n
     real(c_double), value       :: pmass
-    real(c_double), intent(in)  :: x(*),y(*),z(*),h(*)
     real(c_double), intent(in)  :: vx(*),vy(*),vz(*)
     real(c_double), intent(in)  :: pro2(*)
     real(c_double), intent(in)  :: spsound(*)
@@ -68,13 +67,13 @@ module gpu_force_iface
 !
 ! Staging buffers shared by the routines below.  nbuf is their current capacity;
 ! ensure_buffers grows them when npart exceeds it and is otherwise a no-op.
+! They are registered with the driver while allocated (gpu_dens_iface pin_buffer).
 !
  integer :: nbuf = 0
- real(c_double), allocatable :: x8(:),y8(:),z8(:),h8(:)
- real(c_double), allocatable :: vx8(:),vy8(:),vz8(:)
- real(c_double), allocatable :: pro2_8(:),spsound_8(:),alphaAV_8(:),u_8(:)
- real(c_double), allocatable :: fx8(:),fy8(:),fz8(:),f48(:)
- real(c_double), allocatable :: vsigmax8(:),divv8(:)
+ real(c_double), allocatable, target :: vx8(:),vy8(:),vz8(:)
+ real(c_double), allocatable, target :: pro2_8(:),spsound_8(:),alphaAV_8(:),u_8(:)
+ real(c_double), allocatable, target :: fx8(:),fy8(:),fz8(:),f48(:)
+ real(c_double), allocatable, target :: vsigmax8(:),divv8(:)
 
 contains
 
@@ -103,22 +102,26 @@ subroutine force_gpu(npart,xyzh,vxyzu,eos_vars,alphaind,fxyzu,divcurlv)
  call ensure_buffers(npart)
  call prepare_pro2_gpu(npart,xyzh,vxyzu,eos_vars,alphaind)
 
- x8(1:npart)  = real(xyzh(1,1:npart),kind=c_double)
- y8(1:npart)  = real(xyzh(2,1:npart),kind=c_double)
- z8(1:npart)  = real(xyzh(3,1:npart),kind=c_double)
- h8(1:npart)  = real(xyzh(4,1:npart),kind=c_double)
- vx8(1:npart) = real(vxyzu(1,1:npart),kind=c_double)
- vy8(1:npart) = real(vxyzu(2,1:npart),kind=c_double)
- vz8(1:npart) = real(vxyzu(3,1:npart),kind=c_double)
+ !--positions and h are not sent: the GPU uses its copies from the density solve,
+ !  and it reads these velocities only when they may differ from the solve's
+ !$omp parallel do default(none) schedule(static) private(i) shared(npart,vxyzu,vx8,vy8,vz8)
+ do i = 1,npart
+    vx8(i) = real(vxyzu(1,i),kind=c_double)
+    vy8(i) = real(vxyzu(2,i),kind=c_double)
+    vz8(i) = real(vxyzu(3,i),kind=c_double)
+ enddo
+ !$omp end parallel do
 
  call force_gpu_c(int(npart,kind=c_int),                &
                   real(massoftype(igas),kind=c_double), &
-                  x8,y8,z8,h8,vx8,vy8,vz8,              &
+                  vx8,vy8,vz8,                          &
                   pro2_8,spsound_8,alphaAV_8,u_8,       &
                   real(beta,kind=c_double),             &
                   real(alphau,kind=c_double),           &
                   fx8,fy8,fz8,f48,vsigmax8,divv8)
 
+ !$omp parallel do default(none) schedule(static) private(i) &
+ !$omp shared(npart,fxyzu,divcurlv,fx8,fy8,fz8,f48,divv8)
  do i = 1,npart
     fxyzu(1,i)    = real(fx8(i),kind=kind(fxyzu))
     fxyzu(2,i)    = real(fy8(i),kind=kind(fxyzu))
@@ -126,6 +129,7 @@ subroutine force_gpu(npart,xyzh,vxyzu,eos_vars,alphaind,fxyzu,divcurlv)
     fxyzu(4,i)    = real(f48(i),kind=kind(fxyzu))
     divcurlv(1,i) = real(divv8(i),kind=kind(divcurlv))
  enddo
+ !$omp end parallel do
 
  call finish_gpu_force_timesteps(npart,xyzh,fxyzu)
 #else
@@ -142,19 +146,31 @@ end subroutine force_gpu
 !+
 !-----------------------------------------------------------------------
 subroutine ensure_buffers(n)
+ use gpu_dens_iface, only:pin_buffer,unpin_buffer
  integer, intent(in) :: n
 
  if (nbuf >= n) return
 
- if (allocated(x8)) then
-    deallocate(x8,y8,z8,h8,vx8,vy8,vz8, &
+ if (allocated(vx8)) then
+    call unpin_buffer(vx8);       call unpin_buffer(vy8)
+    call unpin_buffer(vz8);       call unpin_buffer(pro2_8);     call unpin_buffer(spsound_8)
+    call unpin_buffer(alphaAV_8); call unpin_buffer(u_8);        call unpin_buffer(fx8)
+    call unpin_buffer(fy8);       call unpin_buffer(fz8);        call unpin_buffer(f48)
+    call unpin_buffer(vsigmax8);  call unpin_buffer(divv8)
+    deallocate(vx8,vy8,vz8, &
                pro2_8,spsound_8,alphaAV_8,u_8, &
                fx8,fy8,fz8,f48,vsigmax8,divv8)
  endif
 
- allocate(x8(n),y8(n),z8(n),h8(n),vx8(n),vy8(n),vz8(n), &
+ allocate(vx8(n),vy8(n),vz8(n), &
           pro2_8(n),spsound_8(n),alphaAV_8(n),u_8(n), &
           fx8(n),fy8(n),fz8(n),f48(n),vsigmax8(n),divv8(n))
+
+ call pin_buffer(vx8);       call pin_buffer(vy8)
+ call pin_buffer(vz8);       call pin_buffer(pro2_8);     call pin_buffer(spsound_8)
+ call pin_buffer(alphaAV_8); call pin_buffer(u_8);        call pin_buffer(fx8)
+ call pin_buffer(fy8);       call pin_buffer(fz8);        call pin_buffer(f48)
+ call pin_buffer(vsigmax8);  call pin_buffer(divv8)
 
  nbuf = n
 
@@ -180,6 +196,9 @@ subroutine prepare_pro2_gpu(npart,xyzh,vxyzu,eos_vars,alphaind)
  integer :: i
  real    :: rhoi,rho1i
 
+ !$omp parallel do default(none) schedule(static) private(i,rhoi,rho1i) &
+ !$omp shared(npart,xyzh,vxyzu,eos_vars,alphaind,massoftype,alpha,maxalpha,maxp) &
+ !$omp shared(pro2_8,spsound_8,u_8,alphaAV_8)
  do i = 1,npart
     rhoi         = rhoh(xyzh(4,i),massoftype(igas))
     rho1i        = 1.0/rhoi
@@ -194,6 +213,7 @@ subroutine prepare_pro2_gpu(npart,xyzh,vxyzu,eos_vars,alphaind)
        alphaAV_8(i) = alpha
     endif
  enddo
+ !$omp end parallel do
 
 end subroutine prepare_pro2_gpu
 
@@ -205,27 +225,40 @@ end subroutine prepare_pro2_gpu
 !-----------------------------------------------------------------------
 subroutine finish_gpu_force_timesteps(npart,xyzh,fxyzu)
  use options,  only:alpha
- use timestep, only:C_cour,C_force,bignumber, &
+ use timestep, only:C_cour,C_force,bignumber,dtmax, &
                     dtcourant,dtforce,dtrad
+ use part,     only:isdead_or_accreted
 
  integer, intent(in) :: npart
  real,    intent(in) :: xyzh(:,:)
  real,    intent(in) :: fxyzu(:,:)
 
  integer :: i
- real    :: hi,vsigdtc,f2i,dtc,dtf
+ real    :: hi,vsigdtc,f2i,dtc,dtf,dtcmin,dtfmin
 
- dtcourant = bignumber
- dtforce   = bignumber
- dtrad     = bignumber
+ dtcmin = bignumber
+ dtfmin = bignumber
+ dtrad  = bignumber
 
+ !--min is exact under reduction, so this is bit-identical to the serial loop
+ !$omp parallel do default(none) schedule(static) private(i,hi,vsigdtc,f2i,dtc,dtf) &
+ !$omp shared(npart,xyzh,fxyzu,vsigmax8,spsound_8,dtmax,C_cour,C_force,alpha) &
+ !$omp reduction(min:dtcmin,dtfmin)
  do i = 1,npart
     hi = xyzh(4,i)
+    !--as force.F90: dead and accreted particles (h <= 0) set no constraint.
+    !  Left in, one of them makes dtc negative and dtf the sqrt of a negative
+    !  number, which poisons the global timestep.
+    if (isdead_or_accreted(hi)) cycle
 
     vsigdtc = max(vsigmax8(i),spsound_8(i))
 
-    dtc = C_cour*hi / &
-          (vsigdtc*max(alpha,1.0))
+    !--as force.F90: no signal speed means no Courant constraint, not a
+    !  division by zero
+    dtc = dtmax
+    if (vsigdtc > tiny(vsigdtc)) then
+       dtc = C_cour*hi/(vsigdtc*max(alpha,1.0))
+    endif
 
     f2i = fxyzu(1,i)*fxyzu(1,i) + &
           fxyzu(2,i)*fxyzu(2,i) + &
@@ -237,9 +270,13 @@ subroutine finish_gpu_force_timesteps(npart,xyzh,fxyzu)
        dtf = C_force*sqrt(hi/sqrt(f2i))
     endif
 
-    dtcourant = min(dtcourant,dtc)
-    dtforce   = min(dtforce,dtf)
+    dtcmin = min(dtcmin,dtc)
+    dtfmin = min(dtfmin,dtf)
  enddo
+ !$omp end parallel do
+
+ dtcourant = dtcmin
+ dtforce   = dtfmin
 
 end subroutine finish_gpu_force_timesteps
 

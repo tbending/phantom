@@ -272,7 +272,7 @@ end subroutine cons2primall_sink
 !+
 !-----------------------------------------------------------------------------
 subroutine cons2prim_everything(npart,xyzh,vxyzu,dvdx,rad,eos_vars,radprop,&
-                                Bevol,Bxyz,dustevol,dustfrac,alphaind)
+                                Bevol,Bxyz,dustevol,dustfrac,alphaind,xi_limiter_in)
  use part,              only:isdead_or_accreted,massoftype,igas,rhoh,igasP,iradP,iradxi,ics,imu,iX,iZ,&
                              iohm,ihall,nden_nimhd,eta_nimhd,iambi,get_partinfo,iphase,this_is_a_test,&
                              ndustsmall,itemp,ikappa,idmu,idgamma,icv,aprmassoftype,apr_level
@@ -291,12 +291,15 @@ subroutine cons2prim_everything(npart,xyzh,vxyzu,dvdx,rad,eos_vars,radprop,&
  real,         intent(inout) :: vxyzu(:,:)
  real(kind=4), intent(inout) :: alphaind(:,:)
  real,         intent(out)   :: eos_vars(:,:),radprop(:,:),Bxyz(:,:),dustfrac(:,:)
+ !--precomputed xi limiter (the GPU path computes it from dv/dx on the device);
+ !  when absent it is formed here from dvdx
+ real,         intent(in), optional :: xi_limiter_in(:)
  integer      :: i,iamtypei,ierr
  integer      :: ierrlist(n_warn)
  real         :: rhoi,spsound,p_on_rhogas,rhogas,gasfrac,pmassi,uui
  real         :: Bxi,Byi,Bzi,psii,xi_limiteri,Bi,temperaturei,mui,X_i,Z_i,gammai
  real         :: xi,yi,zi,hi
- logical      :: iactivei,iamgasi,iamdusti
+ logical      :: iactivei,iamgasi,iamdusti,have_xi
 
  iactivei = .true.
  iamtypei = igas
@@ -307,6 +310,7 @@ subroutine cons2prim_everything(npart,xyzh,vxyzu,dvdx,rad,eos_vars,radprop,&
     call init_eos(ieos,ierr)
     if (ierr /= 0) call fatal('eos','could not initialise equation of state')
  endif
+ have_xi = present(xi_limiter_in)
  gammai = gamma
  mui    = gmw
  X_i    = X_in
@@ -316,7 +320,7 @@ subroutine cons2prim_everything(npart,xyzh,vxyzu,dvdx,rad,eos_vars,radprop,&
 !$omp shared(xyzh,vxyzu,npart,rad,eos_vars,radprop,Bevol,Bxyz,apr_level) &
 !$omp shared(ieos,nucleation,nden_nimhd,eta_nimhd) &
 !$omp shared(alpha,alphamax,iphase,maxphase,maxp,massoftype,aprmassoftype) &
-!$omp shared(use_dustfrac,dustfrac,dustevol,this_is_a_test,ndustsmall,alphaind,dvdx) &
+!$omp shared(use_dustfrac,dustfrac,dustevol,this_is_a_test,ndustsmall,alphaind,dvdx,have_xi,xi_limiter_in) &
 !$omp shared(iopacity_type,use_var_comp,do_nucleation,update_muGamma,implicit_radiation) &
 !$omp private(i,spsound,rhoi,p_on_rhogas,rhogas,gasfrac,uui) &
 !$omp private(Bxi,Byi,Bzi,psii,xi_limiteri,Bi,temperaturei,ierr,pmassi) &
@@ -413,7 +417,11 @@ subroutine cons2prim_everything(npart,xyzh,vxyzu,dvdx,rad,eos_vars,radprop,&
        ! Cullen & Dehnen (2010) shock viscosity switch, set alphaloc
        !
        if (nalpha >= 2) then
-          xi_limiteri = xi_limiter(dvdx(:,i))
+          if (have_xi) then
+             xi_limiteri = xi_limiter_in(i)
+          else
+             xi_limiteri = xi_limiter(dvdx(:,i))
+          endif
           alphaind(2,i) = real4(get_alphaloc(real(alphaind(3,i)),spsound,hi,xi_limiteri,alpha,alphamax))
        endif
 

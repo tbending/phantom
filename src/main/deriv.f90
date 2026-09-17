@@ -43,7 +43,7 @@ subroutine derivs(icall,npart,nactive,xyzh,vxyzu,fxyzu,fext,divcurlv,divcurlB,&
  use io,             only:iprint,fatal,error
  use neighkdtree,    only:build_tree
  use densityforce,   only:densityiterate
- use gpu_dens_iface,  only:densityiterate_gpu,use_gpu_dens
+ use gpu_dens_iface,  only:densityiterate_gpu,use_gpu_dens,init_gpu_switch,xi_gpu
  use gpu_force_iface, only:force_gpu
  use ptmass,         only:ipart_rhomax,ptmass_calc_enclosed_mass,ptmass_boundary_crossing,get_pressure_on_sinks
  use externalforces, only:externalforce
@@ -112,8 +112,12 @@ subroutine derivs(icall,npart,nactive,xyzh,vxyzu,fxyzu,fext,divcurlv,divcurlB,&
 !
 ! build tree to prepare neighbour finding
 !
+ call init_gpu_switch()
  if (icall==1 .or. icall==0) then
-    call build_tree(npart,nactive,xyzh,vxyzu)
+    !--the GPU path finds neighbours with cosmoSPHere's own octree, for density and
+    !  force alike, so nothing reads the kd-tree (densityiterate_gpu refuses the
+    !  options that would)
+    if (.not.use_gpu_dens) call build_tree(npart,nactive,xyzh,vxyzu)
 
     if (gr) then
        ! update time-dependent metric (e.g. binary BH) and repack at particle positions
@@ -135,9 +139,9 @@ subroutine derivs(icall,npart,nactive,xyzh,vxyzu,fxyzu,fext,divcurlv,divcurlB,&
 
  if (icall==1) then
     if (use_gpu_dens) then
-       !--GPU path: cosmoSPHere solves h, gradh(1,i)=1/omega, divv, dvdx and
-       !  ddivvdt in one pass, so no CPU sweep over the kd-tree is needed here
-       call densityiterate_gpu(npart,xyzh,vxyzu,fxyzu,fext,gradh,divcurlv,dvdx,alphaind)
+       !--GPU path: cosmoSPHere solves h, gradh(1,i)=1/omega, divv, the xi limiter
+       !  and ddivvdt in one pass, so no CPU sweep over the kd-tree is needed here
+       call densityiterate_gpu(npart,xyzh,vxyzu,fxyzu,fext,gradh,divcurlv,alphaind)
     else
        !--CPU path: original phantom behaviour, unchanged
        call densityiterate(1,npart,nactive,xyzh,vxyzu,divcurlv,divcurlB,Bevol,&
@@ -165,6 +169,10 @@ subroutine derivs(icall,npart,nactive,xyzh,vxyzu,fxyzu,fext,divcurlv,divcurlB,&
 
  if (gr) then
     call cons2primall(npart,xyzh,metrics,pxyzu,vxyzu,dens,eos_vars)
+ elseif (use_gpu_dens) then
+    !--the GPU returns the xi limiter instead of dv/dx
+    call cons2prim_everything(npart,xyzh,vxyzu,dvdx,rad,eos_vars,radprop,Bevol,Bxyz,dustevol,dustfrac,alphaind,&
+                              xi_limiter_in=xi_gpu)
  else
     call cons2prim_everything(npart,xyzh,vxyzu,dvdx,rad,eos_vars,radprop,Bevol,Bxyz,dustevol,dustfrac,alphaind)
  endif

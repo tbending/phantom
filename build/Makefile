@@ -211,7 +211,7 @@ endif
 endif
 
 #--GPU density solver (cosmoSPHere + Cornerstone octree)
-#  Usage: make GPU=yes GPU_TARGET=<a100|quadro_pascal|mi300>
+#  Usage: make GPU=yes GPU_TARGET=<a100|hopper|quadro_pascal|mi300>
 #         (cuda targets: module load cuda; hip targets: module load rocm/hipcc)
 #  GPU_TARGET selects a profile in Makefile_GPU (backend + arch) and is
 #  required when GPU=yes -- there is no default.  The same backend/arch is
@@ -220,7 +220,7 @@ endif
 GPU=no
 ifeq ($(GPU), yes)
 ifeq ($(GPU_TARGET),)
-    $(error GPU=yes requires GPU_TARGET to be set -- valid: a100, quadro_pascal, mi300 (see build/Makefile_GPU))
+    $(error GPU=yes requires GPU_TARGET to be set -- valid: a100, hopper, quadro_pascal, mi300 (see build/Makefile_GPU))
 endif
     include Makefile_GPU
     FPPFLAGS  += -DGPU
@@ -545,8 +545,8 @@ SOURCES= physcon.f90 ${CONFIG} ${SRCKERNEL} io.F90 units.f90 geometry.f90 \
          krome.F90 memory.f90 ${SRCRW_DUMPS} ${SRCINJECT} injection.f90 \
          H2regions.f90 subgroup.f90 \
          quitdump.f90 dens.F90\
-         gpu_dens_iface.F90 gpu_force_iface.F90\
-         ptmass.F90 force.F90 deriv.f90 ${SRCAPR} readwrite_infile.f90 energies.f90 sort_particles.f90 \
+         ptmass.F90 gpu_dens_iface.F90 gpu_force_iface.F90\
+         force.F90 deriv.f90 ${SRCAPR} readwrite_infile.f90 energies.f90 sort_particles.f90 \
          utils_shuffleparticles.F90 evwrite.f90 substepping.F90 step_leapfrog.f90 writeheader.f90 ${SRCAN} \
          mf_write.f90 egg.f90 evolve_utils.F90 evolve.f90 utils_linalg.f90 \
          checksetup.f90 initial.F90
