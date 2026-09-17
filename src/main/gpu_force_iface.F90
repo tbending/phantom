@@ -182,7 +182,7 @@ subroutine force_gpu(npart,xyzh,vxyzu,eos_vars,alphaind,fxyzu,divcurlv,dt)
     !$omp end parallel do
  endif
 
- call finish_gpu_force_timesteps(npart,xyzh)
+ call finish_gpu_force_timesteps(npart,xyzh,vxyzu,fxyzu)
 #else
  print *, 'ERROR: force_gpu called but phantom not compiled with GPU=yes'
  stop
@@ -280,25 +280,31 @@ end subroutine prepare_pro2_gpu
 !  and the sound speed come from the staging buffers the kernel just filled.
 !+
 !-----------------------------------------------------------------------
-subroutine finish_gpu_force_timesteps(npart,xyzh)
+subroutine finish_gpu_force_timesteps(npart,xyzh,vxyzu,fxyzu)
  use options,  only:alpha
  use timestep, only:C_cour,C_force,bignumber,dtmax, &
                     dtcourant,dtforce,dtrad
  use part,     only:isdead_or_accreted
+ use dim,      only:maxvxyzu,gr
+ use eos,      only:ieos
 
- integer, intent(in) :: npart
- real,    intent(in) :: xyzh(:,:)
+ integer, intent(in)    :: npart
+ real,    intent(in)    :: xyzh(:,:),vxyzu(:,:)
+ real,    intent(inout) :: fxyzu(:,:)
 
  integer :: i
- real    :: hi,vsigdtc,f2i,dtc,dtf,dtcmin,dtfmin
+ real    :: hi,vsigdtc,f2i,dtc,dtf,dtcmin,dtfmin,eni
+ logical :: limit_u
 
  dtcmin = bignumber
  dtfmin = bignumber
  dtrad  = bignumber
+ !--as force.F90: du/dt is limited so a Courant step cannot make u negative
+ limit_u = (maxvxyzu >= 4 .and. .not.gr .and. ieos /= 23)
 
  !--min is exact under reduction, so this is bit-identical to the serial loop
- !$omp parallel do default(none) schedule(static) private(i,hi,vsigdtc,f2i,dtc,dtf) &
- !$omp shared(npart,xyzh,fx8,fy8,fz8,vsigmax8,spsound_8,dtmax,C_cour,C_force,alpha) &
+ !$omp parallel do default(none) schedule(static) private(i,hi,vsigdtc,f2i,dtc,dtf,eni) &
+ !$omp shared(npart,xyzh,vxyzu,fxyzu,limit_u,fx8,fy8,fz8,vsigmax8,spsound_8,dtmax,C_cour,C_force,alpha) &
  !$omp reduction(min:dtcmin,dtfmin)
  do i = 1,npart
     hi = xyzh(4,i)
@@ -314,6 +320,15 @@ subroutine finish_gpu_force_timesteps(npart,xyzh)
     dtc = dtmax
     if (vsigdtc > tiny(vsigdtc)) then
        dtc = C_cour*hi/(vsigdtc*max(alpha,1.0))
+    endif
+
+    !--as force.F90, after every heating and cooling term is in du/dt: change du/dt
+    !  rather than let u + dtc*du/dt go negative
+    if (limit_u) then
+       eni = vxyzu(4,i)
+       if (eni + dtc*fxyzu(4,i) < epsilon(0.) .and. eni > epsilon(0.)) then
+          fxyzu(4,i) = fxyzu(4,i)/(1.-dtc*fxyzu(4,i)/eni)
+       endif
     endif
 
     !--as force.F90, from the SPH force alone (before any driving force is added)
