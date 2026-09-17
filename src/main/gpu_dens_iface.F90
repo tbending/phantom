@@ -59,7 +59,7 @@ module gpu_dens_iface
  interface
   subroutine densityiterate_gpu_c(h, rho, gradh_out, divv, xi_out, ddivvdt, &
                                   x, y, z, vx, vy, vz, ax, ay, az, n, pmass, &
-                                  periodic, box, tolh) bind(C)
+                                  periodic, box, tolh, hfact) bind(C)
    use iso_c_binding, only:c_double,c_int
    real(c_double), intent(inout) :: h(*)
    real(c_double), intent(out)   :: rho(*), gradh_out(*)
@@ -72,7 +72,13 @@ module gpu_dens_iface
    integer(c_int), value         :: periodic
    real(c_double), intent(in)    :: box(6)
    real(c_double), value         :: tolh
+   real(c_double), value         :: hfact
   end subroutine densityiterate_gpu_c
+
+!--C interface to cosmo_kernel_radius in cosmoSPHere/src/dens_c_api.cu
+  real(c_double) function cosmo_kernel_radius() bind(C)
+   use iso_c_binding, only:c_double
+  end function cosmo_kernel_radius
 
 !--C interface to cosmoSPHere/src/pin_c_api.cu
   subroutine cosmo_pin_host(ptr, nbytes) bind(C)
@@ -170,14 +176,14 @@ subroutine densityiterate_gpu(npart, xyzh, vxyzu, fxyzu, fext, gradh, divcurlv, 
  use boundary,  only:cross_boundary,xmin,xmax,ymin,ymax,zmin,zmax
  use mpidomain, only:isperiodic
  use options,   only:tolh
- use dim,  only:curlv,mhd,use_dust,do_radiation,gravity,ind_timesteps,use_apr,gr
+ use dim,  only:curlv,mhd,use_dust,do_radiation,gravity,ind_timesteps,use_apr,gr,use_sinktree
  use viscosity,        only:irealvisc
  use ptmass,           only:icreate_sinks
  use HIIRegion,        only:iH2R
  use ptmass_radiation, only:iget_tdust
- use kernel,           only:kernelname
+ use kernel,           only:kernelname,radkern
  use part,             only:hfact
- use part,             only:iphase,iamtype,iamboundary
+ use part,             only:iphase,iamtype,iamboundary,igas
  use dim,              only:maxphase,maxp
  use iso_c_binding, only:c_double,c_int
 #endif
@@ -190,7 +196,7 @@ subroutine densityiterate_gpu(npart, xyzh, vxyzu, fxyzu, fext, gradh, divcurlv, 
 
 #ifdef GPU
  real    :: hi, rhoi, drhoi, omega
- integer :: i, ncross, nbound
+ integer :: i, ncross, nbound, nother
  integer(kind=8) :: ic0,ic1,ic2,ic3,ic4,crate
  character(len=8) :: statsenv
  logical, save    :: stats = .false.
@@ -220,24 +226,34 @@ subroutine densityiterate_gpu(npart, xyzh, vxyzu, fxyzu, fext, gradh, divcurlv, 
  !--the GPU force pass has neither physical viscosity nor general relativity
  if (irealvisc > 0)     call fatal('densityiterate_gpu','physical viscosity not computed on GPU (irealvisc=0)')
  if (gr)                call fatal('densityiterate_gpu','general relativity not supported on GPU')
- !--cosmoSPHere hard-codes the M_4 cubic spline and hfact = 1.2 (include/kernel.hpp);
- !  any other kernel or hfact would silently use the wrong one
- if (trim(kernelname) /= 'M_4 cubic') call fatal('densityiterate_gpu', &
-    'only the M_4 cubic kernel is implemented on GPU (build with KERNEL=cubic), not '//trim(kernelname))
- if (abs(hfact - 1.2) > 1.e-6) call fatal('densityiterate_gpu','GPU kernel assumes hfact = 1.2',var='hfact',val=hfact)
+ !--sinks in the tree add sink-gas forces during the force walk, which the GPU does not do
+ if (use_sinktree)      call fatal('densityiterate_gpu','sinks in the tree not supported on GPU (use_sinktree)')
+ !--cosmoSPHere implements the M_4 cubic and M_6 quintic splines, chosen when it is
+ !  built (KERNEL is passed through); any other kernel, or a library built for a
+ !  different one, would silently use the wrong kernel
+ if (trim(kernelname) /= 'M_4 cubic' .and. trim(kernelname) /= 'M_6 quintic') &
+    call fatal('densityiterate_gpu','kernel not implemented on GPU (use KERNEL=cubic or quintic): '//trim(kernelname))
+ if (abs(real(cosmo_kernel_radius()) - radkern) > 1.e-6) call fatal('densityiterate_gpu', &
+    'cosmoSPHere library was built for a different kernel: rebuild it',var='radkern',val=real(cosmo_kernel_radius()))
 
- !--boundary particles (wind shells, BHL inflow): on the CPU path they are inactive
- !  after the first call -- no force, no timestep constraint, h left as it was --
- !  but the GPU path would evolve them as gas.  Checked every call, as injection
- !  adds them during a run.
+ !--the GPU solves every particle as gas of mass massoftype(igas).  Boundary particles
+ !  (wind shells, BHL inflow) are inactive after the first call on the CPU path, and
+ !  stars, dark matter and other types have their own mass and physics, so refuse any
+ !  particle that is not gas.  Checked every call, as injection adds particles.
  if (maxphase == maxp) then
     nbound = 0
-    !$omp parallel do default(none) shared(npart,iphase) private(i) reduction(+:nbound)
+    nother = 0
+    !$omp parallel do default(none) shared(npart,iphase) private(i) reduction(+:nbound,nother)
     do i = 1, npart
-       if (iamboundary(iamtype(iphase(i)))) nbound = nbound + 1
+       if (iamboundary(iamtype(iphase(i)))) then
+          nbound = nbound + 1
+       elseif (iamtype(iphase(i)) /= igas) then
+          nother = nother + 1
+       endif
     enddo
     !$omp end parallel do
     if (nbound > 0) call fatal('densityiterate_gpu','boundary particles not supported on GPU',ival=nbound)
+    if (nother > 0) call fatal('densityiterate_gpu','only gas particles are supported on GPU',ival=nother)
  endif
 
  !--COSMO_DENS_STATS=1 also reports the phantom-side cost of the GPU call
@@ -283,7 +299,8 @@ subroutine densityiterate_gpu(npart, xyzh, vxyzu, fxyzu, fext, gradh, divcurlv, 
                             real(massoftype(igas), kind=c_double), &
                             merge(1_c_int, 0_c_int, periodic), &
                             real([xmin,xmax,ymin,ymax,zmin,zmax], kind=c_double), &
-                            real(tolh, kind=c_double))
+                            real(tolh, kind=c_double), &
+                            real(hfact, kind=c_double))
  call system_clock(ic2)
 
  !--write results back to phantom arrays
