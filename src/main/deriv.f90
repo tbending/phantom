@@ -205,7 +205,7 @@ subroutine derivs(icall,npart,nactive,xyzh,vxyzu,fxyzu,fext,divcurlv,divcurlB,&
  !  on use_gpu_dens because it consumes the octree and hmax that densityiterate_gpu
  !  leaves behind; it becomes its own switch in due course.
  if (use_gpu_dens) then
-    call force_gpu(npart,xyzh,vxyzu,eos_vars,alphaind,fxyzu,divcurlv)
+    call force_gpu(npart,xyzh,vxyzu,eos_vars,alphaind,fxyzu,divcurlv,dt)
  else
     call force(icall,npart,xyzh,vxyzu,fxyzu,divcurlv,divcurlB,Bevol,dBevol,&
                rad,drad,radprop,dustprop,dustgasprop,Vrel_disp,dustfrac,ddustevol,fext,fxyz_drag,&

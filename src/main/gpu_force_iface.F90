@@ -41,6 +41,7 @@ module gpu_force_iface
  interface
     subroutine force_gpu_c(n,pmass,vx,vy,vz, &
                          pro2,spsound,alphaAV,u,beta,alphau,disc_viscosity, &
+                         pdv_heating,shock_heating, &
                          fx,fy,fz,f4,vsigmax,divv) bind(C)
     use iso_c_binding, only:c_double,c_int
 
@@ -54,6 +55,7 @@ module gpu_force_iface
     real(c_double), value       :: beta
     real(c_double), value       :: alphau
     integer(c_int), value       :: disc_viscosity
+    integer(c_int), value       :: pdv_heating,shock_heating
     real(c_double), intent(out) :: fx(*),fy(*),fz(*),f4(*)
     real(c_double), intent(out) :: vsigmax(*)
     real(c_double), intent(out) :: divv(*)
@@ -84,10 +86,16 @@ contains
 !  phantom's arrays.  Drop-in replacement for a call to force.
 !+
 !-----------------------------------------------------------------------
-subroutine force_gpu(npart,xyzh,vxyzu,eos_vars,alphaind,fxyzu,divcurlv)
+subroutine force_gpu(npart,xyzh,vxyzu,eos_vars,alphaind,fxyzu,divcurlv,dt)
  use part,    only:massoftype,igas
  use options, only:beta,alphau
- use dim,     only:maxvxyzu,driving,disc_viscosity
+ use dim,     only:maxvxyzu,driving,disc_viscosity,track_lum,h2chemistry,store_dust_temperature
+ use io,      only:fatal
+ use part,    only:ien_type,ien_entropy,ien_entropy_s,rhoh,isdead_or_accreted
+ use eos,     only:icooling,ipdv_heating,ishock_heating
+ use cooling, only:energ_cooling,cooling_in_step
+ use part,    only:nptmass,xyzmh_ptmass
+ use part,    only:sinks_have_heating
 
  integer,      intent(in)    :: npart
  real,         intent(in)    :: xyzh(:,:),vxyzu(:,:)
@@ -95,11 +103,28 @@ subroutine force_gpu(npart,xyzh,vxyzu,eos_vars,alphaind,fxyzu,divcurlv)
  real(kind=4), intent(in)    :: alphaind(:,:)
  real,         intent(inout) :: fxyzu(:,:)
  real(kind=4), intent(inout) :: divcurlv(:,:)
+ real,         intent(in)    :: dt
 
 #ifdef GPU
  integer :: i
+ real    :: dudtcool
+ logical :: add_cooling
 
  if (npart <= 0) return
+
+ !--the GPU returns du/dt as p dV work + shock heating (each switchable) + conductivity,
+ !  as force.F90 assembles it for the internal energy; refuse what would change that sum
+ if (maxvxyzu >= 4) then
+    if (ien_type == ien_entropy .or. ien_type == ien_entropy_s) &
+       call fatal('force_gpu','entropy as the energy variable is not supported on GPU')
+    if (track_lum) call fatal('force_gpu','track_lum not supported on GPU')
+    if (sinks_have_heating(nptmass,xyzmh_ptmass)) call fatal('force_gpu','sink heating not supported on GPU')
+    if (icooling == 9) call fatal('force_gpu','icooling = 9 not supported on GPU')
+    if (icooling > 0 .and. .not.cooling_in_step .and. (h2chemistry .or. store_dust_temperature)) &
+       call fatal('force_gpu','cooling with chemistry or dust temperature in the force pass not supported on GPU')
+ endif
+ !--cooling that force.F90 applies in the force pass (not in the step), added below
+ add_cooling = (maxvxyzu >= 4 .and. icooling > 0 .and. dt > 0. .and. .not.cooling_in_step)
 
  call ensure_buffers(npart)
  call prepare_pro2_gpu(npart,xyzh,vxyzu,eos_vars,alphaind)
@@ -121,6 +146,7 @@ subroutine force_gpu(npart,xyzh,vxyzu,eos_vars,alphaind,fxyzu,divcurlv)
                   real(beta,kind=c_double),             &
                   real(alphau,kind=c_double),           &
                   merge(1_c_int,0_c_int,disc_viscosity), &
+                  int(ipdv_heating,kind=c_int),int(ishock_heating,kind=c_int), &
                   fx8,fy8,fz8,f48,vsigmax8,divv8)
 
  !--as force.F90: with driving, fxyzu already holds the driving force (forceit
@@ -142,6 +168,19 @@ subroutine force_gpu(npart,xyzh,vxyzu,eos_vars,alphaind,fxyzu,divcurlv)
     divcurlv(1,i) = real(divv8(i),kind=kind(divcurlv))
  enddo
  !$omp end parallel do
+
+ !--as force.F90: cooling evaluated in the force pass, from div v of this pass
+ if (add_cooling) then
+    !$omp parallel do default(none) schedule(static) private(i,dudtcool) &
+    !$omp shared(npart,xyzh,vxyzu,fxyzu,divcurlv,massoftype,dt)
+    do i = 1,npart
+       if (isdead_or_accreted(xyzh(4,i))) cycle
+       call energ_cooling(xyzh(1,i),xyzh(2,i),xyzh(3,i),vxyzu(4,i), &
+                          rhoh(xyzh(4,i),massoftype(igas)),dt,divcurlv(1,i),dudtcool)
+       fxyzu(4,i) = fxyzu(4,i) + dudtcool
+    enddo
+    !$omp end parallel do
+ endif
 
  call finish_gpu_force_timesteps(npart,xyzh)
 #else
