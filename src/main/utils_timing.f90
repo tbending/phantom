@@ -18,7 +18,8 @@ module timing
 !
  implicit none
  integer, private :: istarttime(6)
- real(kind=4), private :: starttime
+ real(kind=8), private :: starttime   ! double: seconds since the start of the month exceed
+                                      ! 2**20 mid-month, where real*4 resolves only 1/8 s
 
  data starttime/-1./
 
@@ -436,7 +437,7 @@ subroutine initialise_timing
  istarttime(5) = imin
  istarttime(6) = isec
  !istarttime(7) = imsec
- starttime = iday*86400._4 + ihour*3600._4 + imin*60._4 + isec + imsec*0.001_4
+ starttime = iday*86400._8 + ihour*3600._8 + imin*60._8 + isec + imsec*0.001_8
 
 end subroutine initialise_timing
 
@@ -477,7 +478,9 @@ subroutine getused(tused)
        iday = iday + 31
     endif
  enddo
- tused = iday*86400._4 + ihour*3600._4 + imin*60._4 + isec + imsec*0.001_4 - starttime
+ !--form the absolute time and the difference in double precision; only the (small)
+ !  elapsed time is returned in single precision
+ tused = real(iday*86400._8 + ihour*3600._8 + imin*60._8 + isec + imsec*0.001_8 - starttime, kind=4)
 
 end subroutine getused
 
