@@ -216,15 +216,24 @@ endif
 #  GPU_TARGET selects a profile in Makefile_GPU (backend + arch) and is
 #  required when GPU=yes -- there is no default.  The same backend/arch is
 #  passed to the cosmoSPHere sub-make via the 'cosmosphere' target below.
+#  GPU, GPU_TARGET and COSMO_DIR may be given on the command line or set in the
+#  environment (export GPU=yes GPU_TARGET=a100), as the writemake.sh Makefile expects.
 #  Default GPU=no preserves original phantom CPU behaviour with no code changes.
-GPU=no
+# cosmoSPHere is the submodule beside this build directory, wherever the run directory
+# is; a non-empty COSMO_DIR (environment or command line) overrides it. Defined
+# unconditionally (not just under GPU=yes) so 'make clean' can also clean it.
+ifeq ($(strip $(COSMO_DIR)),)
+    COSMO_DIR := $(abspath $(CURDIR)/../cosmoSPHere)
+endif
+GPU ?= no
 ifeq ($(GPU), yes)
 ifeq ($(GPU_TARGET),)
     $(error GPU=yes requires GPU_TARGET to be set -- valid: a100, hopper, quadro_pascal, mi300 (see build/Makefile_GPU))
 endif
     include Makefile_GPU
     FPPFLAGS  += -DGPU
-    COSMO_DIR ?= $(RUNDIR)/../cosmoSPHere
+    # the GPU path uses global timesteps, whatever the setup's default
+    override IND_TIMESTEPS = no
     LDFLAGS   += -L$(COSMO_DIR)/build -lcosmoSPHere
 ifeq ($(GPU_BACKEND), cuda)
     CUDA_HOME ?= $(CUDA_INSTALL_PATH)
@@ -567,14 +576,7 @@ else
     .PHONY: phantom
 endif
 
-# Build the cosmoSPHere GPU density library with the same backend/arch that
-# GPU_TARGET selected, so a single `make GPU=yes` builds and links everything.
-.PHONY: cosmosphere
-cosmosphere:
-	$(MAKE) -C $(COSMO_DIR) lib GPU_BACKEND=$(GPU_BACKEND) \
-	    CUDA_ARCH="$(CUDA_ARCH)" HIP_ARCH=$(HIP_ARCH) KERNEL=$(KERNEL)
-
-phantom: checksystem checkparams $(GPU_PREREQ) $(OBJECTS) phantom.o
+phantom: checksystem checkparams $(OBJECTS) phantom.o $(GPU_PREREQ)
 	$(FC) $(FFLAGS) -o $(BINDIR)/$@ $(OBJECTS) phantom.o $(LDFLAGS)
 ifeq ($(UNAME), Darwin)
 	dsymutil $(BINDIR)/$@
@@ -593,6 +595,15 @@ endif
 	@echo ""
 	@echo "The Phantom is here (in $(BINDIR)/phantom)"
 	@echo ""
+
+# Build the cosmoSPHere GPU density library with the same backend/arch that
+# GPU_TARGET selected, so a single `make GPU=yes` builds and links everything.
+# Defined after phantom so that phantom stays the default target.
+.PHONY: cosmosphere
+cosmosphere:
+	@echo ""
+	@$(MAKE) -C $(COSMO_DIR) lib GPU_TARGET=$(GPU_TARGET) GPU_BACKEND=$(GPU_BACKEND) \
+	    CUDA_ARCH="$(CUDA_ARCH)" HIP_ARCH=$(HIP_ARCH) KERNEL=$(KERNEL)
 
 #----------------------------------------------------
 # generic target for compiling ALL phantom utilities
@@ -685,7 +696,7 @@ OBJSETSTAR= $(SRCSETSTAR:.f90=.o)
 OBJSETUP1= $(SRCSETUP:.f90=.o)
 OBJSETUP= $(OBJSETUP1:.F90=.o) phantomsetup.o
 
-setup: checksystem checkparams libsetup libphantom $(OBJSETUP)
+setup: checksystem checkparams libsetup libphantom $(OBJSETUP) $(GPU_PREREQ)
 	$(FC) $(FFLAGS) -o $(BINDIR)/phantomsetup  $(OBJSETUP) $(LIBSETUP) $(LIBPHANTOM) $(LDFLAGS) $(LIBS)
 	@echo ""
 	@echo "Phantom setup built"
@@ -1465,6 +1476,7 @@ clean: cleanlibphantom
 ifeq ($(KROME),yes)
 	rm -f ${KROMEPATH}/build/*.o ${KROMEPATH}/build/*.mod ${KROMEPATH}/build/libkrome.so
 endif
+	@if [ -d $(COSMO_DIR) ]; then $(MAKE) -C $(COSMO_DIR) clean; fi
 
 cleanall: clean
 	cd $(BINDIR); rm -f phantom phantomsetup
