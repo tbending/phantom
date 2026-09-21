@@ -120,10 +120,20 @@ module gpu_arrays
    use iso_c_binding, only:c_int
    integer(c_int), value :: n
   end subroutine cosmo_arrays_init
+
+!--Copy one bundle back from the device into its arena slice.  The slice is ncomp
+!  contiguous runs of n, which is the order the device writes them in, so one call
+!  covers the whole bundle.
+  subroutine cosmo_download(slot, host, n) bind(C)
+   use iso_c_binding, only:c_double,c_int
+   integer(c_int), value      :: slot
+   real(c_double), intent(out) :: host(*)
+   integer(c_int), value      :: n
+  end subroutine cosmo_download
  end interface
 #endif
 
- public :: gpu_arrays_init, gpu_arrays_comp, gpu_arrays_nbuf
+ public :: gpu_arrays_init, gpu_arrays_comp, gpu_arrays_nbuf, gpu_arrays_download
  public :: gpu_arrays_mark_packed, gpu_arrays_take_packed
  public :: pin_buffer, unpin_buffer
 
@@ -237,6 +247,24 @@ function gpu_arrays_comp(ib, ic) result(p)
  p => arena(i0:i0+nbuf-1)
 
 end function gpu_arrays_comp
+
+!-------------------------------------------------------------
+!+
+!  Fetch a bundle from the device into its arena slice.  The bundle
+!  ids here and the slot ids in cosmoSPHere/include/arrays.hpp are the
+!  same numbers and must stay in step.
+!+
+!-------------------------------------------------------------
+subroutine gpu_arrays_download(ib, n)
+ integer, intent(in) :: ib, n
+#ifdef GPU
+ real(c_double), pointer, contiguous :: p(:)
+
+ p => gpu_arrays_comp(ib,1)      ! component 1 starts the bundle
+ call cosmo_download(int(ib, kind=c_int), p, int(n, kind=c_int))
+#endif
+
+end subroutine gpu_arrays_download
 
 !-------------------------------------------------------------
 !+

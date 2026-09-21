@@ -51,7 +51,7 @@ module gpu_dens_iface
 !
  use iso_c_binding, only:c_double
  use gpu_arrays,    only:gpu_arrays_init,gpu_arrays_comp,gpu_arrays_nbuf, &
-                         gpu_arrays_mark_packed, &
+                         gpu_arrays_mark_packed,gpu_arrays_download, &
                          ibun_pos,ibun_hsml,ibun_vel,ibun_accel, &
                          ibun_dens_out,ibun_grad_out
  implicit none
@@ -65,13 +65,11 @@ module gpu_dens_iface
 #ifdef GPU
 !--C interface to cosmoSPHere/src/dens_c_api.cu
  interface
-  subroutine densityiterate_gpu_c(h, rho, gradh_out, divv, xi_out, ddivvdt, &
+  subroutine densityiterate_gpu_c(h, &
                                   x, y, z, vx, vy, vz, ax, ay, az, n, pmass, &
                                   periodic, box, tolh, hfact) bind(C)
    use iso_c_binding, only:c_double,c_int
-   real(c_double), intent(inout) :: h(*)
-   real(c_double), intent(out)   :: rho(*), gradh_out(*)
-   real(c_double), intent(out)   :: divv(*), xi_out(*), ddivvdt(*)
+   real(c_double), intent(in)    :: h(*)
    real(c_double), intent(in)    :: x(*), y(*), z(*)
    real(c_double), intent(in)    :: vx(*), vy(*), vz(*)
    real(c_double), intent(in)    :: ax(*), ay(*), az(*)
@@ -310,7 +308,7 @@ subroutine densityiterate_gpu(npart, xyzh, vxyzu, fxyzu, fext, gradh, divcurlv, 
  call gpu_arrays_mark_packed(ibun_vel)
  call system_clock(ic1)
 
- call densityiterate_gpu_c(h8, rho8, drhofh8, divv8, xi8, ddivvdt8, &
+ call densityiterate_gpu_c(h8, &
                             x8, y8, z8, vx8, vy8, vz8, ax8, ay8, az8, &
                             int(npart, kind=c_int), &
                             real(massoftype(igas), kind=c_double), &
@@ -318,6 +316,10 @@ subroutine densityiterate_gpu(npart, xyzh, vxyzu, fxyzu, fext, gradh, divcurlv, 
                             real([xmin,xmax,ymin,ymax,zmin,zmax], kind=c_double), &
                             real(tolh, kind=c_double), &
                             real(hfact, kind=c_double))
+ !--the solve leaves its results on the device; fetch the three bundles it filled
+ call gpu_arrays_download(ibun_hsml,     npart)
+ call gpu_arrays_download(ibun_dens_out, npart)
+ call gpu_arrays_download(ibun_grad_out, npart)
  call system_clock(ic2)
 
  !--write results back to phantom arrays

@@ -36,6 +36,7 @@ module gpu_force_iface
 !
  use iso_c_binding, only:c_double,c_int
  use gpu_arrays,    only:gpu_arrays_init,gpu_arrays_comp,gpu_arrays_take_packed, &
+                         gpu_arrays_download, &
                          ibun_vel,ibun_thermo,ibun_force_out
  implicit none
 
@@ -43,8 +44,7 @@ module gpu_force_iface
  interface
     subroutine force_gpu_c(n,pmass,vx,vy,vz, &
                          pro2,spsound,alphaAV,u,beta,alphau,disc_viscosity, &
-                         pdv_heating,shock_heating, &
-                         fx,fy,fz,f4,vsigmax,divv) bind(C)
+                         pdv_heating,shock_heating) bind(C)
     use iso_c_binding, only:c_double,c_int
 
     integer(c_int), value       :: n
@@ -58,9 +58,6 @@ module gpu_force_iface
     real(c_double), value       :: alphau
     integer(c_int), value       :: disc_viscosity
     integer(c_int), value       :: pdv_heating,shock_heating
-    real(c_double), intent(out) :: fx(*),fy(*),fz(*),f4(*)
-    real(c_double), intent(out) :: vsigmax(*)
-    real(c_double), intent(out) :: divv(*)
     end subroutine force_gpu_c
 
  end interface
@@ -163,8 +160,10 @@ subroutine force_gpu(npart,xyzh,vxyzu,eos_vars,alphaind,fxyzu,divcurlv,dt)
                   real(beta,kind=c_double),             &
                   real(alphau,kind=c_double),           &
                   merge(1_c_int,0_c_int,disc_viscosity), &
-                  int(ipdv_heating,kind=c_int),int(ishock_heating,kind=c_int), &
-                  fx8,fy8,fz8,f48,vsigmax8,divv8)
+                  int(ipdv_heating,kind=c_int),int(ishock_heating,kind=c_int))
+
+ !--the pass leaves its results on the device; fetch them
+ call gpu_arrays_download(ibun_force_out,npart)
 
  !--as force.F90: with driving, fxyzu already holds the driving force (forceit
  !  runs first), so the SPH force is added to it.  Isothermal builds have no
