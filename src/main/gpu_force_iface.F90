@@ -197,7 +197,7 @@ end subroutine force_gpu
 !+
 !-----------------------------------------------------------------------
 subroutine ensure_buffers(n)
- use gpu_dens_iface, only:pin_buffer,unpin_buffer
+ use gpu_arrays, only:pin_buffer,unpin_buffer
  integer, intent(in) :: n
 
  if (nbuf >= n) return

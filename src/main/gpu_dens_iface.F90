@@ -42,10 +42,17 @@ module gpu_dens_iface
 ! that is needed from here is the switch, the box, and wrapping the particles
 ! into it, which the kd-tree build does on the CPU path.
 !
-! :Dependencies: boundary, dim, HIIRegion, io, iso_c_binding, kernel, mpidomain,
-!   options, part, ptmass, ptmass_radiation, viscosity
+! Host staging (the pinned arena the C call reads and writes) belongs to gpu_arrays,
+! not to this module: the force interface stages the same particle data, and both
+! used to keep their own copy of it.
+!
+! :Dependencies: boundary, dim, gpu_arrays, HIIRegion, io, iso_c_binding, kernel,
+!   mpidomain, options, part, ptmass, ptmass_radiation, viscosity
 !
  use iso_c_binding, only:c_double
+ use gpu_arrays,    only:gpu_arrays_init,gpu_arrays_comp,gpu_arrays_nbuf, &
+                         ibun_pos,ibun_hsml,ibun_vel,ibun_accel, &
+                         ibun_dens_out,ibun_grad_out
  implicit none
 
 #ifdef GPU
@@ -80,21 +87,10 @@ module gpu_dens_iface
    use iso_c_binding, only:c_double
   end function cosmo_kernel_radius
 
-!--C interface to cosmoSPHere/src/pin_c_api.cu
-  subroutine cosmo_pin_host(ptr, nbytes) bind(C)
-   use iso_c_binding, only:c_ptr,c_size_t
-   type(c_ptr),       value :: ptr
-   integer(c_size_t), value :: nbytes
-  end subroutine cosmo_pin_host
-
-  subroutine cosmo_unpin_host(ptr) bind(C)
-   use iso_c_binding, only:c_ptr
-   type(c_ptr), value :: ptr
-  end subroutine cosmo_unpin_host
  end interface
 #endif
 
- public :: densityiterate_gpu, init_gpu_switch, pin_buffer, unpin_buffer
+ public :: densityiterate_gpu, init_gpu_switch
  private
 
 !
@@ -104,22 +100,6 @@ module gpu_dens_iface
 ! on the device.  Set to 1 (xi of a zero tensor) until first computed.
 !
  real, allocatable, public :: xi_gpu(:)
-
-#ifdef GPU
-!
-! Staging buffers for the C call, module level and reused across calls:
-! allocated on the first solve and grown only if npart rises.  Allocating and
-! freeing ~15 arrays of npart every solve made every
-! write into them a first touch of fresh pages.  They are registered with the
-! driver for as long as they are allocated (see pin_buffer).
-!
- integer :: nbuf = 0
- real(c_double), allocatable, target :: x8(:), y8(:), z8(:), h8(:)
- real(c_double), allocatable, target :: vx8(:), vy8(:), vz8(:)
- real(c_double), allocatable, target :: ax8(:), ay8(:), az8(:)
- real(c_double), allocatable, target :: rho8(:), drhofh8(:)
- real(c_double), allocatable, target :: divv8(:), xi8(:), ddivvdt8(:)
-#endif
 
 contains
 
@@ -197,6 +177,13 @@ subroutine densityiterate_gpu(npart, xyzh, vxyzu, fxyzu, fext, gradh, divcurlv, 
 #ifdef GPU
  real    :: hi, rhoi, drhoi, omega
  integer :: i, ncross, nbound, nother
+ !--slices of the gpu_arrays arena, re-associated each call because the arena moves
+ !  when it grows.  contiguous, so these pass straight to the bind(C) call.
+ real(c_double), pointer, contiguous :: x8(:),y8(:),z8(:),h8(:)
+ real(c_double), pointer, contiguous :: vx8(:),vy8(:),vz8(:)
+ real(c_double), pointer, contiguous :: ax8(:),ay8(:),az8(:)
+ real(c_double), pointer, contiguous :: rho8(:),drhofh8(:)
+ real(c_double), pointer, contiguous :: divv8(:),xi8(:),ddivvdt8(:)
  integer(kind=8) :: ic0,ic1,ic2,ic3,ic4,crate
  character(len=8) :: statsenv
  logical, save    :: stats = .false.
@@ -264,7 +251,33 @@ subroutine densityiterate_gpu(npart, xyzh, vxyzu, fxyzu, fext, gradh, divcurlv, 
  endif
  call system_clock(ic0, crate)
 
- call ensure_buffers(npart)
+ call gpu_arrays_init(npart)
+ !--xi_gpu is a phantom-side result for cons2prim, not staging, so it is not in the
+ !  arena.  It grows with it, and starts at the xi of a zero tensor.
+ if (.not.allocated(xi_gpu)) then
+    allocate(xi_gpu(gpu_arrays_nbuf()))
+    xi_gpu = 1.
+ elseif (size(xi_gpu) < npart) then
+    deallocate(xi_gpu)
+    allocate(xi_gpu(gpu_arrays_nbuf()))
+    xi_gpu = 1.
+ endif
+
+ x8      => gpu_arrays_comp(ibun_pos,1)
+ y8      => gpu_arrays_comp(ibun_pos,2)
+ z8      => gpu_arrays_comp(ibun_pos,3)
+ h8      => gpu_arrays_comp(ibun_hsml,1)
+ vx8     => gpu_arrays_comp(ibun_vel,1)
+ vy8     => gpu_arrays_comp(ibun_vel,2)
+ vz8     => gpu_arrays_comp(ibun_vel,3)
+ ax8     => gpu_arrays_comp(ibun_accel,1)
+ ay8     => gpu_arrays_comp(ibun_accel,2)
+ az8     => gpu_arrays_comp(ibun_accel,3)
+ rho8    => gpu_arrays_comp(ibun_dens_out,1)
+ drhofh8 => gpu_arrays_comp(ibun_dens_out,2)
+ divv8   => gpu_arrays_comp(ibun_grad_out,1)
+ xi8     => gpu_arrays_comp(ibun_grad_out,2)
+ ddivvdt8=> gpu_arrays_comp(ibun_grad_out,3)
 
  ncross = 0
  !$omp parallel do default(none) private(i) &
@@ -354,72 +367,5 @@ subroutine densityiterate_gpu(npart, xyzh, vxyzu, fxyzu, fext, gradh, divcurlv, 
 
 end subroutine densityiterate_gpu
 
-#ifdef GPU
-!-------------------------------------------------------------
-!+
-!  Grow the staging buffers to hold at least n particles.  No-op once
-!  they are big enough, so the allocation happens on the first solve only.
-!+
-!-------------------------------------------------------------
-subroutine ensure_buffers(n)
- integer, intent(in) :: n
-
- if (nbuf >= n) return
-
- if (allocated(x8)) then
-    call unpin_buffer(x8);   call unpin_buffer(y8);   call unpin_buffer(z8)
-    call unpin_buffer(h8);   call unpin_buffer(vx8);  call unpin_buffer(vy8)
-    call unpin_buffer(vz8);  call unpin_buffer(ax8);  call unpin_buffer(ay8)
-    call unpin_buffer(az8);  call unpin_buffer(rho8); call unpin_buffer(drhofh8)
-    call unpin_buffer(divv8); call unpin_buffer(xi8); call unpin_buffer(ddivvdt8)
-    deallocate(x8, y8, z8, h8, vx8, vy8, vz8, ax8, ay8, az8, &
-               rho8, drhofh8, divv8, xi8, ddivvdt8, xi_gpu)
- endif
-
- allocate(x8(n), y8(n), z8(n), h8(n), vx8(n), vy8(n), vz8(n), &
-          ax8(n), ay8(n), az8(n), rho8(n), drhofh8(n), &
-          divv8(n), xi8(n), ddivvdt8(n), xi_gpu(n))
- xi_gpu = 1.
-
- call pin_buffer(x8);   call pin_buffer(y8);   call pin_buffer(z8)
- call pin_buffer(h8);   call pin_buffer(vx8);  call pin_buffer(vy8)
- call pin_buffer(vz8);  call pin_buffer(ax8);  call pin_buffer(ay8)
- call pin_buffer(az8);  call pin_buffer(rho8); call pin_buffer(drhofh8)
- call pin_buffer(divv8); call pin_buffer(xi8); call pin_buffer(ddivvdt8)
-
- nbuf = n
-
-end subroutine ensure_buffers
-#endif
-
-!-------------------------------------------------------------
-!+
-!  Register a staging buffer with the GPU driver, so the device
-!  copies into and out of it are not slowed by on-demand page
-!  population (catastrophically so on GH200 at 11.3M particles).
-!  Must be undone with unpin_buffer before the buffer is freed.
-!  Failure is silent: the copies still work, unpinned.  No-ops in a
-!  GPU=no build.
-!+
-!-------------------------------------------------------------
-subroutine pin_buffer(a)
- use iso_c_binding, only:c_loc,c_size_t,c_sizeof
- real(c_double), intent(in), target :: a(:)
-
-#ifdef GPU
- if (size(a) > 0) call cosmo_pin_host(c_loc(a(1)), int(size(a),kind=c_size_t)*c_sizeof(a(1)))
-#endif
-
-end subroutine pin_buffer
-
-subroutine unpin_buffer(a)
- use iso_c_binding, only:c_loc
- real(c_double), intent(in), target :: a(:)
-
-#ifdef GPU
- if (size(a) > 0) call cosmo_unpin_host(c_loc(a(1)))
-#endif
-
-end subroutine unpin_buffer
 
 end module gpu_dens_iface
