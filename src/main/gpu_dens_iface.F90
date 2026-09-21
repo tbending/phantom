@@ -51,6 +51,7 @@ module gpu_dens_iface
 !
  use iso_c_binding, only:c_double
  use gpu_arrays,    only:gpu_arrays_init,gpu_arrays_comp,gpu_arrays_nbuf, &
+                         gpu_arrays_mark_packed, &
                          ibun_pos,ibun_hsml,ibun_vel,ibun_accel, &
                          ibun_dens_out,ibun_grad_out
  implicit none
@@ -304,6 +305,9 @@ subroutine densityiterate_gpu(npart, xyzh, vxyzu, fxyzu, fext, gradh, divcurlv, 
     az8(i) = real(fxyzu(3,i) + fext(3,i), kind=c_double)
  enddo
  !$omp end parallel do
+ !--the force pass that follows uses the same velocities, from the same bundle, so
+ !  tell it not to pack them again (gpu_arrays `packed`)
+ call gpu_arrays_mark_packed(ibun_vel)
  call system_clock(ic1)
 
  call densityiterate_gpu_c(h8, rho8, drhofh8, divv8, xi8, ddivvdt8, &

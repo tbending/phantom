@@ -65,7 +65,9 @@ module gpu_arrays
  integer, parameter, public :: ibun_accel    = 4   ! ax, ay, az (fxyzu + fext)
  integer, parameter, public :: ibun_dens_out = 5   ! rho, d(rho)/d(h)
  integer, parameter, public :: ibun_grad_out = 6   ! div v, xi, d(div v)/dt
- integer, parameter, public :: nbundle       = 6
+ integer, parameter, public :: ibun_thermo   = 7   ! p/rho^2, c_s, alpha_AV, u
+ integer, parameter, public :: ibun_force_out= 8   ! fx, fy, fz, du/dt, vsigmax, div v
+ integer, parameter, public :: nbundle       = 8
 
  type :: bundle_t
     character(len=10) :: name  = ''
@@ -84,6 +86,19 @@ module gpu_arrays
  real(c_double), allocatable, target :: arena(:)
  integer :: nbuf = 0   ! particles the arena is currently sized for
 
+!
+! "This bundle already holds current values."  Set by whoever packs it, and taken
+! (read and cleared) by a later pass that would otherwise pack the same thing again.
+!
+! Skipping a pack on the strength of this is safe in a way that skipping a transfer
+! would not be: the slice is left holding the values the earlier pass put there, which
+! are the ones this pass wants, so even if the C entry point does copy the slice it
+! copies the right numbers.  The mark is cleared when taken, so only the pass
+! immediately following the producer may skip -- a later one packs again, which is
+! what the leapfrog corrector needs after it has changed the velocities.
+!
+ logical :: packed(nbundle) = .false.
+
 #ifdef GPU
  interface
 !--C interface to cosmoSPHere/src/pin_c_api.cu
@@ -101,6 +116,7 @@ module gpu_arrays
 #endif
 
  public :: gpu_arrays_init, gpu_arrays_comp, gpu_arrays_nbuf
+ public :: gpu_arrays_mark_packed, gpu_arrays_take_packed
  public :: pin_buffer, unpin_buffer
 
 contains
@@ -112,10 +128,10 @@ contains
 !  enough and the table has not changed, so the allocation happens on
 !  the first solve only.
 !
-!  `live` is where the physics options enter.  Everything the density
-!  pass needs is live in this step because the C entry point still
-!  takes all of it; the predicates each row will take once the API
-!  splits are named against them below.
+!  `live` is where the physics options enter.  Everything the calls
+!  need is live in this step because the C entry points still take all
+!  of it; the option each row will key off once they can be told to
+!  leave something out is named in a comment against that row.
 !+
 !-------------------------------------------------------------
 subroutine gpu_arrays_init(n)
@@ -136,6 +152,11 @@ subroutine gpu_arrays_init(n)
  !--div v is always wanted; xi and d(div v)/dt are the Cullen & Dehnen
  !  switch, so this row splits when the call can leave them out
  bundle(ibun_grad_out) = bundle_t('grad_out', 3, idir_down,   .true.)
+ !--force pass.  u and du/dt exist only when maxvxyzu >= 4, but the C entry point
+ !  takes them either way, so the counts are fixed until it can be told to leave
+ !  them out; that is the same change that makes a row's width depend on an option.
+ bundle(ibun_thermo)   = bundle_t('thermo',   4, idir_up,     .true.)
+ bundle(ibun_force_out)= bundle_t('force_out',6, idir_down,   .true.)
 
  !--lay the live bundles out end to end.  device_only rows take no arena space.
  off = 1
@@ -154,9 +175,36 @@ subroutine gpu_arrays_init(n)
  endif
  allocate(arena(off-1))
  call pin_buffer(arena)
+ packed = .false.   ! nothing in a fresh arena holds anything
  nbuf = n
 
 end subroutine gpu_arrays_init
+
+!-------------------------------------------------------------
+!+
+!  Record that a bundle now holds current values (see `packed` above).
+!+
+!-------------------------------------------------------------
+subroutine gpu_arrays_mark_packed(ib)
+ integer, intent(in) :: ib
+
+ packed(ib) = .true.
+
+end subroutine gpu_arrays_mark_packed
+
+!-------------------------------------------------------------
+!+
+!  Was this bundle packed by the pass just before this one?  Reading
+!  clears the mark, so the answer is yes at most once per pack.
+!+
+!-------------------------------------------------------------
+logical function gpu_arrays_take_packed(ib)
+ integer, intent(in) :: ib
+
+ gpu_arrays_take_packed = packed(ib)
+ packed(ib) = .false.
+
+end function gpu_arrays_take_packed
 
 !-------------------------------------------------------------
 !+
