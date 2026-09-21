@@ -38,7 +38,7 @@ module gpu_arrays
 !
 ! :Dependencies: dim, iso_c_binding
 !
- use iso_c_binding, only:c_double
+ use iso_c_binding, only:c_double,c_int
  implicit none
 
  private
@@ -112,6 +112,14 @@ module gpu_arrays
    use iso_c_binding, only:c_ptr
    type(c_ptr), value :: ptr
   end subroutine cosmo_unpin_host
+
+!--C interface to cosmoSPHere/src/arrays_c_api.cu: sizes the device's particle-length
+!  arrays, so the footprint is decided here rather than by whichever kernel first
+!  touched an array.  The entry points refuse to run on a different count.
+  subroutine cosmo_arrays_init(n) bind(C)
+   use iso_c_binding, only:c_int
+   integer(c_int), value :: n
+  end subroutine cosmo_arrays_init
  end interface
 #endif
 
@@ -175,6 +183,10 @@ subroutine gpu_arrays_init(n)
  endif
  allocate(arena(off-1))
  call pin_buffer(arena)
+#ifdef GPU
+ !--size the device side to match, in one call, from the same n
+ call cosmo_arrays_init(int(n, kind=c_int))
+#endif
  packed = .false.   ! nothing in a fresh arena holds anything
  nbuf = n
 
