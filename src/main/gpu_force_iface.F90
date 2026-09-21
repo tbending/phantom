@@ -98,8 +98,23 @@ subroutine force_gpu(npart,xyzh,vxyzu,eos_vars,alphaind,fxyzu,divcurlv,dt)
  real(c_double), pointer, contiguous :: pro2_8(:),spsound_8(:),alphaAV_8(:),u_8(:)
  real(c_double), pointer, contiguous :: fx8(:),fy8(:),fz8(:),f48(:)
  real(c_double), pointer, contiguous :: vsigmax8(:),divv8(:)
+ !--host-side cost of the force pass, under the same COSMO_DENS_STATS gate as the
+ !  density one.  Without it the sweeps below are invisible: the GPU stats cover only
+ !  the density solve, and phantom's own force timer is quantised to 1/8 s by the
+ !  real*4 in utils_timing.
+ integer(kind=8)  :: ic0,ic1,ic2,ic3,ic4,ic5,crate
+ character(len=8) :: statsenv
+ logical, save    :: stats = .false.
+ logical, save    :: stats_checked = .false.
 
  if (npart <= 0) return
+
+ if (.not. stats_checked) then
+    call get_environment_variable('COSMO_DENS_STATS', statsenv)
+    stats = (len_trim(statsenv) > 0)
+    stats_checked = .true.
+ endif
+ call system_clock(ic0, crate)
 
  !--the GPU returns du/dt as p dV work + shock heating (each switchable) + conductivity,
  !  as force.F90 assembles it for the internal energy; refuse what would change that sum
@@ -151,6 +166,7 @@ subroutine force_gpu(npart,xyzh,vxyzu,eos_vars,alphaind,fxyzu,divcurlv,dt)
  endif
 
  call gpu_arrays_upload(ibun_thermo,npart)
+ call system_clock(ic1)
 
  call force_gpu_c(int(npart,kind=c_int),                &
                   real(massoftype(igas),kind=c_double), &
@@ -160,7 +176,11 @@ subroutine force_gpu(npart,xyzh,vxyzu,eos_vars,alphaind,fxyzu,divcurlv,dt)
                   int(ipdv_heating,kind=c_int),int(ishock_heating,kind=c_int))
 
  !--the pass leaves its results on the device; fetch them
+ call system_clock(ic2)
+
  call gpu_arrays_download(ibun_force_out,npart)
+
+ call system_clock(ic3)
 
  !--as force.F90: with driving, fxyzu already holds the driving force (forceit
  !  runs first), so the SPH force is added to it.  Isothermal builds have no
@@ -182,6 +202,8 @@ subroutine force_gpu(npart,xyzh,vxyzu,eos_vars,alphaind,fxyzu,divcurlv,dt)
  enddo
  !$omp end parallel do
 
+ call system_clock(ic4)
+
  !--as force.F90: cooling evaluated in the force pass, from div v of this pass
  if (add_cooling) then
     !$omp parallel do default(none) schedule(static) private(i,dudtcool) &
@@ -197,6 +219,16 @@ subroutine force_gpu(npart,xyzh,vxyzu,eos_vars,alphaind,fxyzu,divcurlv,dt)
 
  call finish_gpu_force_timesteps(npart,xyzh,vxyzu,fxyzu, &
                                  fx8,fy8,fz8,vsigmax8,spsound_8)
+ call system_clock(ic5)
+
+ if (stats) then
+    write(0,'(a,f8.2,a,f8.2,a,f8.2,a,f8.2,a,f8.2)') &
+       'COSMO_FFORT pack=',  1.e3*real(ic1-ic0)/real(crate), &
+       ' capi=',             1.e3*real(ic2-ic1)/real(crate), &
+       ' download=',         1.e3*real(ic3-ic2)/real(crate), &
+       ' unpack+cool=',      1.e3*real(ic4-ic3)/real(crate), &
+       ' dt=',               1.e3*real(ic5-ic4)/real(crate)
+ endif
 #else
  print *, 'ERROR: force_gpu called but phantom not compiled with GPU=yes'
  stop
