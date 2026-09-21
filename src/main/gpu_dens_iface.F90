@@ -51,7 +51,8 @@ module gpu_dens_iface
 !
  use iso_c_binding, only:c_double
  use gpu_arrays,    only:gpu_arrays_init,gpu_arrays_comp,gpu_arrays_nbuf, &
-                         gpu_arrays_mark_packed,gpu_arrays_download, &
+                         gpu_arrays_mark_packed,gpu_arrays_upload,gpu_arrays_download, &
+                         gpu_arrays_positions_moved,gpu_arrays_order_rebuilt, &
                          ibun_pos,ibun_hsml,ibun_vel,ibun_accel, &
                          ibun_dens_out,ibun_grad_out
  implicit none
@@ -65,14 +66,9 @@ module gpu_dens_iface
 #ifdef GPU
 !--C interface to cosmoSPHere/src/dens_c_api.cu
  interface
-  subroutine densityiterate_gpu_c(h, &
-                                  x, y, z, vx, vy, vz, ax, ay, az, n, pmass, &
+  subroutine densityiterate_gpu_c(n, pmass, &
                                   periodic, box, tolh, hfact) bind(C)
    use iso_c_binding, only:c_double,c_int
-   real(c_double), intent(in)    :: h(*)
-   real(c_double), intent(in)    :: x(*), y(*), z(*)
-   real(c_double), intent(in)    :: vx(*), vy(*), vz(*)
-   real(c_double), intent(in)    :: ax(*), ay(*), az(*)
    integer(c_int), value         :: n
    real(c_double), value         :: pmass
    integer(c_int), value         :: periodic
@@ -308,14 +304,22 @@ subroutine densityiterate_gpu(npart, xyzh, vxyzu, fxyzu, fext, gradh, divcurlv, 
  call gpu_arrays_mark_packed(ibun_vel)
  call system_clock(ic1)
 
- call densityiterate_gpu_c(h8, &
-                            x8, y8, z8, vx8, vy8, vz8, ax8, ay8, az8, &
-                            int(npart, kind=c_int), &
+ !--these positions are for a new step, so the device's ordering is now stale; it
+ !  describes where the particles were.  The solve below rebuilds it.
+ call gpu_arrays_positions_moved()
+ call gpu_arrays_upload(ibun_pos,   npart)
+ call gpu_arrays_upload(ibun_hsml,  npart)
+ call gpu_arrays_upload(ibun_vel,   npart)
+ call gpu_arrays_upload(ibun_accel, npart)
+
+ call densityiterate_gpu_c(int(npart, kind=c_int), &
                             real(massoftype(igas), kind=c_double), &
                             merge(1_c_int, 0_c_int, periodic), &
                             real([xmin,xmax,ymin,ymax,zmin,zmax], kind=c_double), &
                             real(tolh, kind=c_double), &
                             real(hfact, kind=c_double))
+ call gpu_arrays_order_rebuilt()
+
  !--the solve leaves its results on the device; fetch the three bundles it filled
  call gpu_arrays_download(ibun_hsml,     npart)
  call gpu_arrays_download(ibun_dens_out, npart)

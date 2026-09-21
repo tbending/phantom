@@ -35,25 +35,20 @@ module gpu_force_iface
 ! :Dependencies: dim, gpu_arrays, iso_c_binding, options, part, timestep
 !
  use iso_c_binding, only:c_double,c_int
- use gpu_arrays,    only:gpu_arrays_init,gpu_arrays_comp,gpu_arrays_take_packed, &
+ use gpu_arrays,    only:gpu_arrays_init,gpu_arrays_comp,gpu_arrays_claim_packed, &
+                         gpu_arrays_upload, &
                          gpu_arrays_download, &
                          ibun_vel,ibun_thermo,ibun_force_out
  implicit none
 
 #ifdef GPU
  interface
-    subroutine force_gpu_c(n,pmass,vx,vy,vz, &
-                         pro2,spsound,alphaAV,u,beta,alphau,disc_viscosity, &
+    subroutine force_gpu_c(n,pmass,beta,alphau,disc_viscosity, &
                          pdv_heating,shock_heating) bind(C)
     use iso_c_binding, only:c_double,c_int
 
     integer(c_int), value       :: n
     real(c_double), value       :: pmass
-    real(c_double), intent(in)  :: vx(*),vy(*),vz(*)
-    real(c_double), intent(in)  :: pro2(*)
-    real(c_double), intent(in)  :: spsound(*)
-    real(c_double), intent(in)  :: alphaAV(*)
-    real(c_double), intent(in)  :: u(*)
     real(c_double), value       :: beta
     real(c_double), value       :: alphau
     integer(c_int), value       :: disc_viscosity
@@ -143,7 +138,7 @@ subroutine force_gpu(npart,xyzh,vxyzu,eos_vars,alphaind,fxyzu,divcurlv,dt)
  !  same set of positions the slice already holds what this pass would write.  A
  !  later force pass on the same tree is the leapfrog corrector, whose velocities
  !  have changed, and the mark is gone by then, so it packs.
- if (.not. gpu_arrays_take_packed(ibun_vel)) then
+ if (.not. gpu_arrays_claim_packed(ibun_vel)) then
     !$omp parallel do default(none) schedule(static) private(i) shared(npart,vxyzu,vx8,vy8,vz8)
     do i = 1,npart
        vx8(i) = real(vxyzu(1,i),kind=c_double)
@@ -151,12 +146,14 @@ subroutine force_gpu(npart,xyzh,vxyzu,eos_vars,alphaind,fxyzu,divcurlv,dt)
        vz8(i) = real(vxyzu(3,i),kind=c_double)
     enddo
     !$omp end parallel do
+    !--packed here, so the device's copy is stale: send it
+    call gpu_arrays_upload(ibun_vel,npart)
  endif
+
+ call gpu_arrays_upload(ibun_thermo,npart)
 
  call force_gpu_c(int(npart,kind=c_int),                &
                   real(massoftype(igas),kind=c_double), &
-                  vx8,vy8,vz8,                          &
-                  pro2_8,spsound_8,alphaAV_8,u_8,       &
                   real(beta,kind=c_double),             &
                   real(alphau,kind=c_double),           &
                   merge(1_c_int,0_c_int,disc_viscosity), &
