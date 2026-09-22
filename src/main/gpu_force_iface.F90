@@ -18,9 +18,9 @@ module gpu_force_iface
 ! and sets the timestep constraints.  deriv.f90 therefore calls it exactly the
 ! way it calls force, with no GPU-specific scaffolding of its own.
 !
-! The staging buffers are module level and reused across calls, so they are
-! allocated once and grown only if npart rises, rather than allocated and freed
-! on every force evaluation.
+! Host staging belongs to gpu_arrays, which this shares with the density pass:
+! velocity is the same bundle for both, so whichever packs it first is the only
+! one that packs it.
 !
 ! It consumes the octree and per-leaf hmax that densityiterate_gpu leaves in the
 ! GPU state, so it is only valid immediately after a GPU density solve; the C
@@ -32,33 +32,27 @@ module gpu_force_iface
 !
 ! :Runtime parameters: None
 !
-! :Dependencies: dim, gpu_dens_iface, iso_c_binding, options, part, timestep
+! :Dependencies: dim, gpu_arrays, iso_c_binding, options, part, timestep
 !
  use iso_c_binding, only:c_double,c_int
+ use gpu_arrays,    only:gpu_arrays_init,gpu_arrays_comp,gpu_arrays_claim_packed, &
+                         gpu_arrays_upload, &
+                         gpu_arrays_download, &
+                         ibun_vel,ibun_thermo,ibun_force_out
  implicit none
 
 #ifdef GPU
  interface
-    subroutine force_gpu_c(n,pmass,vx,vy,vz, &
-                         pro2,spsound,alphaAV,u,beta,alphau,disc_viscosity, &
-                         pdv_heating,shock_heating, &
-                         fx,fy,fz,f4,vsigmax,divv) bind(C)
+    subroutine force_gpu_c(n,pmass,beta,alphau,disc_viscosity, &
+                         pdv_heating,shock_heating) bind(C)
     use iso_c_binding, only:c_double,c_int
 
     integer(c_int), value       :: n
     real(c_double), value       :: pmass
-    real(c_double), intent(in)  :: vx(*),vy(*),vz(*)
-    real(c_double), intent(in)  :: pro2(*)
-    real(c_double), intent(in)  :: spsound(*)
-    real(c_double), intent(in)  :: alphaAV(*)
-    real(c_double), intent(in)  :: u(*)
     real(c_double), value       :: beta
     real(c_double), value       :: alphau
     integer(c_int), value       :: disc_viscosity
     integer(c_int), value       :: pdv_heating,shock_heating
-    real(c_double), intent(out) :: fx(*),fy(*),fz(*),f4(*)
-    real(c_double), intent(out) :: vsigmax(*)
-    real(c_double), intent(out) :: divv(*)
     end subroutine force_gpu_c
 
  end interface
@@ -66,17 +60,6 @@ module gpu_force_iface
 
  public :: force_gpu
  private
-
-!
-! Staging buffers shared by the routines below.  nbuf is their current capacity;
-! ensure_buffers grows them when npart exceeds it and is otherwise a no-op.
-! They are registered with the driver while allocated (gpu_dens_iface pin_buffer).
-!
- integer :: nbuf = 0
- real(c_double), allocatable, target :: vx8(:),vy8(:),vz8(:)
- real(c_double), allocatable, target :: pro2_8(:),spsound_8(:),alphaAV_8(:),u_8(:)
- real(c_double), allocatable, target :: fx8(:),fy8(:),fz8(:),f48(:)
- real(c_double), allocatable, target :: vsigmax8(:),divv8(:)
 
 contains
 
@@ -109,8 +92,29 @@ subroutine force_gpu(npart,xyzh,vxyzu,eos_vars,alphaind,fxyzu,divcurlv,dt)
  integer :: i
  real    :: dudtcool
  logical :: add_cooling
+ !--slices of the gpu_arrays arena, re-associated each call because the arena moves
+ !  when it grows.  contiguous, so these pass straight to the bind(C) call.
+ real(c_double), pointer, contiguous :: vx8(:),vy8(:),vz8(:)
+ real(c_double), pointer, contiguous :: pro2_8(:),spsound_8(:),alphaAV_8(:),u_8(:)
+ real(c_double), pointer, contiguous :: fx8(:),fy8(:),fz8(:),f48(:)
+ real(c_double), pointer, contiguous :: vsigmax8(:),divv8(:)
+ !--host-side cost of the force pass, under the same COSMO_DENS_STATS gate as the
+ !  density one.  Without it the sweeps below are invisible: the GPU stats cover only
+ !  the density solve, and phantom's own force timer is quantised to 1/8 s by the
+ !  real*4 in utils_timing.
+ integer(kind=8)  :: ic0,ic1,ic2,ic3,ic4,ic5,crate
+ character(len=8) :: statsenv
+ logical, save    :: stats = .false.
+ logical, save    :: stats_checked = .false.
 
  if (npart <= 0) return
+
+ if (.not. stats_checked) then
+    call get_environment_variable('COSMO_DENS_STATS', statsenv)
+    stats = (len_trim(statsenv) > 0)
+    stats_checked = .true.
+ endif
+ call system_clock(ic0, crate)
 
  !--the GPU returns du/dt as p dV work + shock heating (each switchable) + conductivity,
  !  as force.F90 assembles it for the internal energy; refuse what would change that sum
@@ -126,28 +130,57 @@ subroutine force_gpu(npart,xyzh,vxyzu,eos_vars,alphaind,fxyzu,divcurlv,dt)
  !--cooling that force.F90 applies in the force pass (not in the step), added below
  add_cooling = (maxvxyzu >= 4 .and. icooling > 0 .and. dt > 0. .and. .not.cooling_in_step)
 
- call ensure_buffers(npart)
- call prepare_pro2_gpu(npart,xyzh,vxyzu,eos_vars,alphaind)
+ call gpu_arrays_init(npart)
+ vx8      => gpu_arrays_comp(ibun_vel,1)
+ vy8      => gpu_arrays_comp(ibun_vel,2)
+ vz8      => gpu_arrays_comp(ibun_vel,3)
+ pro2_8   => gpu_arrays_comp(ibun_thermo,1)
+ spsound_8=> gpu_arrays_comp(ibun_thermo,2)
+ alphaAV_8=> gpu_arrays_comp(ibun_thermo,3)
+ u_8      => gpu_arrays_comp(ibun_thermo,4)
+ fx8      => gpu_arrays_comp(ibun_force_out,1)
+ fy8      => gpu_arrays_comp(ibun_force_out,2)
+ fz8      => gpu_arrays_comp(ibun_force_out,3)
+ f48      => gpu_arrays_comp(ibun_force_out,4)
+ vsigmax8 => gpu_arrays_comp(ibun_force_out,5)
+ divv8    => gpu_arrays_comp(ibun_force_out,6)
 
- !--positions and h are not sent: the GPU uses its copies from the density solve,
- !  and it reads these velocities only when they may differ from the solve's
- !$omp parallel do default(none) schedule(static) private(i) shared(npart,vxyzu,vx8,vy8,vz8)
- do i = 1,npart
-    vx8(i) = real(vxyzu(1,i),kind=c_double)
-    vy8(i) = real(vxyzu(2,i),kind=c_double)
-    vz8(i) = real(vxyzu(3,i),kind=c_double)
- enddo
- !$omp end parallel do
+ call prepare_pro2_gpu(npart,xyzh,vxyzu,eos_vars,alphaind, &
+                       pro2_8,spsound_8,alphaAV_8,u_8)
+
+ !--positions and h are not sent: the GPU uses its copies from the density solve.
+ !  Velocity is shared with the density pass, so if that pass packed it for this
+ !  same set of positions the slice already holds what this pass would write.  A
+ !  later force pass on the same tree is the leapfrog corrector, whose velocities
+ !  have changed, and the mark is gone by then, so it packs.
+ if (.not. gpu_arrays_claim_packed(ibun_vel)) then
+    !$omp parallel do default(none) schedule(static) private(i) shared(npart,vxyzu,vx8,vy8,vz8)
+    do i = 1,npart
+       vx8(i) = real(vxyzu(1,i),kind=c_double)
+       vy8(i) = real(vxyzu(2,i),kind=c_double)
+       vz8(i) = real(vxyzu(3,i),kind=c_double)
+    enddo
+    !$omp end parallel do
+    !--packed here, so the device's copy is stale: send it
+    call gpu_arrays_upload(ibun_vel,npart)
+ endif
+
+ call gpu_arrays_upload(ibun_thermo,npart)
+ call system_clock(ic1)
 
  call force_gpu_c(int(npart,kind=c_int),                &
                   real(massoftype(igas),kind=c_double), &
-                  vx8,vy8,vz8,                          &
-                  pro2_8,spsound_8,alphaAV_8,u_8,       &
                   real(beta,kind=c_double),             &
                   real(alphau,kind=c_double),           &
                   merge(1_c_int,0_c_int,disc_viscosity), &
-                  int(ipdv_heating,kind=c_int),int(ishock_heating,kind=c_int), &
-                  fx8,fy8,fz8,f48,vsigmax8,divv8)
+                  int(ipdv_heating,kind=c_int),int(ishock_heating,kind=c_int))
+
+ !--the pass leaves its results on the device; fetch them
+ call system_clock(ic2)
+
+ call gpu_arrays_download(ibun_force_out,npart)
+
+ call system_clock(ic3)
 
  !--as force.F90: with driving, fxyzu already holds the driving force (forceit
  !  runs first), so the SPH force is added to it.  Isothermal builds have no
@@ -169,6 +202,8 @@ subroutine force_gpu(npart,xyzh,vxyzu,eos_vars,alphaind,fxyzu,divcurlv,dt)
  enddo
  !$omp end parallel do
 
+ call system_clock(ic4)
+
  !--as force.F90: cooling evaluated in the force pass, from div v of this pass
  if (add_cooling) then
     !$omp parallel do default(none) schedule(static) private(i,dudtcool) &
@@ -182,7 +217,18 @@ subroutine force_gpu(npart,xyzh,vxyzu,eos_vars,alphaind,fxyzu,divcurlv,dt)
     !$omp end parallel do
  endif
 
- call finish_gpu_force_timesteps(npart,xyzh,vxyzu,fxyzu)
+ call finish_gpu_force_timesteps(npart,xyzh,vxyzu,fxyzu, &
+                                 fx8,fy8,fz8,vsigmax8,spsound_8)
+ call system_clock(ic5)
+
+ if (stats) then
+    write(0,'(a,f8.2,a,f8.2,a,f8.2,a,f8.2,a,f8.2)') &
+       'COSMO_FFORT pack=',  1.e3*real(ic1-ic0)/real(crate), &
+       ' capi=',             1.e3*real(ic2-ic1)/real(crate), &
+       ' download=',         1.e3*real(ic3-ic2)/real(crate), &
+       ' unpack+cool=',      1.e3*real(ic4-ic3)/real(crate), &
+       ' dt=',               1.e3*real(ic5-ic4)/real(crate)
+ endif
 #else
  print *, 'ERROR: force_gpu called but phantom not compiled with GPU=yes'
  stop
@@ -192,57 +238,22 @@ end subroutine force_gpu
 
 !-----------------------------------------------------------------------
 !+
-!  Grow the staging buffers to hold at least n particles.  No-op once they
-!  are big enough, so the allocation happens on the first force call only.
-!+
-!-----------------------------------------------------------------------
-subroutine ensure_buffers(n)
- use gpu_dens_iface, only:pin_buffer,unpin_buffer
- integer, intent(in) :: n
-
- if (nbuf >= n) return
-
- if (allocated(vx8)) then
-    call unpin_buffer(vx8);       call unpin_buffer(vy8)
-    call unpin_buffer(vz8);       call unpin_buffer(pro2_8);     call unpin_buffer(spsound_8)
-    call unpin_buffer(alphaAV_8); call unpin_buffer(u_8);        call unpin_buffer(fx8)
-    call unpin_buffer(fy8);       call unpin_buffer(fz8);        call unpin_buffer(f48)
-    call unpin_buffer(vsigmax8);  call unpin_buffer(divv8)
-    deallocate(vx8,vy8,vz8, &
-               pro2_8,spsound_8,alphaAV_8,u_8, &
-               fx8,fy8,fz8,f48,vsigmax8,divv8)
- endif
-
- allocate(vx8(n),vy8(n),vz8(n), &
-          pro2_8(n),spsound_8(n),alphaAV_8(n),u_8(n), &
-          fx8(n),fy8(n),fz8(n),f48(n),vsigmax8(n),divv8(n))
-
- call pin_buffer(vx8);       call pin_buffer(vy8)
- call pin_buffer(vz8);       call pin_buffer(pro2_8);     call pin_buffer(spsound_8)
- call pin_buffer(alphaAV_8); call pin_buffer(u_8);        call pin_buffer(fx8)
- call pin_buffer(fy8);       call pin_buffer(fz8);        call pin_buffer(f48)
- call pin_buffer(vsigmax8);  call pin_buffer(divv8)
-
- nbuf = n
-
-end subroutine ensure_buffers
-
-!-----------------------------------------------------------------------
-!+
 !  Derive the per-particle inputs the force kernel needs, into the staging
 !  buffers.  No MHD/radiation/physical viscosity branch of get_stress.
 !+
 !-----------------------------------------------------------------------
-subroutine prepare_pro2_gpu(npart,xyzh,vxyzu,eos_vars,alphaind)
+subroutine prepare_pro2_gpu(npart,xyzh,vxyzu,eos_vars,alphaind, &
+                            pro2_8,spsound_8,alphaAV_8,u_8)
  use dim,     only:maxalpha,maxp,maxvxyzu
  use options, only:alpha
  use part,    only:igas,igasP,ics,massoftype,rhoh
 
- integer,      intent(in) :: npart
- real,         intent(in) :: xyzh(:,:)
- real,         intent(in) :: vxyzu(:,:)
- real,         intent(in) :: eos_vars(:,:)
- real(kind=4), intent(in) :: alphaind(:,:)
+ integer,      intent(in)  :: npart
+ real,         intent(in)  :: xyzh(:,:)
+ real,         intent(in)  :: vxyzu(:,:)
+ real,         intent(in)  :: eos_vars(:,:)
+ real(kind=4), intent(in)  :: alphaind(:,:)
+ real(c_double), intent(out) :: pro2_8(:),spsound_8(:),alphaAV_8(:),u_8(:)
 
  integer :: i
  real    :: rhoi,rho1i
@@ -280,7 +291,8 @@ end subroutine prepare_pro2_gpu
 !  and the sound speed come from the staging buffers the kernel just filled.
 !+
 !-----------------------------------------------------------------------
-subroutine finish_gpu_force_timesteps(npart,xyzh,vxyzu,fxyzu)
+subroutine finish_gpu_force_timesteps(npart,xyzh,vxyzu,fxyzu, &
+                                      fx8,fy8,fz8,vsigmax8,spsound_8)
  use options,  only:alpha
  use timestep, only:C_cour,C_force,bignumber,dtmax, &
                     dtcourant,dtforce,dtrad
@@ -288,9 +300,10 @@ subroutine finish_gpu_force_timesteps(npart,xyzh,vxyzu,fxyzu)
  use dim,      only:maxvxyzu,gr
  use eos,      only:ieos
 
- integer, intent(in)    :: npart
- real,    intent(in)    :: xyzh(:,:),vxyzu(:,:)
- real,    intent(inout) :: fxyzu(:,:)
+ integer,        intent(in)    :: npart
+ real,           intent(in)    :: xyzh(:,:),vxyzu(:,:)
+ real,           intent(inout) :: fxyzu(:,:)
+ real(c_double), intent(in)    :: fx8(:),fy8(:),fz8(:),vsigmax8(:),spsound_8(:)
 
  integer :: i
  real    :: hi,vsigdtc,f2i,dtc,dtf,dtcmin,dtfmin,eni
