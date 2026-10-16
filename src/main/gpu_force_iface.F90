@@ -79,6 +79,7 @@ subroutine force_gpu(npart,xyzh,vxyzu,eos_vars,alphaind,fxyzu,divcurlv,dt)
  use cooling, only:energ_cooling,cooling_in_step
  use part,    only:nptmass,xyzmh_ptmass
  use part,    only:sinks_have_heating
+ use dim,     only:use_dust
 
  integer,      intent(in)    :: npart
  real,         intent(in)    :: xyzh(:,:),vxyzu(:,:)
@@ -106,8 +107,19 @@ subroutine force_gpu(npart,xyzh,vxyzu,eos_vars,alphaind,fxyzu,divcurlv,dt)
  character(len=8) :: statsenv
  logical, save    :: stats = .false.
  logical, save    :: stats_checked = .false.
+ character(len=8) :: nodragenv
 
  if (npart <= 0) return
+
+ !--with two-fluid dust the GPU computes the gas-gas SPH force and gives dust particles
+ !  zero force: gas-dust drag is not on the GPU yet (phase 4 of
+ !  force/GPU_DUST_TWO_TREE_PLAN.md), so refuse.  COSMO_GPU_DUST_NO_DRAG=1 lets a run
+ !  through regardless, for checking the GPU dust DENSITY against the CPU (nmax = 0)
+ !  and for nothing else: its forces are wrong.
+ if (use_dust) then
+    call get_environment_variable('COSMO_GPU_DUST_NO_DRAG', nodragenv)
+    if (trim(nodragenv) /= '1') call fatal('force_gpu','gas-dust drag not computed on GPU yet')
+ endif
 
  if (.not. stats_checked) then
     call get_environment_variable('COSMO_DENS_STATS', statsenv)

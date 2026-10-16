@@ -54,7 +54,7 @@ module gpu_dens_iface
                          gpu_arrays_mark_packed,gpu_arrays_upload,gpu_arrays_download, &
                          gpu_arrays_positions_moved,gpu_arrays_order_rebuilt, &
                          ibun_pos,ibun_hsml,ibun_vel,ibun_accel, &
-                         ibun_dens_out,ibun_grad_out
+                         ibun_dens_out,ibun_grad_out,ibun_ptype
  implicit none
 
 #ifdef GPU
@@ -66,11 +66,12 @@ module gpu_dens_iface
 #ifdef GPU
 !--C interface to cosmoSPHere/src/dens_c_api.cu
  interface
-  subroutine densityiterate_gpu_c(n, pmass, &
+  subroutine densityiterate_gpu_c(n, pmass, pmass_dust, &
                                   periodic, box, tolh, hfact) bind(C)
    use iso_c_binding, only:c_double,c_int
    integer(c_int), value         :: n
    real(c_double), value         :: pmass
+   real(c_double), value         :: pmass_dust
    integer(c_int), value         :: periodic
    real(c_double), intent(in)    :: box(6)
    real(c_double), value         :: tolh
@@ -133,8 +134,10 @@ end subroutine init_gpu_switch
 !  Calls the cosmoSPHere Newton-Raphson + Cornerstone GPU solver,
 !  then converts outputs to phantom's array conventions.
 !
-!  Only gas particles (igas type) are passed to the GPU.
-!  pmass = massoftype(igas) from the part module.
+!  Gas particles, and with two-fluid dust (dust as particles, one
+!  large grain type) the dust particles too: the GPU builds a tree per
+!  type and solves each with its own mass, massoftype(igas) and
+!  massoftype(idust).
 !
 !  NOTE: hfact is hardcoded to 1.2 (cubic spline) inside cosmoSPHere.
 !  If a different kernel is selected in phantom, ensure the same hfact
@@ -158,7 +161,10 @@ subroutine densityiterate_gpu(npart, xyzh, vxyzu, fxyzu, fext, gradh, divcurlv, 
  use ptmass_radiation, only:iget_tdust
  use kernel,           only:kernelname,radkern
  use part,             only:hfact
- use part,             only:iphase,iamtype,iamboundary,igas
+ use part,             only:iphase,iamtype,iamboundary,igas,idust
+ use part,             only:ndustsmall,ndustlarge
+ use dim,              only:use_dustgrowth
+ use options,          only:use_dustfrac,use_hybrid
  use dim,              only:maxphase,maxp
  use iso_c_binding, only:c_double,c_int
 #endif
@@ -179,6 +185,8 @@ subroutine densityiterate_gpu(npart, xyzh, vxyzu, fxyzu, fext, gradh, divcurlv, 
  real(c_double), pointer, contiguous :: ax8(:),ay8(:),az8(:)
  real(c_double), pointer, contiguous :: rho8(:),drhofh8(:)
  real(c_double), pointer, contiguous :: divv8(:),xi8(:),ddivvdt8(:)
+ real(c_double), pointer, contiguous :: ptype8(:)
+ real(c_double) :: pmass_dust
  integer(kind=8) :: ic0,ic1,ic2,ic3,ic4,crate
  character(len=8) :: statsenv
  logical, save    :: stats = .false.
@@ -189,10 +197,20 @@ subroutine densityiterate_gpu(npart, xyzh, vxyzu, fxyzu, fext, gradh, divcurlv, 
  !--the GPU sweep produces div v, dv/dx and d(div v)/dt for a single gas type.
  !  Anything that needs a quantity it does not compute would silently get stale
  !  values, so refuse rather than run: curl v (divcurlv(2:4)), div/curl B,
- !  the 2-fluid dust density, radiation fluxes, and gradsoft in gradh(2,:).
+ !  radiation fluxes, and gradsoft in gradh(2,:).
  if (curlv)        call fatal('densityiterate_gpu','curl v not computed on GPU (set curlv=F)')
  if (mhd)          call fatal('densityiterate_gpu','divcurlB not computed on GPU')
- if (use_dust)     call fatal('densityiterate_gpu','dust density not computed on GPU')
+ !--two-fluid dust is solved on its own tree.  Dust as a mixture (dustfrac on the gas),
+ !  small grains, more than one large grain size (one tree per size is not decided:
+ !  force/GPU_DUST_TWO_TREE_PLAN.md) and dust growth are not.  NOT YET: the gas-side
+ !  dust-to-gas ratio, dustfrac(ndustsmall+1,:) on gas particles, is not computed.
+ if (use_dust) then
+    if (use_dustfrac .or. use_hybrid .or. ndustsmall > 0) &
+       call fatal('densityiterate_gpu','dust as a mixture not supported on GPU (use dust_method=2)')
+    if (ndustlarge > 1) &
+       call fatal('densityiterate_gpu','more than one large grain size not supported on GPU',ival=ndustlarge)
+    if (use_dustgrowth) call fatal('densityiterate_gpu','dust growth not supported on GPU')
+ endif
  if (do_radiation) call fatal('densityiterate_gpu','radiation flux not computed on GPU')
  if (gravity)      call fatal('densityiterate_gpu','gradsoft not computed on GPU')
  !--the GPU force pass evaluates and overwrites every particle, not just the
@@ -218,10 +236,11 @@ subroutine densityiterate_gpu(npart, xyzh, vxyzu, fxyzu, fext, gradh, divcurlv, 
  if (abs(real(cosmo_kernel_radius()) - radkern) > 1.e-6) call fatal('densityiterate_gpu', &
     'cosmoSPHere library was built for a different kernel: rebuild it',var='radkern',val=real(cosmo_kernel_radius()))
 
- !--the GPU solves every particle as gas of mass massoftype(igas).  Boundary particles
- !  (wind shells, BHL inflow) are inactive after the first call on the CPU path, and
- !  stars, dark matter and other types have their own mass and physics, so refuse any
- !  particle that is not gas.  Checked every call, as injection adds particles.
+ !--the GPU solves gas with massoftype(igas) and, with two-fluid dust, dust with
+ !  massoftype(idust).  Boundary particles (wind shells, BHL inflow) are inactive after
+ !  the first call on the CPU path, and stars, dark matter and other types have their
+ !  own mass and physics, so refuse any other particle.  Checked every call, as
+ !  injection adds particles.
  if (maxphase == maxp) then
     nbound = 0
     nother = 0
@@ -229,13 +248,13 @@ subroutine densityiterate_gpu(npart, xyzh, vxyzu, fxyzu, fext, gradh, divcurlv, 
     do i = 1, npart
        if (iamboundary(iamtype(iphase(i)))) then
           nbound = nbound + 1
-       elseif (iamtype(iphase(i)) /= igas) then
+       elseif (iamtype(iphase(i)) /= igas .and. .not.(use_dust .and. iamtype(iphase(i)) == idust)) then
           nother = nother + 1
        endif
     enddo
     !$omp end parallel do
     if (nbound > 0) call fatal('densityiterate_gpu','boundary particles not supported on GPU',ival=nbound)
-    if (nother > 0) call fatal('densityiterate_gpu','only gas particles are supported on GPU',ival=nother)
+    if (nother > 0) call fatal('densityiterate_gpu','only gas and two-fluid dust particles are supported on GPU',ival=nother)
  endif
 
  !--COSMO_DENS_STATS=1 also reports the phantom-side cost of the GPU call
@@ -273,11 +292,12 @@ subroutine densityiterate_gpu(npart, xyzh, vxyzu, fxyzu, fext, gradh, divcurlv, 
  divv8   => gpu_arrays_comp(ibun_grad_out,1)
  xi8     => gpu_arrays_comp(ibun_grad_out,2)
  ddivvdt8=> gpu_arrays_comp(ibun_grad_out,3)
+ if (use_dust) ptype8 => gpu_arrays_comp(ibun_ptype,1)
 
  ncross = 0
  !$omp parallel do default(none) private(i) &
  !$omp shared(npart,xyzh,vxyzu,fxyzu,fext,x8,y8,z8,h8,vx8,vy8,vz8,ax8,ay8,az8) &
- !$omp shared(isperiodic) reduction(+:ncross)
+ !$omp shared(isperiodic,ptype8,iphase) reduction(+:ncross)
  do i = 1, npart
     !--the GPU tree is built in the periodic box, so particles must be inside it
     if (periodic) then
@@ -297,6 +317,8 @@ subroutine densityiterate_gpu(npart, xyzh, vxyzu, fxyzu, fext, gradh, divcurlv, 
     ax8(i) = real(fxyzu(1,i) + fext(1,i), kind=c_double)
     ay8(i) = real(fxyzu(2,i) + fext(2,i), kind=c_double)
     az8(i) = real(fxyzu(3,i) + fext(3,i), kind=c_double)
+    !--which tree the particle goes in (the type check above admits only these two)
+    if (use_dust) ptype8(i) = merge(1._c_double, 0._c_double, iamtype(iphase(i)) == idust)
  enddo
  !$omp end parallel do
  !--the force pass that follows uses the same velocities, from the same bundle, so
@@ -311,9 +333,13 @@ subroutine densityiterate_gpu(npart, xyzh, vxyzu, fxyzu, fext, gradh, divcurlv, 
  call gpu_arrays_upload(ibun_hsml,  npart)
  call gpu_arrays_upload(ibun_vel,   npart)
  call gpu_arrays_upload(ibun_accel, npart)
+ if (use_dust) call gpu_arrays_upload(ibun_ptype, npart)
+ pmass_dust = 0._c_double
+ if (use_dust) pmass_dust = real(massoftype(idust), kind=c_double)
 
  call densityiterate_gpu_c(int(npart, kind=c_int), &
                             real(massoftype(igas), kind=c_double), &
+                            pmass_dust, &
                             merge(1_c_int, 0_c_int, periodic), &
                             real([xmin,xmax,ymin,ymax,zmin,zmax], kind=c_double), &
                             real(tolh, kind=c_double), &

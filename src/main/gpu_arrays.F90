@@ -113,7 +113,8 @@ module gpu_arrays
  integer, parameter, public :: ibun_grad_out = 6   ! div v, xi, d(div v)/dt
  integer, parameter, public :: ibun_thermo   = 7   ! p/rho^2, c_s, alpha_AV, u
  integer, parameter, public :: ibun_force_out= 8   ! fx, fy, fz, du/dt, vsigmax, div v
- integer, parameter, public :: nbundle       = 8
+ integer, parameter, public :: ibun_ptype    = 9   ! particle type, 0 gas / 1 dust
+ integer, parameter, public :: nbundle       = 9
 
  type :: bundle_t
     character(len=10) :: name  = ''
@@ -239,6 +240,7 @@ contains
 !+
 !-------------------------------------------------------------
 subroutine gpu_arrays_init(n)
+ use dim, only:use_dust
 #ifdef GPU
  use io, only:fatal
 #endif
@@ -267,6 +269,10 @@ subroutine gpu_arrays_init(n)
  !  them out; that is the same change that makes a row's width depend on an option.
  bundle(ibun_thermo)   = bundle_t('thermo',   4, idir_up,     .true.)
  bundle(ibun_force_out)= bundle_t('force_out',6, idir_down,   .true.)
+ !--two-fluid dust: the device puts each type in its own segment and builds a tree
+ !  per type, so it needs to know which particles are which.  Phantom order, sent
+ !  before the solve (it sorts by it), never fetched back.
+ bundle(ibun_ptype)    = bundle_t('ptype',    1, idir_up,     use_dust)
 
  !--lay the live bundles out end to end.  device_only rows take no arena space.
  off = 1
@@ -394,13 +400,17 @@ subroutine gpu_arrays_upload(ib, n)
 
  p => gpu_arrays_comp(ib,1)
  if (order_matches) then
+    !--the type is read by the key kernel in phantom order, alongside the positions,
+    !  so gathering it into the device's order would mislabel every particle
+    if (ib == ibun_ptype) call fatal('gpu_arrays_upload','particle types sent after the '//&
+                                     'solve: send them with the positions, before it')
     call cosmo_upload_sorted(int(ib, kind=c_int), p, int(n, kind=c_int))
  else
     !--the ordering on the device is stale, which is only the case between new
     !  positions and the solve that sorts them; the only bundles that belong in
     !  that window are the ones the solve itself reads
     if (ib /= ibun_pos .and. ib /= ibun_hsml .and. &
-        ib /= ibun_vel .and. ib /= ibun_accel) &
+        ib /= ibun_vel .and. ib /= ibun_accel .and. ib /= ibun_ptype) &
        call fatal('gpu_arrays_upload','bundle sent between new positions and the '//&
                   'solve that sorts them: move it after the density solve',ival=ib)
     call cosmo_upload(int(ib, kind=c_int), p, int(n, kind=c_int))
