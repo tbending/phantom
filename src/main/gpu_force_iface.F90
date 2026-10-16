@@ -38,14 +38,14 @@ module gpu_force_iface
  use gpu_arrays,    only:gpu_arrays_init,gpu_arrays_comp,gpu_arrays_claim_packed, &
                          gpu_arrays_upload, &
                          gpu_arrays_download, &
-                         ibun_vel,ibun_thermo,ibun_force_out
+                         ibun_vel,ibun_thermo,ibun_force_out,ibun_drag_out
  implicit none
 
 #ifdef GPU
  interface
     subroutine force_gpu_c(n,pmass,beta,alphau,disc_viscosity, &
-                         pdv_heating,shock_heating) bind(C)
-    use iso_c_binding, only:c_double,c_int
+                         pdv_heating,shock_heating,idrag,dust,drag_tally) bind(C)
+    use iso_c_binding, only:c_double,c_int,c_long_long
 
     integer(c_int), value       :: n
     real(c_double), value       :: pmass
@@ -53,6 +53,9 @@ module gpu_force_iface
     real(c_double), value       :: alphau
     integer(c_int), value       :: disc_viscosity
     integer(c_int), value       :: pdv_heating,shock_heating
+    integer(c_int), value       :: idrag             ! 0: no two-fluid drag
+    real(c_double), intent(in)  :: dust(8)           ! see dust_params below
+    integer(c_long_long), intent(out) :: drag_tally(3)  ! drag, Stokes, supersonic pairs
     end subroutine force_gpu_c
 
  end interface
@@ -80,7 +83,12 @@ subroutine force_gpu(npart,xyzh,vxyzu,eos_vars,alphaind,fxyzu,divcurlv,dt)
  use part,    only:nptmass,xyzmh_ptmass
  use part,    only:sinks_have_heating
  use dim,     only:use_dust
- use part,    only:iphase,iamtype
+ use part,    only:iphase,iamtype,idust,grainsize,graindens,tstop
+ use dust,    only:idrag,irecon,drag_implicit,icut_backreaction,K_code,seff,coeff_gei_1,cste_mu
+ use timestep,only:bignumber
+ use io,      only:iverbose,warning,id,master
+ use io_summary, only:summary_variable,iosumdgs,iosumdge
+ use iso_c_binding, only:c_long_long
 
  integer,      intent(in)    :: npart
  real,         intent(in)    :: xyzh(:,:),vxyzu(:,:)
@@ -100,6 +108,11 @@ subroutine force_gpu(npart,xyzh,vxyzu,eos_vars,alphaind,fxyzu,divcurlv,dt)
  real(c_double), pointer, contiguous :: pro2_8(:),spsound_8(:),alphaAV_8(:),u_8(:)
  real(c_double), pointer, contiguous :: fx8(:),fy8(:),fz8(:),f48(:)
  real(c_double), pointer, contiguous :: vsigmax8(:),divv8(:)
+ real(c_double), pointer, contiguous :: fdx8(:),fdy8(:),fdz8(:),tsmin8(:)
+ real(c_double)       :: dust_params(8)
+ integer(c_long_long) :: drag_tally(3)
+ integer(c_int)       :: idrag_gpu
+ real                 :: frac_stokes,frac_super
  !--host-side cost of the force pass, under the same COSMO_DENS_STATS gate as the
  !  density one.  Without it the sweeps below are invisible: the GPU stats cover only
  !  the density solve, and phantom's own force timer is quantised to 1/8 s by the
@@ -108,18 +121,18 @@ subroutine force_gpu(npart,xyzh,vxyzu,eos_vars,alphaind,fxyzu,divcurlv,dt)
  character(len=8) :: statsenv
  logical, save    :: stats = .false.
  logical, save    :: stats_checked = .false.
- character(len=8) :: nodragenv
 
  if (npart <= 0) return
 
- !--with two-fluid dust the GPU computes the gas-gas SPH force and gives dust particles
- !  zero force: gas-dust drag is not on the GPU yet (phase 4 of
- !  force/GPU_DUST_TWO_TREE_PLAN.md), so refuse.  COSMO_GPU_DUST_NO_DRAG=1 lets a run
- !  through regardless, for checking the GPU dust DENSITY against the CPU (nmax = 0)
- !  and for nothing else: its forces are wrong.
+ !--two-fluid dust: explicit gas-dust drag without reconstruction, as force.F90.
+ !  Reconstruction (irecon >= 0) and the implicit scheme come later
+ !  (force/GPU_DUST_TWO_TREE_PLAN.md phases 5 and 6); idrag = 0 would still need the
+ !  gas-dust pairs for vsig, which the GPU only walks when there is drag.
  if (use_dust) then
-    call get_environment_variable('COSMO_GPU_DUST_NO_DRAG', nodragenv)
-    if (trim(nodragenv) /= '1') call fatal('force_gpu','gas-dust drag not computed on GPU yet')
+    if (idrag < 1 .or. idrag > 3) &
+       call fatal('force_gpu','two-fluid drag on the GPU needs idrag = 1, 2 or 3',ival=idrag)
+    if (irecon >= 0) call fatal('force_gpu','drag reconstruction not on the GPU yet (set irecon = -1)')
+    if (drag_implicit) call fatal('force_gpu','implicit drag not on the GPU yet (drag_implicit = F)')
  endif
 
  if (.not. stats_checked) then
@@ -157,6 +170,12 @@ subroutine force_gpu(npart,xyzh,vxyzu,eos_vars,alphaind,fxyzu,divcurlv,dt)
  f48      => gpu_arrays_comp(ibun_force_out,4)
  vsigmax8 => gpu_arrays_comp(ibun_force_out,5)
  divv8    => gpu_arrays_comp(ibun_force_out,6)
+ if (use_dust) then
+    fdx8   => gpu_arrays_comp(ibun_drag_out,1)
+    fdy8   => gpu_arrays_comp(ibun_drag_out,2)
+    fdz8   => gpu_arrays_comp(ibun_drag_out,3)
+    tsmin8 => gpu_arrays_comp(ibun_drag_out,4)
+ endif
 
  call prepare_pro2_gpu(npart,xyzh,vxyzu,eos_vars,alphaind, &
                        pro2_8,spsound_8,alphaAV_8,u_8)
@@ -181,17 +200,30 @@ subroutine force_gpu(npart,xyzh,vxyzu,eos_vars,alphaind,fxyzu,divcurlv,dt)
  call gpu_arrays_upload(ibun_thermo,npart)
  call system_clock(ic1)
 
+ !--the drag parameters, in the order force_c_api.cu reads them: one large grain size
+ !  (densityiterate_gpu refuses more), and dust.f90's constants for the stopping time
+ idrag_gpu   = 0_c_int
+ dust_params = 0._c_double
+ drag_tally  = 0_c_long_long
+ if (use_dust) then
+    idrag_gpu   = int(idrag, kind=c_int)
+    dust_params = real([grainsize(1), graindens(1), K_code(1), seff, coeff_gei_1, cste_mu, &
+                        massoftype(idust), merge(1., 0., icut_backreaction == 1)], kind=c_double)
+ endif
+
  call force_gpu_c(int(npart,kind=c_int),                &
                   real(massoftype(igas),kind=c_double), &
                   real(beta,kind=c_double),             &
                   real(alphau,kind=c_double),           &
                   merge(1_c_int,0_c_int,disc_viscosity), &
-                  int(ipdv_heating,kind=c_int),int(ishock_heating,kind=c_int))
+                  int(ipdv_heating,kind=c_int),int(ishock_heating,kind=c_int), &
+                  idrag_gpu,dust_params,drag_tally)
 
  !--the pass leaves its results on the device; fetch them
  call system_clock(ic2)
 
  call gpu_arrays_download(ibun_force_out,npart)
+ if (use_dust) call gpu_arrays_download(ibun_drag_out,npart)
 
  call system_clock(ic3)
 
@@ -199,7 +231,7 @@ subroutine force_gpu(npart,xyzh,vxyzu,eos_vars,alphaind,fxyzu,divcurlv,dt)
  !  runs first), so the SPH force is added to it.  Isothermal builds have no
  !  u, so fxyzu has no fourth row and du/dt is discarded.
  !$omp parallel do default(none) schedule(static) private(i) &
- !$omp shared(npart,fxyzu,divcurlv,fx8,fy8,fz8,f48,divv8,iphase)
+ !$omp shared(npart,fxyzu,divcurlv,fx8,fy8,fz8,f48,divv8,iphase,fdx8,fdy8,fdz8,tsmin8,tstop,xyzh)
  do i = 1,npart
     if (driving) then
        fxyzu(1,i) = fxyzu(1,i) + real(fx8(i),kind=kind(fxyzu))
@@ -211,6 +243,14 @@ subroutine force_gpu(npart,xyzh,vxyzu,eos_vars,alphaind,fxyzu,divcurlv,dt)
        fxyzu(3,i) = real(fz8(i),kind=kind(fxyzu))
     endif
     if (maxvxyzu >= 4) fxyzu(4,i) = real(f48(i),kind=kind(fxyzu))
+    if (use_dust) then
+       !--as force.F90: the drag is added to fxyzu after the SPH force, and tstop is the
+       !  smallest pair stopping time, bignumber for a particle with no partner
+       fxyzu(1,i) = fxyzu(1,i) + real(fdx8(i),kind=kind(fxyzu))
+       fxyzu(2,i) = fxyzu(2,i) + real(fdy8(i),kind=kind(fxyzu))
+       fxyzu(3,i) = fxyzu(3,i) + real(fdz8(i),kind=kind(fxyzu))
+       if (.not.isdead_or_accreted(xyzh(4,i))) tstop(:,i) = min(real(tsmin8(i)),bignumber)
+    endif
     !--as force.F90 (isgas): the force pass's div v replaces the density pass's for gas
     !  only.  Dust keeps the one from its own density solve.
     if (use_dust) then
@@ -240,7 +280,21 @@ subroutine force_gpu(npart,xyzh,vxyzu,eos_vars,alphaind,fxyzu,divcurlv,dt)
  endif
 
  call finish_gpu_force_timesteps(npart,xyzh,vxyzu,fxyzu, &
-                                 fx8,fy8,fz8,vsigmax8,spsound_8)
+                                 fx8,fy8,fz8,vsigmax8,spsound_8,tsmin8)
+
+ !--as force.F90: the share of drag pairs in the Stokes and supersonic Epstein regimes
+ if (use_dust) then
+    if (drag_tally(1) > 0) then
+       frac_stokes = real(drag_tally(2))/real(drag_tally(1))
+       frac_super  = real(drag_tally(3))/real(drag_tally(1))
+       if (iverbose >= 1 .and. id==master) then
+          if (drag_tally(2) > 0) call warning('force','using Stokes drag regime',var='%Stokes',val=100.*frac_stokes)
+          if (drag_tally(3) > 0) call warning('force','supersonic Epstein regime',val=100.*frac_super,var='%super')
+       endif
+       if (drag_tally(2) > 0) call summary_variable('dust',iosumdgs,int(drag_tally(2)),100.*frac_stokes)
+       if (drag_tally(3) > 0) call summary_variable('dust',iosumdge,int(drag_tally(3)),100.*frac_super)
+    endif
+ endif
  call system_clock(ic5)
 
  if (stats) then
@@ -314,52 +368,64 @@ end subroutine prepare_pro2_gpu
 !+
 !-----------------------------------------------------------------------
 subroutine finish_gpu_force_timesteps(npart,xyzh,vxyzu,fxyzu, &
-                                      fx8,fy8,fz8,vsigmax8,spsound_8)
+                                      fx8,fy8,fz8,vsigmax8,spsound_8,tsmin8)
  use options,  only:alpha
  use timestep, only:C_cour,C_force,bignumber,dtmax, &
                     dtcourant,dtforce,dtrad
- use part,     only:isdead_or_accreted
- use dim,      only:maxvxyzu,gr
+ use part,     only:isdead_or_accreted,iphase,iamtype,igas
+ use dim,      only:maxvxyzu,gr,use_dust
  use eos,      only:ieos
+ use io_summary, only:summary_variable,iosumdgr
 
  integer,        intent(in)    :: npart
  real,           intent(in)    :: xyzh(:,:),vxyzu(:,:)
  real,           intent(inout) :: fxyzu(:,:)
  real(c_double), intent(in)    :: fx8(:),fy8(:),fz8(:),vsigmax8(:),spsound_8(:)
+ real(c_double), pointer, contiguous, intent(in) :: tsmin8(:)   ! associated only with use_dust
 
- integer :: i
- real    :: hi,vsigdtc,f2i,dtc,dtf,dtcmin,dtfmin,eni
- logical :: limit_u
+ integer :: i,ndustres
+ real    :: hi,vsigdtc,f2i,dtc,dtf,dtcmin,dtfmin,eni,ts_min,dtdrag
+ real    :: dustresfacmean,dustresfacmax
+ logical :: limit_u,isgas
 
  dtcmin = bignumber
  dtfmin = bignumber
  dtrad  = bignumber
+ ndustres       = 0
+ dustresfacmean = 0.
+ dustresfacmax  = 0.
  !--as force.F90: du/dt is limited so a Courant step cannot make u negative
  limit_u = (maxvxyzu >= 4 .and. .not.gr .and. ieos /= 23)
 
  !--min is exact under reduction, so this is bit-identical to the serial loop
- !$omp parallel do default(none) schedule(static) private(i,hi,vsigdtc,f2i,dtc,dtf,eni) &
+ !$omp parallel do default(none) schedule(static) private(i,hi,vsigdtc,f2i,dtc,dtf,eni,isgas,ts_min,dtdrag) &
  !$omp shared(npart,xyzh,vxyzu,fxyzu,limit_u,fx8,fy8,fz8,vsigmax8,spsound_8,dtmax,C_cour,C_force,alpha) &
- !$omp reduction(min:dtcmin,dtfmin)
+ !$omp shared(iphase,tsmin8) &
+ !$omp reduction(min:dtcmin,dtfmin) reduction(+:ndustres,dustresfacmean) reduction(max:dustresfacmax)
  do i = 1,npart
     hi = xyzh(4,i)
     !--as force.F90: dead and accreted particles (h <= 0) set no constraint.
     !  Left in, one of them makes dtc negative and dtf the sqrt of a negative
     !  number, which poisons the global timestep.
     if (isdead_or_accreted(hi)) cycle
-
-    vsigdtc = max(vsigmax8(i),spsound_8(i))
+    isgas = .true.
+    if (use_dust) isgas = (iamtype(iphase(i)) == igas)
 
     !--as force.F90: no signal speed means no Courant constraint, not a
-    !  division by zero
+    !  division by zero.  Gas uses its own sound speed and alpha too; other particles
+    !  (two-fluid dust) only the signal speed from their neighbours.
     dtc = dtmax
-    if (vsigdtc > tiny(vsigdtc)) then
-       dtc = C_cour*hi/(vsigdtc*max(alpha,1.0))
+    if (isgas) then
+       vsigdtc = max(vsigmax8(i),spsound_8(i))
+       if (vsigdtc > tiny(vsigdtc)) dtc = C_cour*hi/(vsigdtc*max(alpha,1.0))
+    else
+       vsigdtc = vsigmax8(i)
+       if (vsigdtc > tiny(vsigdtc)) dtc = C_cour*hi/vsigdtc
     endif
 
     !--as force.F90, after every heating and cooling term is in du/dt: change du/dt
     !  rather than let u + dtc*du/dt go negative
-    if (limit_u) then
+    if (limit_u .and. isgas) then
        eni = vxyzu(4,i)
        if (eni + dtc*fxyzu(4,i) < epsilon(0.) .and. eni > epsilon(0.)) then
           fxyzu(4,i) = fxyzu(4,i)/(1.-dtc*fxyzu(4,i)/eni)
@@ -377,6 +443,21 @@ subroutine finish_gpu_force_timesteps(npart,xyzh,vxyzu,fxyzu, &
        dtf = C_force*sqrt(hi/sqrt(f2i))
     endif
 
+    !--as force.F90 for dust as particles: the drag timestep from the smallest pair
+    !  stopping time, and the check that gas resolves it (h < c_s t_s)
+    if (use_dust) then
+       ts_min = min(real(tsmin8(i)),bignumber)
+       dtdrag = 0.9*ts_min
+       dtf    = min(dtf,dtdrag)
+       if (isgas .and. ts_min < bignumber) then
+          if (hi > ts_min*spsound_8(i)) then
+             ndustres       = ndustres + 1
+             dustresfacmean = dustresfacmean + hi/(ts_min*spsound_8(i))
+             dustresfacmax  = max(dustresfacmax, hi/(ts_min*real(spsound_8(i))))
+          endif
+       endif
+    endif
+
     dtcmin = min(dtcmin,dtc)
     dtfmin = min(dtfmin,dtf)
  enddo
@@ -384,6 +465,7 @@ subroutine finish_gpu_force_timesteps(npart,xyzh,vxyzu,fxyzu, &
 
  dtcourant = dtcmin
  dtforce   = dtfmin
+ if (ndustres > 0) call summary_variable('dust',iosumdgr,ndustres,dustresfacmean/real(ndustres),dustresfacmax)
 
 end subroutine finish_gpu_force_timesteps
 

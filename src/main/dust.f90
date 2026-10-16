@@ -50,7 +50,9 @@ module dust
  public :: read_options_dust
  public :: get_viscmol_nu
 
- real, private :: cste_mu,coeff_gei_1,seff
+ !--set by init_drag, read only elsewhere: public so the GPU drag (gpu_force_iface) uses
+ !  the same constants rather than recomputing them
+ real, public  :: cste_mu,coeff_gei_1,seff
  private
 
 contains
@@ -365,7 +367,9 @@ subroutine read_options_dust(db,nerr)
  call read_inopt(ilimitdustflux,'ilimitdustflux',db,errcount=nerr,default=ilimitdustflux)
 
  if (.not.use_dustfrac) then
-    call read_inopt(irecon,'irecon',db,min=0,max=1,errcount=nerr,default=irecon)
+    !--min=-1: the option text and force.F90 (irecon >= 0 tests) offer -1 = off, which
+    !  min=0 made unreachable from the input file
+    call read_inopt(irecon,'irecon',db,min=-1,max=1,errcount=nerr,default=irecon)
     call read_inopt(drag_implicit,'drag_implicit',db,errcount=nerr,default=drag_implicit)
  endif
 

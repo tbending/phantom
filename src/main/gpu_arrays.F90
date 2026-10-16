@@ -115,7 +115,8 @@ module gpu_arrays
  integer, parameter, public :: ibun_force_out= 8   ! fx, fy, fz, du/dt, vsigmax, div v
  integer, parameter, public :: ibun_ptype    = 9   ! particle type, 0 gas / 1 dust
  integer, parameter, public :: ibun_dustgas  = 10  ! dust-to-gas ratio on gas, 0 on dust
- integer, parameter, public :: nbundle       = 10
+ integer, parameter, public :: ibun_drag_out = 11  ! drag ax, ay, az, min pair stopping time
+ integer, parameter, public :: nbundle       = 11
 
  type :: bundle_t
     character(len=10) :: name  = ''
@@ -277,6 +278,9 @@ subroutine gpu_arrays_init(n)
  !--and the dust-to-gas ratio it forms on each gas particle from the dust in its
  !  kernel, which phantom keeps in dustfrac for large grains
  bundle(ibun_dustgas)  = bundle_t('dustgas',  1, idir_down,   use_dust)
+ !--gas-dust drag, kept apart from the SPH force as force.F90 keeps it (its force
+ !  timestep uses the SPH force alone), and the stopping time for tstop and dtdrag
+ bundle(ibun_drag_out) = bundle_t('drag_out', 4, idir_down,   use_dust)
 
  !--lay the live bundles out end to end.  device_only rows take no arena space.
  off = 1
