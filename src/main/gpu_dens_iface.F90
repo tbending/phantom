@@ -54,7 +54,7 @@ module gpu_dens_iface
                          gpu_arrays_mark_packed,gpu_arrays_upload,gpu_arrays_download, &
                          gpu_arrays_positions_moved,gpu_arrays_order_rebuilt, &
                          ibun_pos,ibun_hsml,ibun_vel,ibun_accel, &
-                         ibun_dens_out,ibun_grad_out,ibun_ptype
+                         ibun_dens_out,ibun_grad_out,ibun_ptype,ibun_dustgas
  implicit none
 
 #ifdef GPU
@@ -162,7 +162,7 @@ subroutine densityiterate_gpu(npart, xyzh, vxyzu, fxyzu, fext, gradh, divcurlv, 
  use kernel,           only:kernelname,radkern
  use part,             only:hfact
  use part,             only:iphase,iamtype,iamboundary,igas,idust
- use part,             only:ndustsmall,ndustlarge
+ use part,             only:ndustsmall,ndustlarge,dustfrac
  use dim,              only:use_dustgrowth
  use options,          only:use_dustfrac,use_hybrid
  use dim,              only:maxphase,maxp
@@ -185,7 +185,7 @@ subroutine densityiterate_gpu(npart, xyzh, vxyzu, fxyzu, fext, gradh, divcurlv, 
  real(c_double), pointer, contiguous :: ax8(:),ay8(:),az8(:)
  real(c_double), pointer, contiguous :: rho8(:),drhofh8(:)
  real(c_double), pointer, contiguous :: divv8(:),xi8(:),ddivvdt8(:)
- real(c_double), pointer, contiguous :: ptype8(:)
+ real(c_double), pointer, contiguous :: ptype8(:),dustgas8(:)
  real(c_double) :: pmass_dust
  integer(kind=8) :: ic0,ic1,ic2,ic3,ic4,crate
  character(len=8) :: statsenv
@@ -202,8 +202,7 @@ subroutine densityiterate_gpu(npart, xyzh, vxyzu, fxyzu, fext, gradh, divcurlv, 
  if (mhd)          call fatal('densityiterate_gpu','divcurlB not computed on GPU')
  !--two-fluid dust is solved on its own tree.  Dust as a mixture (dustfrac on the gas),
  !  small grains, more than one large grain size (one tree per size is not decided:
- !  force/GPU_DUST_TWO_TREE_PLAN.md) and dust growth are not.  NOT YET: the gas-side
- !  dust-to-gas ratio, dustfrac(ndustsmall+1,:) on gas particles, is not computed.
+ !  force/GPU_DUST_TWO_TREE_PLAN.md) and dust growth are not.
  if (use_dust) then
     if (use_dustfrac .or. use_hybrid .or. ndustsmall > 0) &
        call fatal('densityiterate_gpu','dust as a mixture not supported on GPU (use dust_method=2)')
@@ -292,7 +291,8 @@ subroutine densityiterate_gpu(npart, xyzh, vxyzu, fxyzu, fext, gradh, divcurlv, 
  divv8   => gpu_arrays_comp(ibun_grad_out,1)
  xi8     => gpu_arrays_comp(ibun_grad_out,2)
  ddivvdt8=> gpu_arrays_comp(ibun_grad_out,3)
- if (use_dust) ptype8 => gpu_arrays_comp(ibun_ptype,1)
+ if (use_dust) ptype8   => gpu_arrays_comp(ibun_ptype,1)
+ if (use_dust) dustgas8 => gpu_arrays_comp(ibun_dustgas,1)
 
  ncross = 0
  !$omp parallel do default(none) private(i) &
@@ -350,13 +350,14 @@ subroutine densityiterate_gpu(npart, xyzh, vxyzu, fxyzu, fext, gradh, divcurlv, 
  call gpu_arrays_download(ibun_hsml,     npart)
  call gpu_arrays_download(ibun_dens_out, npart)
  call gpu_arrays_download(ibun_grad_out, npart)
+ if (use_dust) call gpu_arrays_download(ibun_dustgas, npart)
  call system_clock(ic2)
 
  !--write results back to phantom arrays
  !  Skip inactive/dead particles (xyzh(4,i) < 0 in phantom convention)
  !$omp parallel do default(none) private(i,hi,rhoi,drhoi,omega) &
- !$omp shared(npart,xyzh,gradh,divcurlv,alphaind,xi_gpu) &
- !$omp shared(h8,rho8,drhofh8,divv8,xi8,ddivvdt8)
+ !$omp shared(npart,xyzh,gradh,divcurlv,alphaind,xi_gpu,dustfrac,ndustsmall) &
+ !$omp shared(h8,rho8,drhofh8,divv8,xi8,ddivvdt8,dustgas8)
  do i = 1, npart
     if (xyzh(4,i) < 0.) cycle   ! preserve negative h for inactive particles
     hi    = real(h8(i))
@@ -380,6 +381,12 @@ subroutine densityiterate_gpu(npart, xyzh, vxyzu, fxyzu, fext, gradh, divcurlv, 
     divcurlv(1,i) = real(divv8(i), kind=4)
     xi_gpu(i) = real(xi8(i))
     if (nalpha >= 3) alphaind(3,i) = real(ddivvdt8(i), kind=4)
+    !--two-fluid dust, as dens.F90: dustfrac is cleared on every particle the solve
+    !  touched, then holds the dust-to-gas ratio on gas (zero from the device on dust)
+    if (use_dust) then
+       dustfrac(:,i) = 0.
+       dustfrac(ndustsmall+1,i) = real(dustgas8(i))
+    endif
  enddo
  !$omp end parallel do
 

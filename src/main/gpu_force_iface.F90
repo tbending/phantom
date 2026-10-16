@@ -80,6 +80,7 @@ subroutine force_gpu(npart,xyzh,vxyzu,eos_vars,alphaind,fxyzu,divcurlv,dt)
  use part,    only:nptmass,xyzmh_ptmass
  use part,    only:sinks_have_heating
  use dim,     only:use_dust
+ use part,    only:iphase,iamtype
 
  integer,      intent(in)    :: npart
  real,         intent(in)    :: xyzh(:,:),vxyzu(:,:)
@@ -198,7 +199,7 @@ subroutine force_gpu(npart,xyzh,vxyzu,eos_vars,alphaind,fxyzu,divcurlv,dt)
  !  runs first), so the SPH force is added to it.  Isothermal builds have no
  !  u, so fxyzu has no fourth row and du/dt is discarded.
  !$omp parallel do default(none) schedule(static) private(i) &
- !$omp shared(npart,fxyzu,divcurlv,fx8,fy8,fz8,f48,divv8)
+ !$omp shared(npart,fxyzu,divcurlv,fx8,fy8,fz8,f48,divv8,iphase)
  do i = 1,npart
     if (driving) then
        fxyzu(1,i) = fxyzu(1,i) + real(fx8(i),kind=kind(fxyzu))
@@ -210,6 +211,11 @@ subroutine force_gpu(npart,xyzh,vxyzu,eos_vars,alphaind,fxyzu,divcurlv,dt)
        fxyzu(3,i) = real(fz8(i),kind=kind(fxyzu))
     endif
     if (maxvxyzu >= 4) fxyzu(4,i) = real(f48(i),kind=kind(fxyzu))
+    !--as force.F90 (isgas): the force pass's div v replaces the density pass's for gas
+    !  only.  Dust keeps the one from its own density solve.
+    if (use_dust) then
+       if (iamtype(iphase(i)) /= igas) cycle
+    endif
     divcurlv(1,i) = real(divv8(i),kind=kind(divcurlv))
  enddo
  !$omp end parallel do
@@ -219,9 +225,13 @@ subroutine force_gpu(npart,xyzh,vxyzu,eos_vars,alphaind,fxyzu,divcurlv,dt)
  !--as force.F90: cooling evaluated in the force pass, from div v of this pass
  if (add_cooling) then
     !$omp parallel do default(none) schedule(static) private(i,dudtcool) &
-    !$omp shared(npart,xyzh,vxyzu,fxyzu,divcurlv,massoftype,dt)
+    !$omp shared(npart,xyzh,vxyzu,fxyzu,divcurlv,massoftype,dt,iphase)
     do i = 1,npart
        if (isdead_or_accreted(xyzh(4,i))) cycle
+       !--as force.F90, cooling is for gas
+       if (use_dust) then
+          if (iamtype(iphase(i)) /= igas) cycle
+       endif
        call energ_cooling(xyzh(1,i),xyzh(2,i),xyzh(3,i),vxyzu(4,i), &
                           rhoh(xyzh(4,i),massoftype(igas)),dt,divcurlv(1,i),dudtcool)
        fxyzu(4,i) = fxyzu(4,i) + dudtcool
