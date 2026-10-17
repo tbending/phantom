@@ -26,8 +26,10 @@ module gpu_dens_iface
 !
 ! Outputs written back to phantom particle arrays:
 !   xyzh(4,i)     — converged smoothing length h_i
-!   gradh(1,i)    — 1/omega_i  (phantom's Grad-h correction factor)
-!                   where omega = 1 + (h/3*rho) * d(rho)/d(h)
+!   rho(i)        — the kernel-summed density (same type only)
+!   gradh(igradomega,i) — 1/Omega~_i, Omega~ = 1 - dh/dn(h) dn/dh   (number-density
+!   gradh(igradzeta,i)  — zeta_i = dh/dn(h) d(rho)/dh                grad-h terms, as
+!                   dens.F90 finish_rhosum; dh/dn = -h/(3 n(h)), n(h) = (hfact/h)^3)
 !   divcurlv(1,i) — div v
 !   xi_gpu(i)     — Cullen & Dehnen xi limiter, from the velocity gradient
 !                   tensor, which never leaves the GPU (see cons2prim)
@@ -168,6 +170,9 @@ subroutine densityiterate_gpu(npart, xyzh, vxyzu, fxyzu, fext, gradh, divcurlv, 
  use options,          only:use_dustfrac,use_hybrid
  use dust,             only:irecon
  use dim,              only:maxphase,maxp
+ use part,             only:rho,dhdn
+ use dim,              only:igradomega,igradzeta
+ use options,          only:two_kernel
  use iso_c_binding, only:c_double,c_int
 #endif
  integer,      intent(in)    :: npart
@@ -178,7 +183,7 @@ subroutine densityiterate_gpu(npart, xyzh, vxyzu, fxyzu, fext, gradh, divcurlv, 
  real(kind=4), intent(inout) :: alphaind(:,:)
 
 #ifdef GPU
- real    :: hi, rhoi, drhoi, omega
+ real    :: hi, rhoi, drhoi, omega, dhdni, pmassi
  integer :: i, ncross, nbound, nother
  !--slices of the gpu_arrays arena, re-associated each call because the arena moves
  !  when it grows.  contiguous, so these pass straight to the bind(C) call.
@@ -214,6 +219,7 @@ subroutine densityiterate_gpu(npart, xyzh, vxyzu, fxyzu, fext, gradh, divcurlv, 
  endif
  if (do_radiation) call fatal('densityiterate_gpu','radiation flux not computed on GPU')
  if (gravity)      call fatal('densityiterate_gpu','gradsoft not computed on GPU')
+ if (two_kernel)   call fatal('densityiterate_gpu','two_kernel (n from W~) not computed on GPU')
  !--the GPU force pass evaluates and overwrites every particle, not just the
  !  active ones, so individual timesteps would advance inactive particles
  if (ind_timesteps) call fatal('densityiterate_gpu','individual timesteps not supported on GPU (IND_TIMESTEPS=no)')
@@ -360,28 +366,34 @@ subroutine densityiterate_gpu(npart, xyzh, vxyzu, fxyzu, fext, gradh, divcurlv, 
 
  !--write results back to phantom arrays
  !  Skip inactive/dead particles (xyzh(4,i) < 0 in phantom convention)
- !$omp parallel do default(none) private(i,hi,rhoi,drhoi,omega) &
- !$omp shared(npart,xyzh,gradh,divcurlv,alphaind,xi_gpu,dustfrac,ndustsmall) &
- !$omp shared(h8,rho8,drhofh8,divv8,xi8,ddivvdt8,dustgas8)
+ !$omp parallel do default(none) private(i,hi,rhoi,drhoi,omega,dhdni,pmassi) &
+ !$omp shared(npart,xyzh,gradh,divcurlv,alphaind,xi_gpu,dustfrac,ndustsmall,rho) &
+ !$omp shared(h8,rho8,drhofh8,divv8,xi8,ddivvdt8,dustgas8,iphase,massoftype,maxp,maxphase)
  do i = 1, npart
     if (xyzh(4,i) < 0.) cycle   ! preserve negative h for inactive particles
     hi    = real(h8(i))
     rhoi  = real(rho8(i))
     drhoi = real(drhofh8(i))    ! d(rho)/d(h), normalised
     xyzh(4,i) = hi
-    !--convert to phantom's gradh(1,i) = 1/omega
-    !  omega = 1 + (h/3*rho) * d(rho)/d(h)
-    !  NB: the GPU forms the same omega internally to normalise the gradients
-    !  below (sphGradientsKernel) -- keep the two in step.
+    rho(i)    = rhoi
+    !--phantom's number-density grad-h terms (dens.F90 finish_rhosum), sums over the
+    !  particle's own type: Omega~ = 1 - dh/dn dn/dh with dn/dh = (drho/dh)/m, and
+    !  zeta = dh/dn drho/dh.  NB: the GPU forms the same Omega~ internally to normalise
+    !  the gradients (sphGradientsKernel) and the force (forcePrepKernel) -- keep in step.
     if (rhoi > 0. .and. hi > 0.) then
-       omega = 1.0 + (hi / (3.0 * rhoi)) * drhoi
+       pmassi = massoftype(igas)
+       if (maxphase==maxp) pmassi = massoftype(iamtype(iphase(i)))
+       dhdni = dhdn(hi)
+       omega = 1.0 - dhdni * drhoi / pmassi
        if (omega > 0.) then
-          gradh(1,i) = real(1.0 / omega, kind=4)
+          gradh(igradomega,i) = real(1.0 / omega, kind=4)
        else
-          gradh(1,i) = 1.0_4
+          gradh(igradomega,i) = 1.0_4
        endif
+       gradh(igradzeta,i) = real(dhdni * drhoi, kind=4)
     else
-       gradh(1,i) = 1.0_4
+       gradh(igradomega,i) = 1.0_4
+       gradh(igradzeta,i)  = 0.0_4
     endif
     divcurlv(1,i) = real(divv8(i), kind=4)
     xi_gpu(i) = real(xi8(i))

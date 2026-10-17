@@ -77,7 +77,7 @@ subroutine force_gpu(npart,xyzh,vxyzu,eos_vars,alphaind,fxyzu,divcurlv,dt)
  use options, only:beta,alphau
  use dim,     only:maxvxyzu,driving,disc_viscosity,track_lum,h2chemistry,store_dust_temperature
  use io,      only:fatal
- use part,    only:ien_type,ien_entropy,ien_entropy_s,rhoh,isdead_or_accreted
+ use part,    only:ien_type,ien_entropy,ien_entropy_s,rho,isdead_or_accreted
  use eos,     only:icooling,ipdv_heating,ishock_heating
  use cooling, only:energ_cooling,cooling_in_step
  use part,    only:nptmass,xyzmh_ptmass
@@ -287,7 +287,7 @@ subroutine force_gpu(npart,xyzh,vxyzu,eos_vars,alphaind,fxyzu,divcurlv,dt)
  !--as force.F90: cooling evaluated in the force pass, from div v of this pass
  if (add_cooling) then
     !$omp parallel do default(none) schedule(static) private(i,dudtcool) &
-    !$omp shared(npart,xyzh,vxyzu,fxyzu,divcurlv,massoftype,dt,iphase)
+    !$omp shared(npart,xyzh,vxyzu,fxyzu,divcurlv,rho,dt,iphase)
     do i = 1,npart
        if (isdead_or_accreted(xyzh(4,i))) cycle
        !--as force.F90, cooling is for gas
@@ -295,7 +295,7 @@ subroutine force_gpu(npart,xyzh,vxyzu,eos_vars,alphaind,fxyzu,divcurlv,dt)
           if (iamtype(iphase(i)) /= igas) cycle
        endif
        call energ_cooling(xyzh(1,i),xyzh(2,i),xyzh(3,i),vxyzu(4,i), &
-                          rhoh(xyzh(4,i),massoftype(igas)),dt,divcurlv(1,i),dudtcool)
+                          rho(i),dt,divcurlv(1,i),dudtcool)
        fxyzu(4,i) = fxyzu(4,i) + dudtcool
     enddo
     !$omp end parallel do
@@ -344,7 +344,7 @@ subroutine prepare_pro2_gpu(npart,xyzh,vxyzu,eos_vars,alphaind, &
                             pro2_8,spsound_8,alphaAV_8,u_8)
  use dim,     only:maxalpha,maxp,maxvxyzu
  use options, only:alpha
- use part,    only:igas,igasP,ics,massoftype,rhoh
+ use part,    only:igasP,ics,rho
 
  integer,      intent(in)  :: npart
  real,         intent(in)  :: xyzh(:,:)
@@ -357,11 +357,14 @@ subroutine prepare_pro2_gpu(npart,xyzh,vxyzu,eos_vars,alphaind, &
  real    :: rhoi,rho1i
 
  !$omp parallel do default(none) schedule(static) private(i,rhoi,rho1i) &
- !$omp shared(npart,xyzh,vxyzu,eos_vars,alphaind,massoftype,alpha,maxalpha,maxp) &
+ !$omp shared(npart,xyzh,vxyzu,eos_vars,alphaind,rho,alpha,maxalpha,maxp) &
  !$omp shared(pro2_8,spsound_8,u_8,alphaAV_8)
  do i = 1,npart
-    rhoi         = rhoh(xyzh(4,i),massoftype(igas))
-    rho1i        = 1.0/rhoi
+    !--the kernel-summed density, as force.F90 and cons2prim since the number-density
+    !  formulation; zero on particles the solve has never touched
+    rhoi         = rho(i)
+    rho1i        = 0.
+    if (rhoi > 0.) rho1i = 1.0/rhoi
 
     pro2_8(i)    = eos_vars(igasP,i)*rho1i*rho1i
     spsound_8(i) = eos_vars(ics,i)
