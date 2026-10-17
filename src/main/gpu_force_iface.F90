@@ -54,7 +54,7 @@ module gpu_force_iface
     integer(c_int), value       :: disc_viscosity
     integer(c_int), value       :: pdv_heating,shock_heating
     integer(c_int), value       :: idrag             ! 0: no two-fluid drag
-    real(c_double), intent(in)  :: dust(8)           ! see dust_params below
+    real(c_double), intent(in)  :: dust(9)           ! see dust_params below
     integer(c_long_long), intent(out) :: drag_tally(3)  ! drag, Stokes, supersonic pairs
     end subroutine force_gpu_c
 
@@ -109,7 +109,7 @@ subroutine force_gpu(npart,xyzh,vxyzu,eos_vars,alphaind,fxyzu,divcurlv,dt)
  real(c_double), pointer, contiguous :: fx8(:),fy8(:),fz8(:),f48(:)
  real(c_double), pointer, contiguous :: vsigmax8(:),divv8(:)
  real(c_double), pointer, contiguous :: fdx8(:),fdy8(:),fdz8(:),tsmin8(:)
- real(c_double)       :: dust_params(8)
+ real(c_double)       :: dust_params(9)
  integer(c_long_long) :: drag_tally(3)
  integer(c_int)       :: idrag_gpu
  real                 :: frac_stokes,frac_super
@@ -124,14 +124,13 @@ subroutine force_gpu(npart,xyzh,vxyzu,eos_vars,alphaind,fxyzu,divcurlv,dt)
 
  if (npart <= 0) return
 
- !--two-fluid dust: explicit gas-dust drag without reconstruction, as force.F90.
- !  Reconstruction (irecon >= 0) and the implicit scheme come later
- !  (force/GPU_DUST_TWO_TREE_PLAN.md phases 5 and 6); idrag = 0 would still need the
- !  gas-dust pairs for vsig, which the GPU only walks when there is drag.
+ !--two-fluid dust: explicit gas-dust drag, with or without reconstruction (irecon),
+ !  as force.F90.  The implicit scheme comes later (force/GPU_DUST_TWO_TREE_PLAN.md
+ !  phase 6); idrag = 0 would still need the gas-dust pairs for vsig, which the GPU only
+ !  walks when there is drag.
  if (use_dust) then
     if (idrag < 1 .or. idrag > 3) &
        call fatal('force_gpu','two-fluid drag on the GPU needs idrag = 1, 2 or 3',ival=idrag)
-    if (irecon >= 0) call fatal('force_gpu','drag reconstruction not on the GPU yet (set irecon = -1)')
     if (drag_implicit) call fatal('force_gpu','implicit drag not on the GPU yet (drag_implicit = F)')
  endif
 
@@ -208,7 +207,8 @@ subroutine force_gpu(npart,xyzh,vxyzu,eos_vars,alphaind,fxyzu,divcurlv,dt)
  if (use_dust) then
     idrag_gpu   = int(idrag, kind=c_int)
     dust_params = real([grainsize(1), graindens(1), K_code(1), seff, coeff_gei_1, cste_mu, &
-                        massoftype(idust), merge(1., 0., icut_backreaction == 1)], kind=c_double)
+                        massoftype(idust), merge(1., 0., icut_backreaction == 1), real(irecon)], &
+                       kind=c_double)
  endif
 
  call force_gpu_c(int(npart,kind=c_int),                &

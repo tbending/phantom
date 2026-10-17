@@ -67,7 +67,7 @@ module gpu_dens_iface
 !--C interface to cosmoSPHere/src/dens_c_api.cu
  interface
   subroutine densityiterate_gpu_c(n, pmass, pmass_dust, &
-                                  periodic, box, tolh, hfact) bind(C)
+                                  periodic, box, tolh, hfact, keep_dvdx) bind(C)
    use iso_c_binding, only:c_double,c_int
    integer(c_int), value         :: n
    real(c_double), value         :: pmass
@@ -76,6 +76,7 @@ module gpu_dens_iface
    real(c_double), intent(in)    :: box(6)
    real(c_double), value         :: tolh
    real(c_double), value         :: hfact
+   integer(c_int), value         :: keep_dvdx
   end subroutine densityiterate_gpu_c
 
 !--C interface to cosmo_kernel_radius in cosmoSPHere/src/dens_c_api.cu
@@ -165,6 +166,7 @@ subroutine densityiterate_gpu(npart, xyzh, vxyzu, fxyzu, fext, gradh, divcurlv, 
  use part,             only:ndustsmall,ndustlarge,dustfrac
  use dim,              only:use_dustgrowth
  use options,          only:use_dustfrac,use_hybrid
+ use dust,             only:irecon
  use dim,              only:maxphase,maxp
  use iso_c_binding, only:c_double,c_int
 #endif
@@ -343,7 +345,10 @@ subroutine densityiterate_gpu(npart, xyzh, vxyzu, fxyzu, fext, gradh, divcurlv, 
                             merge(1_c_int, 0_c_int, periodic), &
                             real([xmin,xmax,ymin,ymax,zmin,zmax], kind=c_double), &
                             real(tolh, kind=c_double), &
-                            real(hfact, kind=c_double))
+                            real(hfact, kind=c_double), &
+                            !--drag reconstruction reads both particles' dv/dx in the
+                            !  force pass, so the device keeps it (gpu_arrays ibun_dvdx)
+                            merge(1_c_int, 0_c_int, use_dust .and. irecon >= 0))
  call gpu_arrays_order_rebuilt()
 
  !--the solve leaves its results on the device; fetch the three bundles it filled
