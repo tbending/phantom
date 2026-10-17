@@ -22,6 +22,7 @@ module ptmass_radiation
 ! :Dependencies: dim, dust_formation, infile_utils, io, part, physcon,
 !   raytracer, units
 !
+ use, intrinsic :: ieee_arithmetic, only:ieee_is_nan
 
  implicit none
  integer, public  :: isink_radiation = 0
@@ -257,7 +258,7 @@ end subroutine get_radiative_acceleration_from_star
 !+
 !-----------------------------------------------------------------------
 subroutine get_dust_temperature(npart,xyzh,eos_vars,nptmass,xyzmh_ptmass,dust_temp)
- use part,      only:tau,tau_lucy,ikappa,nucleation
+ use part,      only:tau,tau_lucy,ikappa,nucleation,rho
  use raytracer, only:get_all_tau
  use dust_formation, only:calc_kappa_bowen,idust_opacity
  use dim,       only:itau_alloc
@@ -284,19 +285,19 @@ subroutine get_dust_temperature(npart,xyzh,eos_vars,nptmass,xyzmh_ptmass,dust_te
  if (iget_tdust == 4) then
     ! update tau_Lucy
     if (idust_opacity == 2) then
-       call get_all_tau(npart, nptmass, xyzmh_ptmass, xyzh, nucleation(:,ikappa),&
+       call get_all_tau(npart, nptmass, xyzmh_ptmass, xyzh, rho, nucleation(:,ikappa),&
                          iray_resolution, .false., tau_lucy)
     else
-       call get_all_tau(npart, nptmass, xyzmh_ptmass, xyzh, calc_kappa_bowen(dust_temp(1:npart)),&
+       call get_all_tau(npart, nptmass, xyzmh_ptmass, xyzh, rho, calc_kappa_bowen(dust_temp(1:npart)),&
                          iray_resolution,  .false., tau_lucy)
     endif
  elseif (itau_alloc == 1) then
     ! update tau
     if (idust_opacity == 2) then
-       call get_all_tau(npart, nptmass, xyzmh_ptmass, xyzh, nucleation(:,ikappa),&
+       call get_all_tau(npart, nptmass, xyzmh_ptmass, xyzh, rho, nucleation(:,ikappa),&
                          iray_resolution, .true., tau)
     else
-       call get_all_tau(npart, nptmass, xyzmh_ptmass, xyzh, calc_kappa_bowen(dust_temp(1:npart)),&
+       call get_all_tau(npart, nptmass, xyzmh_ptmass, xyzh, rho, calc_kappa_bowen(dust_temp(1:npart)),&
                          iray_resolution, .true., tau)
     endif
  endif
@@ -389,7 +390,7 @@ subroutine get_dust_temperature_from_ptmass(npart,xyzh,eos_vars,nptmass,xyzmh_pt
        if (.not.isdead_or_accreted(xyzh(4,i))) then
           r = sqrt((xyzh(1,i)-xa)**2 + (xyzh(2,i)-ya)**2 + (xyzh(3,i)-za)**2)
           if (r  <  R_star) r = R_star
-          if (isnan(tau_lucy(i))) tau_lucy(i) = 2./3.
+          if (ieee_is_nan(tau_lucy(i))) tau_lucy(i) = 2./3.
           dust_temp(i) = T_star * (.5*(1.-sqrt(1.-(R_star/r)**2)+3./2.*tau_lucy(i)))**(1./4.)
        endif
     enddo

@@ -10,16 +10,16 @@ module utils_gr
 !
 ! :References: Liptai & Price (2019), MNRAS 485, 819-842
 !
-! :Owner: David Liptai
+! :Owner: Spencer Magnall
 !
 ! :Runtime parameters: None
 !
-! :Dependencies: io, metric, metric_tools, part
+! :Dependencies: io, metric, metric_tools
 !
  implicit none
 
- public :: dot_product_gr, get_u0, get_bigv, rho2dens, h2dens, get_geodesic_accel, get_sqrtg, get_sqrt_gamma
- public :: perturb_metric
+ public :: dot_product_gr, get_u0, get_bigv, rho2dens, get_geodesic_accel, get_sqrtg, get_sqrt_gamma
+ public :: perturb_metric,get_u_los
 
  private
 
@@ -59,10 +59,34 @@ pure subroutine get_u0(gcov,v,U0,ierr)
  v4(0)   = 1.
  v4(1:3) = v(1:3)
  vv      = dot_product_gr(v4,v4,gcov)
- U0      = 1./sqrt(-vv)
- if (vv > 0.) ierr = 1
+ if (vv < 0.) then
+    U0 = 1./sqrt(-vv)
+ else
+    U0   = huge(U0)  ! velocity faster than light, avoid floating point exception
+    ierr = 1
+ endif
 
 end subroutine get_u0
+
+!----------------------------------------------------------------
+!+
+!  Covariant 4-velocity projected along the unit vector rhat,
+!  U_i rhat^i with U_i = U^0 (g_{0i} + g_{ij} v^j), for the
+!  coordinate velocity v = projv*rhat. Used for the velocity
+!  jump in the shock viscosity; for a fixed metric this is a
+!  monotonic function of projv
+!+
+!----------------------------------------------------------------
+pure real function get_u_los(gcov,projv,rhat)
+ real, intent(in) :: gcov(0:3,0:3),projv,rhat(3)
+ real    :: v(3),U0
+ integer :: ierr
+
+ v = projv*rhat
+ call get_u0(gcov,v,U0,ierr)
+ get_u_los = U0*dot_product(gcov(0,1:3) + matmul(gcov(1:3,1:3),v),rhat)
+
+end function get_u_los
 
 !----------------------------------------------------------------
 !+
@@ -86,33 +110,14 @@ end subroutine get_bigv
 
 !----------------------------------------------------------------
 !+
-!  get density in the fluid rest frame (primitive dens) from
-!  the conserved density rho* (stored as the smoothing length)
+!  get primitive rest-frame density (dens) from conserved rho
+!  (kernel-summed mass density in Phantom)
 !+
 !----------------------------------------------------------------
-subroutine h2dens(dens,pmass,xyzh,metrici,v)
- use part, only:rhoh
- real, intent(in)  :: pmass,xyzh(1:4),metrici(:,:,:),v(1:3)
- real, intent(out) :: dens
- real :: rho, h, xyz(1:3)
-
- xyz = xyzh(1:3)
- h   = xyzh(4)
- rho = rhoh(h,pmass)
- call rho2dens(dens,rho,xyz,metrici,v)
-
-end subroutine h2dens
-
-!----------------------------------------------------------------
-!+
-!  get density in the fluid rest frame (primitive dens) from
-!  the conserved density rho*
-!+
-!----------------------------------------------------------------
-subroutine rho2dens(dens,rho,position,metrici,v)
+subroutine rho2dens(dens,rho,metrici,v)
  use metric_tools, only:unpack_metric
  use io,           only:error
- real, intent(in)  :: rho,position(1:3),metrici(:,:,:),v(1:3)
+ real, intent(in)  :: rho,metrici(:,:,:),v(1:3)
  real, intent(out) :: dens
  integer :: ierror
  real :: gcov(0:3,0:3), sqrtg, U0

@@ -1124,7 +1124,7 @@ end subroutine update_ptmass
 !-------------------------------------------------------------------------
 subroutine ptmass_create(nptmass,npart,itest,xyzh,pxyzu,fxyzu,fext,divcurlv,poten,&
                          massoftype,xyzmh_ptmass,pxyzu_ptmass,fxyz_ptmass,fxyz_ptmass_sinksink,dptmass,time)
- use part,          only:ihacc,ihsoft,itbirth,igas,iamtype,get_partinfo,iphase,iactive,maxphase,rhoh, &
+ use part,          only:ihacc,ihsoft,itbirth,igas,iamtype,get_partinfo,iphase,iactive,maxphase,rho, &
                          ispinx,ispiny,ispinz,eos_vars,igasP,igamma,ndptmass,apr_level,aprmassoftype,metrics_ptmass,&
                          isftype,inseed
  use dim,           only:maxp,maxvxyzu,maxptmass,ind_timesteps,use_apr,maxpsph,gr
@@ -1157,7 +1157,7 @@ subroutine ptmass_create(nptmass,npart,itest,xyzh,pxyzu,fxyzu,fext,divcurlv,pote
  integer            :: nneigh
  integer, parameter :: maxcache      = 12000
  integer, parameter :: nneigh_thresh = 1024 ! approximate epot if neigh>neigh_thresh; (-ve for off)
- real, save :: xyzcache(3,maxcache)
+ real, allocatable, save :: xyzcache(:,:)
  real    :: xi,yi,zi,hi,hi1,hi21,xj,yj,zj,hj1,hj21,xk,yk,zk,hk1
  real    :: rij2,rik2,rjk2,dx,dy,dz
  real    :: vxi,vyi,vzi,dv2,dvx,dvy,dvz,rhomax
@@ -1183,7 +1183,7 @@ subroutine ptmass_create(nptmass,npart,itest,xyzh,pxyzu,fxyzu,fext,divcurlv,pote
  if (itest > 0 .and. itest <= npart) then
     iphasei = iphase(itest)
     itype   = iamtype(iphasei)
-    rhomax  = rhoh(xyzh(4,itest),massoftype(itype))
+    rhomax  = rho(itest)
  endif
  call reduceloc_mpi('max',rhomax,id_rhomax)
  ForceCreation = (f_crit_override > 0. .and. rhomax > f_crit_override*rho_crit)
@@ -1248,7 +1248,7 @@ subroutine ptmass_create(nptmass,npart,itest,xyzh,pxyzu,fxyzu,fext,divcurlv,pote
  iactivej = .true.
  pmassgas1 = 1.0/pmassj
 
- if (id==id_rhomax) call summary_variable_rhomax(itest,rhoh(hi,pmassi)*real(unit_density),iprint,nptmass)
+ if (id==id_rhomax) call summary_variable_rhomax(itest,rho(itest)*real(unit_density),iprint,nptmass)
 
  if (iverbose >= 1 .and. id==id_rhomax) &
     write(iprint,"(a,i10,a,i2,a)",advance='no') &
@@ -1291,6 +1291,7 @@ subroutine ptmass_create(nptmass,npart,itest,xyzh,pxyzu,fxyzu,fext,divcurlv,pote
 
  ! CHECK 3: all neighbours are all active ( & perform math for checks 4-6)
  ! find neighbours within the checking radius of hcheck
+ if (.not. allocated(xyzcache)) allocate(xyzcache(3,maxcache))
  call getneigh_pos((/xi,yi,zi/),0.,hcheck,listneigh,nneigh,xyzcache,maxcache,leaf_is_active)
  ! determine if we should approximate epot
  calc_exact_epot = .true.
@@ -1298,7 +1299,7 @@ subroutine ptmass_create(nptmass,npart,itest,xyzh,pxyzu,fxyzu,fext,divcurlv,pote
 !$omp parallel default(none) &
 !$omp shared(nprocs) &
 !$omp shared(maxp,maxphase,npart,maxpsph) &
-!$omp shared(nneigh,listneigh,xyzh,xyzcache,pxyzu,massoftype,iphase,pmassgas1,calc_exact_epot,hcheck2,eos_vars) &
+!$omp shared(nneigh,listneigh,xyzh,xyzcache,pxyzu,massoftype,iphase,pmassgas1,calc_exact_epot,hcheck2,eos_vars,rho) &
 !$omp shared(itest,id,id_rhomax,ifail,xi,yi,zi,hi,vxi,vyi,vzi,hi1,hi21,itype,pmassi,ieos,gamma,poten) &
 #ifdef PERIODIC
 !$omp shared(dxbound,dybound,dzbound) &
@@ -1382,7 +1383,7 @@ subroutine ptmass_create(nptmass,npart,itest,xyzh,pxyzu,fxyzu,fext,divcurlv,pote
 
        ! thermal energy (for gas only)
        if (itypej==igas) then
-          rhoj = rhoh(xyzh(4,j),pmassj)
+          rhoj = rho(j)
           if (maxvxyzu >= 4) then
              etherm = etherm + pmassj*pxyzu(4,j)
           else
@@ -1712,7 +1713,7 @@ subroutine ptmass_create(nptmass,npart,itest,xyzh,pxyzu,fxyzu,fext,divcurlv,pote
  ! print details to file, if requested
  if (record_created) then
     write(iscfile,'(es18.10,1x,3(i18,1x),8(es18.9,1x),8(i18,1x))') &
-       time,nptmass+1,itest,nneigh_act,rhoh(hi,pmassi),divvi,alpha_grav,alphabeta_grav,etot,epot,ekin,etherm,ifail_array
+       time,nptmass+1,itest,nneigh_act,real(rho(itest)),divvi,alpha_grav,alphabeta_grav,etot,epot,ekin,etherm,ifail_array
     call flush(iscfile)
  endif
 

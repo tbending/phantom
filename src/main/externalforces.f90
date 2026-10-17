@@ -99,7 +99,7 @@ contains
 !  Computes external (body) forces on a particle given its co-ordinates
 !+
 !-----------------------------------------------------------------------
-subroutine externalforce(iexternalforce,xi,yi,zi,hi,ti,fextxi,fextyi,fextzi,phi,dtf,ii)
+subroutine externalforce(iexternalforce,xi,yi,zi,hi,ti,fextxi,fextyi,fextzi,phi,dtf,ii,rhoi)
  use extern_corotate,  only:get_centrifugal_force,get_companion_force,icompanion_grav
  use extern_binary,    only:binary_force
  use extern_prdrag,    only:get_prdrag_spatial_force
@@ -116,15 +116,15 @@ subroutine externalforce(iexternalforce,xi,yi,zi,hi,ti,fextxi,fextyi,fextzi,phi,
  use extern_geopot,      only:get_geopot_force,J2,spinvec
  use units,              only:get_G_code
  use io,                 only:fatal
- use part,               only:rhoh,massoftype,igas
  integer, intent(in)  :: iexternalforce
  real,    intent(in)  :: xi,yi,zi,hi,ti
  real,    intent(out) :: fextxi,fextyi,fextzi,phi
  real,    intent(out), optional :: dtf
- integer, intent(in),  optional :: ii ! NOTE: index-base physics can be dangerous; treat with caution!
+ integer, intent(in),  optional :: ii   ! particle index for gwinspiral only
+ real,    intent(in),  optional :: rhoi ! density (required for iext_externB)
  real            :: r2,dr,dr3,r,d2,f2i
  real            :: rcyl2,rcyl,rsph,rsph3,v2onr,dtf1,dtf2
- real            :: phii,gcode,R_g,factor,rhoi
+ real            :: phii,gcode,R_g,factor,dens
  real, parameter :: Rtorus = 1.0
  real :: pos(3)
 !-----------------------------------------------------------------------
@@ -212,8 +212,9 @@ subroutine externalforce(iexternalforce,xi,yi,zi,hi,ti,fextxi,fextyi,fextzi,phi,
 !
 !--External force due to an assumed external B field (with non-zero curl)
 !
-    rhoi = rhoh(hi,massoftype(igas))
-    call get_externalB_force(xi,yi,zi,hi,rhoi,fextxi,fextyi,fextzi)
+    if (.not.present(rhoi)) call fatal('externalforce','density required for external B field')
+    dens = rhoi
+    call get_externalB_force(xi,yi,zi,hi,dens,fextxi,fextyi,fextzi)
     phi = 0.
 
  case(iext_spiral)
@@ -522,7 +523,7 @@ end subroutine update_vdependent_extforce
 !-----------------------------------------------------------------------
 subroutine update_externalforce(iexternalforce,ti,dmdt)
  use io,                only:warn
- use part,              only:xyzh,vxyzu,igas,npart,nptmass,&
+ use part,              only:xyzh,vxyzu,npart,nptmass,&
                              xyzmh_ptmass,vxyz_ptmass
  use extern_gwinspiral, only:gw_still_inspiralling,get_gw_force
  use extern_binary,     only:update_binary
@@ -818,7 +819,8 @@ subroutine initialise_externalforces(iexternalforce,ierr)
  end select
 
  select case(iexternalforce)
- case(iext_star,iext_binary,iext_corot_binary,iext_prdrag,iext_spiral,iext_lensethirring,iext_einsteinprec,iext_gnewton)
+ case(iext_star,iext_binary,iext_corot_binary,iext_prdrag,iext_spiral,iext_lensethirring,&
+      iext_einsteinprec,iext_gnewton,iext_gwinspiral)
     !
     !--check that G=1 in code units
     !

@@ -33,7 +33,7 @@ module eos_zerotemp
 
  private
 
-  ! these set the mixture of species
+ ! these set the mixture of species
  ! following elements can be set by user at runtime
  real :: xh  = 0.0
  real :: xhe = 0.0
@@ -47,6 +47,10 @@ module eos_zerotemp
  real :: xmass(speciesmax) ! mass fraction of species
  real :: Aion(speciesmax)  ! number of nucleons
  real :: Zion(speciesmax)  ! number of protons
+
+ ! relativity parameter below which the series expansions are used
+ ! in f_chandra and g_chandra (see notes on those functions)
+ real, parameter :: xsmall = 0.03
 contains
 
 !----------------------------------------------------------------
@@ -108,7 +112,7 @@ subroutine read_options_eos_zerotemp(db,nerr)
 
  use infile_utils, only:inopts, read_inopt
  type(inopts), intent(inout) :: db(:)
- integer, intent(inout) :: nerr
+ integer,      intent(inout) :: nerr
 
  call read_inopt(xh ,'xh',db,nerr)
  call read_inopt(xhe,'xhe',db,nerr)
@@ -170,14 +174,57 @@ end subroutine eos_zerotemp_calc_mu_e
 !----------------------------------------------------------------
 !+
 !  Chandrasekhar's EOS function
+!
+!  For x << 1 the two terms are each of order 3x and cancel to leave
+!  a result of order x^5, so evaluating the expression directly loses
+!  all precision (it returns pure round-off below x ~ 1e-3). Use the
+!  asymptotic series in that limit instead; the two branches agree to
+!  better than 1e-8 in relative terms either side of xsmall
 !+
 !----------------------------------------------------------------
-
 real function f_chandra(x) result(fx)
  real, intent(in) :: x
 
- fx = x*(2*x**2 - 3)*sqrt(1+x**2) + 3*log(x + sqrt(1+x**2))
+ if (x < xsmall) then
+    fx = 1.6*x**5*(1. - (5./14.)*x**2 + (5./24.)*x**4)
+ else
+    fx = x*(2*x**2 - 3)*sqrt(1+x**2) + 3*asinh(x)
+ endif
+
 end function f_chandra
+
+!----------------------------------------------------------------
+!+
+!  companion function giving the internal energy density, where
+!  g(x) = 8x^3 (sqrt(1+x^2) - 1) - f(x). This suffers the same
+!  cancellation as f_chandra for x << 1, so is handled the same way
+!+
+!----------------------------------------------------------------
+real function g_chandra(x) result(gx)
+ real, intent(in) :: x
+
+ if (x < xsmall) then
+    gx = 2.4*x**5*(1. - (5./28.)*x**2 + (5./72.)*x**4)
+ else
+    gx = 8.*x**3*(sqrt(1.+x**2) - 1.) - f_chandra(x)
+ endif
+
+end function g_chandra
+
+!----------------------------------------------------------------
+!+
+!  relativity parameter x = p_Fermi / (m_e c) for a given density
+!+
+!----------------------------------------------------------------
+real function x_from_rho(rhoi) result(x)
+ real, intent(in) :: rhoi
+ real :: ne
+
+ ne = rhoi / (mu_e * atomic_mass_unit)
+ x = ( (3.0 * ne * planckh**3) / &
+       (8.0 * pi * mass_electron_cgs**3 * c**3) )**(1.0/3.0)
+
+end function x_from_rho
 
 ! ----------------------------------------------------------------
 !+
@@ -186,23 +233,19 @@ end function f_chandra
 !  Note that this is only the electron degeneracy pressure, so does not include the ion
 !+ input/output is cgs
 ! ----------------------------------------------------------------
-
 subroutine get_zerotemp_pressure(rhoi,presi)
  real, intent(in)  :: rhoi
  real, intent(out) :: presi
- real :: ne, x
+ real :: x
 
  ! This is the zero temperature pressure for a fully degenerate electron gas, i.e. a white dwarf. See Kippenhahn & Weigert, Stellar Structure and Evolution, section 15.2
  ! Note that this is only the electron degeneracy pressure, so does not include the ion contribution to the pressure.
  ! This is a good approximation for white dwarfs where the electrons are highly degenerate but the ions are not.
  ! Note also that this assumes a fully ionised gas, so mu is the mean molecular weight per free electron
 
-    ne = rhoi / (mu_e * atomic_mass_unit)
+ x = x_from_rho(rhoi)
 
-    x = ( (3.0 * ne * planckh**3) / &
-        (8.0 * pi * mass_electron_cgs**3 * c**3) )**(1.0/3.0)
-
-    presi = (pi * mass_electron_cgs**4 * c**5 / (3.0 * planckh**3)) * f_chandra(x)
+ presi = (pi * mass_electron_cgs**4 * c**5 / (3.0 * planckh**3)) * f_chandra(x)
 
 end subroutine get_zerotemp_pressure
 
@@ -211,18 +254,15 @@ end subroutine get_zerotemp_pressure
 !+!  get internal energy from density for zero temperature EOS
 !-----------------------------------------------------------------------
 subroutine get_zerotemp_u(rhoi,u)
- real,    intent(in)    :: rhoi
- real,    intent(out)   :: u
- real :: ne, x, gx
+ real, intent(in)  :: rhoi
+ real, intent(out) :: u
+ real :: x, gx
 
-    ne = rhoi / (mu_e * atomic_mass_unit)
+ x = x_from_rho(rhoi)
 
-    x = ( (3.0 * ne * planckh**3) / &
-        (8.0 * pi * mass_electron_cgs**3 * c**3) )**(1.0/3.0)
-
-    gx = (8*x**3)*(sqrt(x**2 + 1)-1)-f_chandra(x)
-    u = (pi * mass_electron_cgs**4 * c**5 / (3.0 * planckh**3)) * gx
-    u = u/rhoi !previous equation is erg/cm^3 so here I convert it
+ gx = g_chandra(x)
+ u = (pi * mass_electron_cgs**4 * c**5 / (3.0 * planckh**3)) * gx
+ u = u/rhoi !previous equation is erg/cm^3 so here I convert it
 end subroutine get_zerotemp_u
 
 !----------------------------------------------------------------
@@ -230,21 +270,17 @@ end subroutine get_zerotemp_u
 !  Calculates sound speed from density (derivative of f(x), analytically found), input output in cgs
 !+
 !----------------------------------------------------------------
-
 subroutine get_zerotemp_spsoundi(rhoi,spsoundi)
  real, intent(in)  :: rhoi
  real, intent(out) :: spsoundi
- real :: ne, x
+ real :: x
 
  if (rhoi <= 0.0) then
     spsoundi = 0.0
     return
  endif
 
- ne = rhoi / (mu_e * atomic_mass_unit)
-
- x = ( (3.0 * ne * planckh**3) / &
-        (8.0 * pi * mass_electron_cgs**3 * c**3) )**(1.0/3.0)
+ x = x_from_rho(rhoi)
 
  spsoundi = sqrt((mass_electron_cgs * c**2 * x**2) / (3.0 * atomic_mass_unit * mu_e * sqrt(1.0 + x**2)))
 end subroutine get_zerotemp_spsoundi
@@ -256,52 +292,52 @@ end subroutine get_zerotemp_spsoundi
 !----------------------------------------------------------------
 subroutine get_zerotemp_rhofrompres(presi,densi,ierr)
 
-   real, intent(in)  :: presi
-   real, intent(out) :: densi
-   integer, intent(out) :: ierr
+ real,    intent(in)  :: presi
+ real,    intent(out) :: densi
+ integer, intent(out) :: ierr
 
-   real :: ne, x, fx
-   real :: xlo, xhi, xmid
-   integer :: iter
+ real :: ne, x, fx
+ real :: xlo, xhi, xmid
+ integer :: iter
 
-   integer, parameter :: iter_max = 1000
-   real,    parameter :: tolerance = 1.e-12
+ integer, parameter :: iter_max = 1000
+ real,    parameter :: tolerance = 1.e-12
 
-   fx = presi * (3.0*planckh**3) / &
+ fx = presi * (3.0*planckh**3) / &
         (pi*mass_electron_cgs**4*c**5)
 
-   ! Initial bracket
-   xlo = 0.0
-   xhi = 1.0
+ ! Initial bracket
+ xlo = 0.0
+ xhi = 1.0
 
-   do while (f_chandra(xhi) < fx)
-      xhi = 2.0*xhi
-   enddo
+ do while (f_chandra(xhi) < fx)
+    xhi = 2.0*xhi
+ enddo
 
-   ierr = 0
+ ierr = 0
 
-   do iter = 1, iter_max
+ do iter = 1, iter_max
 
-      xmid = 0.5*(xlo + xhi)
+    xmid = 0.5*(xlo + xhi)
 
-      if (f_chandra(xmid) > fx) then
-         xhi = xmid
-      else
-         xlo = xmid
-      endif
+    if (f_chandra(xmid) > fx) then
+       xhi = xmid
+    else
+       xlo = xmid
+    endif
 
-      if (abs(xhi-xlo)/(xmid+1.e-300) < tolerance) exit
+    if (abs(xhi-xlo)/(xmid+1.e-300) < tolerance) exit
 
-   enddo
+ enddo
 
-   if (iter == iter_max) ierr = 1
+ if (iter == iter_max) ierr = 1
 
-   x = 0.5*(xlo + xhi)
+ x = 0.5*(xlo + xhi)
 
-   ne = (8.0*pi*mass_electron_cgs**3*c**3 / &
+ ne = (8.0*pi*mass_electron_cgs**3*c**3 / &
         (3.0*planckh**3)) * x**3
 
-   densi = ne * mu_e * atomic_mass_unit
+ densi = ne * mu_e * atomic_mass_unit
 
 end subroutine get_zerotemp_rhofrompres
 

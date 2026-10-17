@@ -52,6 +52,7 @@ module mpiderivs
  public :: deallocate_cell_comms_arrays
 
  public :: init_cell_exchange
+ public :: init_send_requests
  public :: send_cell
  public :: recv_cells
  public :: check_send_finished
@@ -133,9 +134,9 @@ subroutine init_celldens_exchange(xbufrecv,ireq,thread_complete,ncomplete_mpi,dt
     if (mpierr /= 0) call fatal('init_cell_exchange','error in MPI_START')
  enddo
 
- !$omp master
+ !$omp masked
  ncomplete_mpi = 0
- !$omp end master
+ !$omp end masked
  thread_complete(omp_thread_num()+1) = .false.
 #else
  ncomplete_mpi = 0
@@ -178,9 +179,9 @@ subroutine init_cellforce_exchange(xbufrecv,ireq,thread_complete,ncomplete_mpi,d
     if (mpierr /= 0) call fatal('init_cell_exchange','error in MPI_START')
  enddo
 
- !$omp master
+ !$omp masked
  ncomplete_mpi = 0
- !$omp end master
+ !$omp end masked
  thread_complete(omp_thread_num()+1) = .false.
 #else
  ncomplete_mpi = 0
@@ -188,6 +189,25 @@ subroutine init_cellforce_exchange(xbufrecv,ireq,thread_complete,ncomplete_mpi,d
  dtype = 0
 #endif
 end subroutine init_cellforce_exchange
+
+!-----------------------------------------------------------------------
+!+
+!  Subroutine to initialize send request handles to null
+!+
+!-----------------------------------------------------------------------
+subroutine init_send_requests(irequestsend)
+ integer, intent(out) :: irequestsend(nprocs)
+
+!--instead of simply assigning 0, assign MPI_REQUEST_NULL
+!  it is infact 0 in open mpi, but 0x2c000000 for MPICH-derived MPI.
+
+#ifdef MPI
+ irequestsend = MPI_REQUEST_NULL
+#else
+ irequestsend = 0
+#endif
+
+end subroutine init_send_requests
 
 !-----------------------------------------------------------------------
 !+
@@ -302,27 +322,27 @@ subroutine recv_while_wait_dens(stack,xrecvbuf,irequestrecv,irequestsend,thread_
  enddo
 
  !--signal to other MPI tasks that this task has finished sending
- !$omp master
+ !$omp masked
  do newproc=0,nprocs-1
     if (newproc /= id) then
        call MPI_ISEND(counters(newproc+1,isent),1,MPI_INTEGER4,newproc,0,comm_cellcount,irequestsend(newproc+1),mpierr)
     endif
  enddo
- !$omp end master
+ !$omp end masked
 
  !--continue receiving cells until all MPI tasks have finished sending
  do while (ncomplete_mpi < nprocs)
     call recv_cells(stack,xrecvbuf,irequestrecv,counters)
-    !$omp master
+    !$omp masked
     call check_complete(counters,ncomplete_mpi)
-    !$omp end master
+    !$omp end masked
  enddo
 
  call barrier_mpi
 
- !$omp master
+ !$omp masked
  ncomplete_mpi = 0
- !$omp end master
+ !$omp end masked
  thread_complete(omp_thread_num()+1) = .false.
 
 #endif
@@ -352,27 +372,27 @@ subroutine recv_while_wait_force(stack,xrecvbuf,irequestrecv,irequestsend,thread
  enddo
 
  !--signal to other MPI tasks that this task has finished sending
- !$omp master
+ !$omp masked
  do newproc=0,nprocs-1
     if (newproc /= id) then
        call MPI_ISEND(counters(newproc+1,isent),1,MPI_INTEGER4,newproc,0,comm_cellcount,irequestsend(newproc+1),mpierr)
     endif
  enddo
- !$omp end master
+ !$omp end masked
 
  !--continue receiving cells until all MPI tasks have finished sending
  do while (ncomplete_mpi < nprocs)
     call recv_cells(stack,xrecvbuf,irequestrecv,counters)
-    !$omp master
+    !$omp masked
     call check_complete(counters,ncomplete_mpi)
-    !$omp end master
+    !$omp end masked
  enddo
 
  call barrier_mpi
 
- !$omp master
+ !$omp masked
  ncomplete_mpi = 0
- !$omp end master
+ !$omp end masked
  thread_complete(omp_thread_num()+1) = .false.
 
 #endif
@@ -653,7 +673,7 @@ subroutine reset_cell_counters(counters)
  integer :: iproc
  integer :: mpierr
 
- !$omp master
+ !$omp masked
  counters(:,isent)   = 0
  counters(:,iexpect) = -1
  counters(:,irecv)   = 0
@@ -665,7 +685,7 @@ subroutine reset_cell_counters(counters)
        if (mpierr /= 0) call fatal('reset_cell_counters','error in MPI_IRECV')
     endif
  enddo
- !$omp end master
+ !$omp end masked
 
 #endif
 end subroutine reset_cell_counters

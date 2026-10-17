@@ -18,6 +18,7 @@ module cooling_radapprox
 !
 ! :Dependencies: eos_stamatellos, infile_utils, io, part, physcon, units
 !
+ use, intrinsic :: ieee_arithmetic, only:ieee_is_nan
 
  implicit none
  real  :: Lstar = 0. ! in units of L_sun
@@ -56,13 +57,12 @@ subroutine init_star()
       "at (xyz)",xyzmh_ptmass(1:3,isink_star)!"as illuminating star."
 end subroutine init_star
 
-subroutine radcool_evolve_ui(ui,dt,i,Tfloor,h,uout)
+subroutine radcool_evolve_ui(ui,dt,i,Tfloor,rhoi,uout)
  use eos_stamatellos, only:ttherm_store,ueqi_store,getintenerg_opdep
  use io,              only:warning
  use units,           only:unit_density,unit_ergg
- use part,            only:rhoh,massoftype,igas
  real,    intent(inout) :: ui
- real,    intent(in)    :: dt,Tfloor,h
+ real,    intent(in)    :: dt,Tfloor,rhoi
  integer, intent(in)    :: i
  real,    intent(out), optional :: uout
  real :: tthermi,ueqi,utemp,ufloor_cgs,rhoi_cgs
@@ -71,7 +71,7 @@ subroutine radcool_evolve_ui(ui,dt,i,Tfloor,h,uout)
  tthermi = ttherm_store(i)
  ueqi = ueqi_store(i)
  utemp = ui
- rhoi_cgs = rhoh(h,massoftype(igas))*unit_density
+ rhoi_cgs = rhoi*unit_density
  call getintenerg_opdep(Tfloor**(1.0/4.0),rhoi_cgs,ufloor_cgs)
 
  if (tthermi > epsilon(tthermi) .and. ui /= ueqi) then
@@ -86,7 +86,7 @@ subroutine radcool_evolve_ui(ui,dt,i,Tfloor,h,uout)
     endif
 
     ! if tthermi ==0 or dt/thermi is neglible then ui doesn't change
-    if (isnan(utemp) .or. utemp < epsilon(utemp)) then
+    if (ieee_is_nan(utemp) .or. utemp < epsilon(utemp)) then
        utemp = ui
     endif
  endif
@@ -111,7 +111,7 @@ subroutine radcool_update_du(i,xi,yi,zi,rhoi,ui,duhydro,Tfloor)
  use units,    only:umass,udist,unit_density,unit_ergg,utime,unit_pressure
  use eos_stamatellos, only:getopac_opdep,getintenerg_opdep,gradP_cool,&
           ttherm_store,ueqi_store,tau_store
- use part,       only:xyzmh_ptmass,igas,eos_vars,iTemp
+ use part,       only:xyzmh_ptmass,eos_vars,iTemp
  integer, intent(in) :: i
  real,    intent(in) :: xi,yi,zi,rhoi
  real,    intent(in) :: ui,duhydro,Tfloor
@@ -197,7 +197,7 @@ subroutine radcool_update_du(i,xi,yi,zi,rhoi,ui,duhydro,Tfloor)
 
  ttherm_store(i) = tthermi
 
- if (isnan(tthermi) .or. isnan(ueqi)) then
+ if (ieee_is_nan(tthermi) .or. ieee_is_nan(ueqi)) then
     call warning("In Stamatellos cooling","energ=NaN or 0. ui=",val=ui)
  endif
 
