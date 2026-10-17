@@ -117,7 +117,8 @@ module gpu_arrays
  integer, parameter, public :: ibun_dustgas  = 10  ! dust-to-gas ratio on gas, 0 on dust
  integer, parameter, public :: ibun_drag_out = 11  ! drag ax, ay, az, min pair stopping time
  integer, parameter, public :: ibun_dvdx     = 12  ! velocity gradient tensor, device only
- integer, parameter, public :: nbundle       = 12
+ integer, parameter, public :: ibun_dragold  = 13  ! previous pass's drag ax, ay, az (implicit drag)
+ integer, parameter, public :: nbundle       = 13
 
  type :: bundle_t
     character(len=10) :: name  = ''
@@ -243,7 +244,8 @@ contains
 !+
 !-------------------------------------------------------------
 subroutine gpu_arrays_init(n)
- use dim, only:use_dust
+ use dim,  only:use_dust
+ use dust, only:drag_implicit
 #ifdef GPU
  use io, only:fatal
 #endif
@@ -286,6 +288,10 @@ subroutine gpu_arrays_init(n)
  !  sweep forms it and the device keeps it (densityiterate_gpu_c keep_dvdx): it never
  !  crosses, so it takes no arena space.  The row is here so the table says so.
  bundle(ibun_dvdx)     = bundle_t('dvdx',     9, idir_device_only, use_dust)
+ !--implicit drag reads both particles' drag acceleration from the PREVIOUS force pass
+ !  (force.F90's fxyz_dragold).  The device order changes with every density solve, so
+ !  phantom keeps it and sends it before each force pass.
+ bundle(ibun_dragold)  = bundle_t('drag_old', 3, idir_up,     use_dust .and. drag_implicit)
 
  !--lay the live bundles out end to end.  device_only rows take no arena space.
  off = 1

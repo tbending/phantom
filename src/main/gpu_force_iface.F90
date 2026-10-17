@@ -38,7 +38,7 @@ module gpu_force_iface
  use gpu_arrays,    only:gpu_arrays_init,gpu_arrays_comp,gpu_arrays_claim_packed, &
                          gpu_arrays_upload, &
                          gpu_arrays_download, &
-                         ibun_vel,ibun_thermo,ibun_force_out,ibun_drag_out
+                         ibun_vel,ibun_thermo,ibun_force_out,ibun_drag_out,ibun_dragold
  implicit none
 
 #ifdef GPU
@@ -54,7 +54,7 @@ module gpu_force_iface
     integer(c_int), value       :: disc_viscosity
     integer(c_int), value       :: pdv_heating,shock_heating
     integer(c_int), value       :: idrag             ! 0: no two-fluid drag
-    real(c_double), intent(in)  :: dust(9)           ! see dust_params below
+    real(c_double), intent(in)  :: dust(11)          ! see dust_params below
     integer(c_long_long), intent(out) :: drag_tally(3)  ! drag, Stokes, supersonic pairs
     end subroutine force_gpu_c
 
@@ -83,7 +83,7 @@ subroutine force_gpu(npart,xyzh,vxyzu,eos_vars,alphaind,fxyzu,divcurlv,dt)
  use part,    only:nptmass,xyzmh_ptmass
  use part,    only:sinks_have_heating
  use dim,     only:use_dust
- use part,    only:iphase,iamtype,idust,grainsize,graindens,tstop
+ use part,    only:iphase,iamtype,idust,grainsize,graindens,tstop,fxyz_drag,fxyz_dragold
  use dust,    only:idrag,irecon,drag_implicit,icut_backreaction,K_code,seff,coeff_gei_1,cste_mu
  use timestep,only:bignumber
  use io,      only:iverbose,warning,id,master
@@ -109,7 +109,8 @@ subroutine force_gpu(npart,xyzh,vxyzu,eos_vars,alphaind,fxyzu,divcurlv,dt)
  real(c_double), pointer, contiguous :: fx8(:),fy8(:),fz8(:),f48(:)
  real(c_double), pointer, contiguous :: vsigmax8(:),divv8(:)
  real(c_double), pointer, contiguous :: fdx8(:),fdy8(:),fdz8(:),tsmin8(:)
- real(c_double)       :: dust_params(9)
+ real(c_double), pointer, contiguous :: fdox8(:),fdoy8(:),fdoz8(:)
+ real(c_double)       :: dust_params(11)
  integer(c_long_long) :: drag_tally(3)
  integer(c_int)       :: idrag_gpu
  real                 :: frac_stokes,frac_super
@@ -124,14 +125,12 @@ subroutine force_gpu(npart,xyzh,vxyzu,eos_vars,alphaind,fxyzu,divcurlv,dt)
 
  if (npart <= 0) return
 
- !--two-fluid dust: explicit gas-dust drag, with or without reconstruction (irecon),
- !  as force.F90.  The implicit scheme comes later (force/GPU_DUST_TWO_TREE_PLAN.md
- !  phase 6); idrag = 0 would still need the gas-dust pairs for vsig, which the GPU only
- !  walks when there is drag.
+ !--two-fluid dust: gas-dust drag, explicit or implicit (drag_implicit), with or without
+ !  reconstruction (irecon), as force.F90; idrag = 0 would still need the gas-dust pairs
+ !  for vsig, which the GPU only walks when there is drag.
  if (use_dust) then
     if (idrag < 1 .or. idrag > 3) &
        call fatal('force_gpu','two-fluid drag on the GPU needs idrag = 1, 2 or 3',ival=idrag)
-    if (drag_implicit) call fatal('force_gpu','implicit drag not on the GPU yet (drag_implicit = F)')
  endif
 
  if (.not. stats_checked) then
@@ -197,6 +196,24 @@ subroutine force_gpu(npart,xyzh,vxyzu,eos_vars,alphaind,fxyzu,divcurlv,dt)
  endif
 
  call gpu_arrays_upload(ibun_thermo,npart)
+
+ !--implicit drag, as force.F90: this pass reads the drag acceleration of the previous
+ !  one, so keep it as fxyz_dragold and send it; fxyz_drag is refilled after the pass
+ if (use_dust .and. drag_implicit) then
+    fdox8 => gpu_arrays_comp(ibun_dragold,1)
+    fdoy8 => gpu_arrays_comp(ibun_dragold,2)
+    fdoz8 => gpu_arrays_comp(ibun_dragold,3)
+    !$omp parallel do default(none) schedule(static) private(i) &
+    !$omp shared(npart,fxyz_drag,fxyz_dragold,fdox8,fdoy8,fdoz8)
+    do i = 1,npart
+       fxyz_dragold(1:3,i) = fxyz_drag(1:3,i)
+       fdox8(i) = real(fxyz_dragold(1,i),kind=c_double)
+       fdoy8(i) = real(fxyz_dragold(2,i),kind=c_double)
+       fdoz8(i) = real(fxyz_dragold(3,i),kind=c_double)
+    enddo
+    !$omp end parallel do
+    call gpu_arrays_upload(ibun_dragold,npart)
+ endif
  call system_clock(ic1)
 
  !--the drag parameters, in the order force_c_api.cu reads them: one large grain size
@@ -207,8 +224,8 @@ subroutine force_gpu(npart,xyzh,vxyzu,eos_vars,alphaind,fxyzu,divcurlv,dt)
  if (use_dust) then
     idrag_gpu   = int(idrag, kind=c_int)
     dust_params = real([grainsize(1), graindens(1), K_code(1), seff, coeff_gei_1, cste_mu, &
-                        massoftype(idust), merge(1., 0., icut_backreaction == 1), real(irecon)], &
-                       kind=c_double)
+                        massoftype(idust), merge(1., 0., icut_backreaction == 1), real(irecon), &
+                        merge(1., 0., drag_implicit), dt], kind=c_double)
  endif
 
  call force_gpu_c(int(npart,kind=c_int),                &
@@ -231,7 +248,8 @@ subroutine force_gpu(npart,xyzh,vxyzu,eos_vars,alphaind,fxyzu,divcurlv,dt)
  !  runs first), so the SPH force is added to it.  Isothermal builds have no
  !  u, so fxyzu has no fourth row and du/dt is discarded.
  !$omp parallel do default(none) schedule(static) private(i) &
- !$omp shared(npart,fxyzu,divcurlv,fx8,fy8,fz8,f48,divv8,iphase,fdx8,fdy8,fdz8,tsmin8,tstop,xyzh)
+ !$omp shared(npart,fxyzu,divcurlv,fx8,fy8,fz8,f48,divv8,iphase,fdx8,fdy8,fdz8,tsmin8,tstop,xyzh) &
+ !$omp shared(fxyz_drag,drag_implicit)
  do i = 1,npart
     if (driving) then
        fxyzu(1,i) = fxyzu(1,i) + real(fx8(i),kind=kind(fxyzu))
@@ -249,7 +267,11 @@ subroutine force_gpu(npart,xyzh,vxyzu,eos_vars,alphaind,fxyzu,divcurlv,dt)
        fxyzu(1,i) = fxyzu(1,i) + real(fdx8(i),kind=kind(fxyzu))
        fxyzu(2,i) = fxyzu(2,i) + real(fdy8(i),kind=kind(fxyzu))
        fxyzu(3,i) = fxyzu(3,i) + real(fdz8(i),kind=kind(fxyzu))
-       if (.not.isdead_or_accreted(xyzh(4,i))) tstop(:,i) = min(real(tsmin8(i)),bignumber)
+       if (.not.isdead_or_accreted(xyzh(4,i))) then
+          tstop(:,i) = min(real(tsmin8(i)),bignumber)
+          !--as force.F90 with drag_implicit: this pass's drag, read back by the next one
+          if (drag_implicit) fxyz_drag(1:3,i) = [real(fdx8(i)),real(fdy8(i)),real(fdz8(i))]
+       endif
     endif
     !--as force.F90 (isgas): the force pass's div v replaces the density pass's for gas
     !  only.  Dust keeps the one from its own density solve.
@@ -376,6 +398,7 @@ subroutine finish_gpu_force_timesteps(npart,xyzh,vxyzu,fxyzu, &
  use dim,      only:maxvxyzu,gr,use_dust
  use eos,      only:ieos
  use io_summary, only:summary_variable,iosumdgr
+ use dust,     only:drag_implicit
 
  integer,        intent(in)    :: npart
  real,           intent(in)    :: xyzh(:,:),vxyzu(:,:)
@@ -400,7 +423,7 @@ subroutine finish_gpu_force_timesteps(npart,xyzh,vxyzu,fxyzu, &
  !--min is exact under reduction, so this is bit-identical to the serial loop
  !$omp parallel do default(none) schedule(static) private(i,hi,vsigdtc,f2i,dtc,dtf,eni,isgas,ts_min,dtdrag) &
  !$omp shared(npart,xyzh,vxyzu,fxyzu,limit_u,fx8,fy8,fz8,vsigmax8,spsound_8,dtmax,C_cour,C_force,alpha) &
- !$omp shared(iphase,tsmin8) &
+ !$omp shared(iphase,tsmin8,drag_implicit) &
  !$omp reduction(min:dtcmin,dtfmin) reduction(+:ndustres,dustresfacmean) reduction(max:dustresfacmax)
  do i = 1,npart
     hi = xyzh(4,i)
@@ -447,7 +470,11 @@ subroutine finish_gpu_force_timesteps(npart,xyzh,vxyzu,fxyzu, &
     !  stopping time, and the check that gas resolves it (h < c_s t_s)
     if (use_dust) then
        ts_min = min(real(tsmin8(i)),bignumber)
-       dtdrag = 0.9*ts_min
+       if (drag_implicit) then
+          dtdrag = 90.*ts_min
+       else
+          dtdrag = 0.9*ts_min
+       endif
        dtf    = min(dtf,dtdrag)
        if (isgas .and. ts_min < bignumber) then
           if (hi > ts_min*spsound_8(i)) then
