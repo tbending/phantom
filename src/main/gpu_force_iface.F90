@@ -84,6 +84,7 @@ subroutine force_gpu(npart,xyzh,vxyzu,eos_vars,alphaind,fxyzu,divcurlv,dt)
  use part,    only:sinks_have_heating
  use dim,     only:use_dust
  use part,    only:iphase,iamtype,idust,grainsize,graindens,tstop,fxyz_drag,fxyz_dragold
+ use part,    only:ndusttypes
  use dust,    only:idrag,irecon,drag_implicit,icut_backreaction,K_code,seff,coeff_gei_1,cste_mu
  use timestep,only:bignumber
  use io,      only:iverbose,warning,id,master
@@ -249,7 +250,7 @@ subroutine force_gpu(npart,xyzh,vxyzu,eos_vars,alphaind,fxyzu,divcurlv,dt)
  !  u, so fxyzu has no fourth row and du/dt is discarded.
  !$omp parallel do default(none) schedule(static) private(i) &
  !$omp shared(npart,fxyzu,divcurlv,fx8,fy8,fz8,f48,divv8,iphase,fdx8,fdy8,fdz8,tsmin8,tstop,xyzh) &
- !$omp shared(fxyz_drag,drag_implicit)
+ !$omp shared(fxyz_drag,drag_implicit,ndusttypes)
  do i = 1,npart
     if (driving) then
        fxyzu(1,i) = fxyzu(1,i) + real(fx8(i),kind=kind(fxyzu))
@@ -268,7 +269,8 @@ subroutine force_gpu(npart,xyzh,vxyzu,eos_vars,alphaind,fxyzu,divcurlv,dt)
        fxyzu(2,i) = fxyzu(2,i) + real(fdy8(i),kind=kind(fxyzu))
        fxyzu(3,i) = fxyzu(3,i) + real(fdz8(i),kind=kind(fxyzu))
        if (.not.isdead_or_accreted(xyzh(4,i))) then
-          tstop(:,i) = min(real(tsmin8(i)),bignumber)
+          !  (only the dust types in use: tstop has maxdusttypes rows, as dustfrac)
+          tstop(1:ndusttypes,i) = min(real(tsmin8(i)),bignumber)
           !--as force.F90 with drag_implicit: this pass's drag, read back by the next one
           if (drag_implicit) fxyz_drag(1:3,i) = [real(fdx8(i)),real(fdy8(i)),real(fdz8(i))]
        endif

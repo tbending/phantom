@@ -165,7 +165,7 @@ subroutine densityiterate_gpu(npart, xyzh, vxyzu, fxyzu, fext, gradh, divcurlv, 
  use kernel,           only:kernelname,radkern
  use part,             only:hfact
  use part,             only:iphase,iamtype,iamboundary,igas,idust
- use part,             only:ndustsmall,ndustlarge,dustfrac
+ use part,             only:ndustsmall,ndustlarge,dustfrac,ndusttypes
  use dim,              only:use_dustgrowth
  use options,          only:use_dustfrac,use_hybrid
  use dust,             only:irecon
@@ -367,7 +367,7 @@ subroutine densityiterate_gpu(npart, xyzh, vxyzu, fxyzu, fext, gradh, divcurlv, 
  !--write results back to phantom arrays
  !  Skip inactive/dead particles (xyzh(4,i) < 0 in phantom convention)
  !$omp parallel do default(none) private(i,hi,rhoi,drhoi,omega,dhdni,pmassi) &
- !$omp shared(npart,xyzh,gradh,divcurlv,alphaind,xi_gpu,dustfrac,ndustsmall,rho) &
+ !$omp shared(npart,xyzh,gradh,divcurlv,alphaind,xi_gpu,dustfrac,ndustsmall,ndusttypes,rho) &
  !$omp shared(h8,rho8,drhofh8,divv8,xi8,ddivvdt8,dustgas8,iphase,massoftype,maxp,maxphase)
  do i = 1, npart
     if (xyzh(4,i) < 0.) cycle   ! preserve negative h for inactive particles
@@ -399,9 +399,11 @@ subroutine densityiterate_gpu(npart, xyzh, vxyzu, fxyzu, fext, gradh, divcurlv, 
     xi_gpu(i) = real(xi8(i))
     if (nalpha >= 3) alphaind(3,i) = real(ddivvdt8(i), kind=4)
     !--two-fluid dust, as dens.F90: dustfrac is cleared on every particle the solve
-    !  touched, then holds the dust-to-gas ratio on gas (zero from the device on dust)
+    !  touched, then holds the dust-to-gas ratio on gas (zero from the device on dust).
+    !  Only the dust types in use: dustfrac has maxdusttypes rows (22 unless MAXDUST* is
+    !  set at build time), and clearing all of them on every particle was most of this loop.
     if (use_dust) then
-       dustfrac(:,i) = 0.
+       dustfrac(1:ndusttypes,i) = 0.
        dustfrac(ndustsmall+1,i) = real(dustgas8(i))
     endif
  enddo
