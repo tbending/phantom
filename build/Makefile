@@ -221,6 +221,9 @@ endif
 #  GPU, GPU_TARGET and COSMO_DIR may be given on the command line or set in the
 #  environment (export GPU=yes GPU_TARGET=a100), as the writemake.sh Makefile expects.
 #  Default GPU=no preserves original phantom CPU behaviour with no code changes.
+#  GPU_IND=yes keeps the setup's IND_TIMESTEPS under GPU=yes (individual timesteps on
+#  the GPU path, under development: indiv_cosmo GPU_IND_TIMESTEPS_PLAN.md).  The default,
+#  no, forces global timesteps as before, so existing GPU builds are unchanged.
 # cosmoSPHere is the submodule beside this build directory, wherever the run directory
 # is; a non-empty COSMO_DIR (environment or command line) overrides it. Defined
 # unconditionally (not just under GPU=yes) so 'make clean' can also clean it.
@@ -228,14 +231,17 @@ ifeq ($(strip $(COSMO_DIR)),)
     COSMO_DIR := $(abspath $(CURDIR)/../cosmoSPHere)
 endif
 GPU ?= no
+GPU_IND ?= no
 ifeq ($(GPU), yes)
 ifeq ($(GPU_TARGET),)
     $(error GPU=yes requires GPU_TARGET to be set -- valid: a100, hopper, quadro_pascal, mi300 (see build/Makefile_GPU))
 endif
     include Makefile_GPU
     FPPFLAGS  += -DGPU
-    # the GPU path uses global timesteps, whatever the setup's default
+    # the GPU path uses global timesteps, whatever the setup's default, unless GPU_IND=yes
+ifneq ($(GPU_IND), yes)
     override IND_TIMESTEPS = no
+endif
     LDFLAGS   += -L$(COSMO_DIR)/build -lcosmoSPHere
 ifeq ($(GPU_BACKEND), cuda)
     CUDA_HOME ?= $(CUDA_INSTALL_PATH)
@@ -741,7 +747,7 @@ OBJTEST= $(OBJTEST1:.F90=.o)
 
 .PHONY: phantomtest
 
-phantomtest: checksystem checkparams libphantom libsetup $(OBJTEST)
+phantomtest: checksystem checkparams $(GPU_PREREQ) libphantom libsetup $(OBJTEST)
 	@echo ""
 	@echo "Phantomtest: Getting your life back one test at a time"
 	@echo ""

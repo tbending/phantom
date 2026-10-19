@@ -219,6 +219,11 @@ module gpu_arrays
    use iso_c_binding, only:c_int
    integer(c_int), value :: slot
   end function cosmo_slot_ncomp
+
+!--Print (under COSMO_DENS_STATS) and reset the bytes and copies moved since the
+!  last call: one COSMO_XFER line per step.
+  subroutine cosmo_xfer_report() bind(C)
+  end subroutine cosmo_xfer_report
  end interface
 #endif
 
@@ -227,6 +232,7 @@ module gpu_arrays
  public :: gpu_arrays_positions_moved, gpu_arrays_order_rebuilt
  public :: gpu_arrays_mark_packed, gpu_arrays_claim_packed
  public :: pin_buffer, unpin_buffer
+ public :: gpu_xfer_report
 
 contains
 
@@ -462,6 +468,24 @@ subroutine gpu_arrays_order_rebuilt()
  order_matches = .true.
 
 end subroutine gpu_arrays_order_rebuilt
+
+!-------------------------------------------------------------
+!+
+!  One step's traffic across the bus: printed as COSMO_XFER
+!  up=<bytes> down=<bytes> calls=<copies> under COSMO_DENS_STATS,
+!  then reset.  Called once per step from evol, so under individual
+!  timesteps each line is one substep of the finest bin.  The step
+!  counts everything since the previous step's line, start-up
+!  included for the first.  No-op without GPU.
+!+
+!-------------------------------------------------------------
+subroutine gpu_xfer_report()
+
+#ifdef GPU
+ call cosmo_xfer_report()
+#endif
+
+end subroutine gpu_xfer_report
 
 !-------------------------------------------------------------
 !+

@@ -113,6 +113,8 @@ subroutine evol(infile,logfile,evfile,dumpfile,flag)
  use timestep,         only:time,dt,dtmax,nsteps,dtextforce,rhomaxnow
  use timestep_ind,     only:nactive
  use growth_coala,     only:get_growth_rate_coala
+ use gpu_dens_iface,   only:use_gpu_dens
+ use gpu_arrays,       only:gpu_xfer_report
  character(len=*), intent(in)    :: infile
  character(len=*), intent(inout) :: logfile,evfile,dumpfile
  integer,          intent(in), optional :: flag
@@ -141,6 +143,7 @@ subroutine evol(infile,logfile,evfile,dumpfile,flag)
     !  for individual timesteps this is the shortest timestep
     !
     call step(npart,nactive,time,dt,dtextforce,dtnew)
+    if (use_gpu_dens) call gpu_xfer_report()
     !
     ! Strang splitting: implicit update for another half step
     !
