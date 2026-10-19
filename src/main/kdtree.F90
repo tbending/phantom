@@ -145,7 +145,13 @@ subroutine maketree(node, xyzh, np, leaf_is_active, ncells, apr_tree, refineleve
     sinktree = .true.
  endif
 
- leaf_is_active = 0
+ ! (in parallel: the array is sized for the largest tree, and a serial loop over it
+ ! costs about as much as building the top of the tree)
+ !$omp parallel do schedule(static) default(none) shared(leaf_is_active) private(i)
+ do i=1,size(leaf_is_active)
+    leaf_is_active(i) = 0
+ enddo
+ !$omp end parallel do
 
  ir = 0
  il = 0
