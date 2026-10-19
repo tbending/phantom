@@ -20,7 +20,7 @@ module kdtree
 ! :Runtime parameters: None
 !
 ! :Dependencies: allocutils, boundary, dim, dtypekdtree, io, mpibalance,
-!   mpidomain, mpitree, mpiutils, part, timing
+!   mpidomain, mpitree, mpiutils, part, timestep, timestep_ind, timing
 !
  use, intrinsic :: ieee_arithmetic, only:ieee_is_nan
  use dim,         only:maxp,ncellsmax,minpart,use_apr,use_sinktree,maxptmass,maxpsph,gravity
@@ -570,7 +570,7 @@ subroutine active_leaves_of_tree(leaf_is_active,active_leaves,nactive,listed)
     enddo
     nlist(ic) = k
  enddo
- !$omp end do
+ !$omp enddo
  !$omp single
  do ic=1,nchunk
     nlist(ic) = nlist(ic) + nlist(ic-1)
@@ -586,7 +586,7 @@ subroutine active_leaves_of_tree(leaf_is_active,active_leaves,nactive,listed)
        endif
     enddo
  enddo
- !$omp end do
+ !$omp enddo
  !$omp end parallel
  nactive = nlist(nchunk)
  deallocate(nlist)
@@ -759,7 +759,7 @@ subroutine revise_tree(node,xyzh,np,leaf_is_active,ncells,time,use_bounds,revise
        enddo
        nlist(ic) = kk
     enddo
-    !$omp end do
+    !$omp enddo
     !$omp single
     do ic=1,nchunk
        nlist(ic) = nlist(ic) + nlist(ic-1)
@@ -775,7 +775,7 @@ subroutine revise_tree(node,xyzh,np,leaf_is_active,ncells,time,use_bounds,revise
           endif
        enddo
     enddo
-    !$omp end do
+    !$omp enddo
     !$omp end parallel
     nvisit = nlist(nchunk)
     deallocate(nlist)
@@ -830,7 +830,7 @@ subroutine revise_tree(node,xyzh,np,leaf_is_active,ncells,time,use_bounds,revise
           p = node(p)%parent
        enddo
     enddo
-    !$omp end do nowait
+    !$omp enddo nowait
     ! each thread's marked nodes placed in the list after those of the threads before it
     ! (a running total, rather than a critical section every thread would queue for)
     nthread_dirty(it+1) = nmy
@@ -870,7 +870,7 @@ subroutine revise_tree(node,xyzh,np,leaf_is_active,ncells,time,use_bounds,revise
        do j=merge(1,levstart(max(l-1,0))+1,l==0),levstart(l)
           call combine_children(node,bylevel(j))
        enddo
-       !$omp end do
+       !$omp enddo
     enddo
     !$omp end parallel
     deallocate(levstart,bylevel)
@@ -947,7 +947,7 @@ subroutine revise_all_leaves(node,xyzh,leaf_is_active,ncells,dfac,use_bounds,tim
           call combine_children(node,n)
        endif
     enddo
-    !$omp end do
+    !$omp enddo
  enddo
  !$omp single
  do l=ltop-1,0,-1

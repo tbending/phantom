@@ -21,7 +21,7 @@ module neighkdtree
 !   - tree_revise         : *update the tree in place between rebuilds*
 !
 ! :Dependencies: allocutils, boundary, dim, dtypekdtree, infile_utils, io,
-!   kdtree, kernel, mpiutils, part
+!   kdtree, kernel, mpiutils, part, timestep_ind
 !
  use dim,          only:ncellsmax,ncellsmaxglobal,gravity
  use dtypekdtree,  only:kdnode,lenfgrav
