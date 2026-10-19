@@ -213,18 +213,26 @@ end subroutine get_distance_from_centre_of_mass
 !  build the tree
 !+
 !-----------------------------------------------------------------------
-subroutine build_tree(npart,nactive,xyzh,vxyzu,for_apr)
- use io,           only:nprocs
- use kdtree,       only:maketree,maketreeglobal!,revtree
- use dim,          only:mpi,use_sinktree
+subroutine build_tree(npart,nactive,xyzh,vxyzu,for_apr,time,bounds_ok)
+ use io,           only:nprocs,iprint
+ use kdtree,       only:maketree,maketreeglobal,revise_tree,nleaves_visited
+ use dim,          only:mpi,use_sinktree,ind_timesteps,use_apr
  use part,         only:nptmass,xyzmh_ptmass,maxp
+ use timestep_ind, only:istepfrac
  use allocutils,   only:allocate_array
  integer, intent(inout) :: npart
  integer, intent(in)    :: nactive
  real,    intent(inout) :: xyzh(:,:)
  real,    intent(in)    :: vxyzu(:,:)
  logical, intent(in), optional :: for_apr
- logical :: apr_tree
+ real,    intent(in), optional :: time        ! current time: needed to revise the tree
+ logical, intent(in), optional :: bounds_ok   ! no sinks, external forces or damping: leaves
+                                              ! with only inactive particles need not be visited
+ logical :: apr_tree,revised,use_bounds
+ integer :: reason
+ integer, save :: revise_mode = -1   ! EXPERIMENT: env PHANTOM_REVISE_TREE 0 off, 1 on, 2 on + log
+ integer, save :: revise_levels = 4  ! EXPERIMENT: env PHANTOM_REVISE_LEVELS
+ character(len=8) :: envval
 
  apr_tree = .false.
  if (present(for_apr)) apr_tree = for_apr
@@ -250,13 +258,33 @@ subroutine build_tree(npart,nactive,xyzh,vxyzu,for_apr)
     if (use_sinktree) then
        call maketree(node,xyzh,npart,leaf_is_active,ncells,apr_tree,nptmass=nptmass,xyzmh_ptmass=xyzmh_ptmass)
     else
-       ! use revtree for small numbers of active particles to avoid tree rebuild overhead
-       ! threshold: use revtree if < 0.1% of total particles
-       !if (npart > 0 .and. nactive < 0.001*npart) then
-       !   call revtree(node,xyzh,leaf_is_active,ncells)
-       !else
-       call maketree(node,xyzh,npart,leaf_is_active,ncells,apr_tree)
-       !endif
+       !
+       ! with individual timesteps, update the tree in place when not every particle is
+       ! active (revise_tree says when it cannot, and the tree is rebuilt instead)
+       !
+       if (revise_mode < 0) then
+          revise_mode = 1
+          call get_environment_variable('PHANTOM_REVISE_TREE',envval)
+          if (len_trim(envval) > 0) read(envval,*) revise_mode
+          call get_environment_variable('PHANTOM_REVISE_LEVELS',envval)
+          if (len_trim(envval) > 0) read(envval,*) revise_levels
+       endif
+       revised = .false.
+       reason  = -1
+       !
+       ! the tree is never re-split between builds, so its nodes loosen as particles move:
+       ! rebuild fully whenever the particles revise_levels timestep levels above the
+       ! shortest are active (every 2**revise_levels substeps), as well as when all are
+       !
+       if (ind_timesteps .and. .not.apr_tree .and. .not.use_apr .and. nactive < npart .and. &
+           revise_mode > 0 .and. present(time) .and. mod(istepfrac,2**revise_levels) /= 0) then
+          use_bounds = .false.
+          if (present(bounds_ok)) use_bounds = bounds_ok .and. revise_mode /= 3   ! EXPERIMENT: 3 = phase 1
+          call revise_tree(node,xyzh,npart,leaf_is_active,ncells,time,use_bounds,revised,reason)
+       endif
+       if (.not.revised) call maketree(node,xyzh,npart,leaf_is_active,ncells,apr_tree)
+       if (revise_mode >= 2) write(iprint,"(a,l2,a,i3,a,i9,a,i9,a,i9)") ' REVISE ',revised,' reason',reason,&
+                                    ' nactive',nactive,' npart',npart,' visited',nleaves_visited
     endif
  endif
  call list_active_leaves()
@@ -977,8 +1005,9 @@ end subroutine open_nodes
 !+
 !----------------------------------------------------------------
 subroutine cache_neighbours(nneigh,isrc,ixyzcachesize,maxcache,listneigh,xyzcache,xoffset,yoffset,zoffset)
- use part, only:rho,gradh,treecache
- use dim,  only:igradomega,igradzeta,maxpsph
+ use part,   only:rho,gradh,treecache,xyzh
+ use dim,    only:igradomega,igradzeta,maxpsph
+ use kdtree, only:all_fresh
 #ifdef GRAVITY
  use dim,  only:igradsoft
 #endif
@@ -988,8 +1017,12 @@ subroutine cache_neighbours(nneigh,isrc,ixyzcachesize,maxcache,listneigh,xyzcach
  integer, intent(out)   :: listneigh(:)
  real,    intent(out)   :: xyzcache(:,:)
  integer :: npnode,ipart,num_to_cache,ip,inode
+ logical :: fresh
 
  npnode = inoderange(2,isrc) - inoderange(1,isrc) + 1
+ ! after a revision, treecache is current only for the leaves it visited: read the
+ ! others' positions and h from xyzh (their masses in treecache do not change)
+ fresh = all_fresh
 
  if (nneigh + npnode <= ixyzcachesize) then
     num_to_cache = npnode
@@ -1004,11 +1037,16 @@ subroutine cache_neighbours(nneigh,isrc,ixyzcachesize,maxcache,listneigh,xyzcach
        inode = inoderange(1,isrc)+ipart-1
        ip = abs(inodeparts(inode))
        listneigh(nneigh+ipart)  = ip
-       xyzcache(1,nneigh+ipart) = treecache(1,inode) + xoffset
-       xyzcache(2,nneigh+ipart) = treecache(2,inode) + yoffset
-       xyzcache(3,nneigh+ipart) = treecache(3,inode) + zoffset
-       if (maxcache >= 4) then
-          xyzcache(ih1,nneigh+ipart) = 1./treecache(4,inode)
+       if (fresh) then
+          xyzcache(1,nneigh+ipart) = treecache(1,inode) + xoffset
+          xyzcache(2,nneigh+ipart) = treecache(2,inode) + yoffset
+          xyzcache(3,nneigh+ipart) = treecache(3,inode) + zoffset
+          if (maxcache >= 4) xyzcache(ih1,nneigh+ipart) = 1./treecache(4,inode)
+       else
+          xyzcache(1,nneigh+ipart) = xyzh(1,ip) + xoffset
+          xyzcache(2,nneigh+ipart) = xyzh(2,ip) + yoffset
+          xyzcache(3,nneigh+ipart) = xyzh(3,ip) + zoffset
+          if (maxcache >= 4) xyzcache(ih1,nneigh+ipart) = 1./xyzh(4,ip)
        endif
        if (maxcache >= 5) then
           xyzcache(im,nneigh+ipart) = treecache(5,inode)

@@ -60,7 +60,9 @@ subroutine derivs(icall,npart,nactive,xyzh,vxyzu,fxyzu,fext,divcurlv,divcurlB,&
  use cons2prim,      only:cons2primall,cons2prim_everything
  use metric_tools,   only:init_metric
  use radiation_implicit, only:do_radiation_implicit,ierr_failed_to_converge
- use options,        only:implicit_radiation,implicit_radiation_store_drad,use_porosity,need_pressure_on_sinks
+ use options,        only:implicit_radiation,implicit_radiation_store_drad,use_porosity,need_pressure_on_sinks,&
+                           iexternalforce
+ use damping,        only:idamp
  use HIIRegion,      only:HIIupdateflag,iH2R,HII_feedback
  integer,         intent(in)    :: icall
  integer,         intent(inout) :: npart
@@ -111,7 +113,8 @@ subroutine derivs(icall,npart,nactive,xyzh,vxyzu,fxyzu,fext,divcurlv,divcurlB,&
 ! build tree to prepare neighbour finding
 !
  if (icall==1 .or. icall==0) then
-    call build_tree(npart,nactive,xyzh,vxyzu)
+    call build_tree(npart,nactive,xyzh,vxyzu,time=time,&
+                    bounds_ok=(nptmass == 0 .and. iexternalforce <= 0 .and. idamp == 0))
 
     if (gr) then
        ! update time-dependent metric (e.g. binary BH) and repack at particle positions
