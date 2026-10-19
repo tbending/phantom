@@ -119,7 +119,9 @@ module gpu_arrays
  integer, parameter, public :: ibun_dvdx     = 12  ! velocity gradient tensor, device only
  integer, parameter, public :: ibun_dragold  = 13  ! previous pass's drag ax, ay, az (implicit drag)
  integer, parameter, public :: ibun_active   = 14  ! 1 active / 0 inactive (individual timesteps)
- integer, parameter, public :: nbundle       = 14
+ integer, parameter, public :: ibun_indts_in = 15  ! rho, zeta/Omega, ibin_old (individual timesteps)
+ integer, parameter, public :: ibun_indts_out= 16  ! neighbour ibin_old max, wake flag (individual timesteps)
+ integer, parameter, public :: nbundle       = 16
 
  type :: bundle_t
     character(len=10) :: name  = ''
@@ -303,6 +305,13 @@ subroutine gpu_arrays_init(n)
  !  the solve iterates those alone.  Phantom order, sent with the positions before the
  !  solve sorts them, never fetched back.  A double per particle for now: one slot type.
  bundle(ibun_active)   = bundle_t('active',   1, idir_up,     ind_timesteps)
+ !--and the force pass: an inactive particle enters as a neighbour with the rho and
+ !  zeta/Omega phantom stored at its last active step (the solve did not form them),
+ !  and every particle's ibin_old feeds the Saitoh-Makino limiter.  Back come, per
+ !  active particle, its neighbours' largest ibin_old, and per particle whether it is
+ !  a neighbour of an active one (force.F90's ibin_wake trigger).
+ bundle(ibun_indts_in) = bundle_t('indts_in', 3, idir_up,     ind_timesteps)
+ bundle(ibun_indts_out)= bundle_t('indts_out',2, idir_down,   ind_timesteps)
 
  !--lay the live bundles out end to end.  device_only rows take no arena space.
  off = 1

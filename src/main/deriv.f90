@@ -45,7 +45,8 @@ subroutine derivs(icall,npart,nactive,xyzh,vxyzu,fxyzu,fext,divcurlv,divcurlB,&
  use densityforce,   only:densityiterate
  use gpu_dens_iface,  only:densityiterate_gpu,use_gpu_dens,init_gpu_switch,xi_gpu
  use gpu_dens_iface,  only:gpu_dens_mirror,gpu_dens_mirror_before,gpu_dens_mirror_after
- use gpu_force_iface, only:force_gpu
+ use gpu_force_iface, only:force_gpu,gpu_force_mirror_before,gpu_force_mirror_after
+ use gpu_dens_iface,  only:gpu_force_mirror
  use ptmass,         only:ipart_rhomax,ptmass_calc_enclosed_mass,ptmass_boundary_crossing,get_pressure_on_sinks
  use externalforces, only:externalforce
  use part,           only:dustgasprop,Vrel_disp,dvdx,Bxyz,set_boundaries_to_active,&
@@ -211,9 +212,13 @@ subroutine derivs(icall,npart,nactive,xyzh,vxyzu,fxyzu,fext,divcurlv,divcurlB,&
  if (use_gpu_dens) then
     call force_gpu(npart,xyzh,vxyzu,eos_vars,alphaind,fxyzu,divcurlv,dt)
  else
+    !--(DEV HATCH, Phase 1.2: COSMO_FORCE_MIRROR runs the GPU force alongside)
+    if (gpu_force_mirror .and. icall==1) &
+       call gpu_force_mirror_before(npart,xyzh,vxyzu,eos_vars,alphaind,fxyzu,divcurlv,dt)
     call force(icall,npart,xyzh,vxyzu,fxyzu,divcurlv,divcurlB,Bevol,dBevol,&
                rad,drad,radprop,dustprop,dustgasprop,Vrel_disp,dustfrac,ddustevol,fext,fxyz_drag,&
                ipart_rhomax,dt,stressmax,eos_vars,dens,metrics,apr_level)
+    if (gpu_force_mirror .and. icall==1) call gpu_force_mirror_after(npart,xyzh,fxyzu,divcurlv)
  endif
  call do_timing('force',tlast,tcpulast)
 

@@ -98,6 +98,9 @@ module gpu_dens_iface
  !  CPU one on the same inputs, every derivs, and compares them per particle.  The run
  !  itself stays on the CPU path.
  logical, public :: gpu_dens_mirror = .false.
+ !--and COSMO_FORCE_MIRROR=1 (implies the density one, whose solve the GPU force needs)
+ !  does the same for the force pass (gpu_force_iface gpu_force_mirror_*)
+ logical, public :: gpu_force_mirror = .false.
  real,         allocatable :: mir_h0(:),mir_rho0(:),mir_hg(:),mir_rhog(:)
  real(kind=4), allocatable :: mir_gradh0(:,:),mir_divv0(:),mir_alpha0(:)
  real(kind=4), allocatable :: mir_gradhg(:,:),mir_divvg(:),mir_alphag(:)
@@ -140,6 +143,10 @@ subroutine init_gpu_switch()
  write(iprint,'(a,l1)') ' cosmoSPHere: use_gpu_dens = ',use_gpu_dens
  call get_environment_variable('COSMO_DENS_MIRROR',val,ln,ierr)
  gpu_dens_mirror = (ierr == 0 .and. ln > 0 .and. .not.use_gpu_dens)
+ call get_environment_variable('COSMO_FORCE_MIRROR',val,ln,ierr)
+ gpu_force_mirror = (ierr == 0 .and. ln > 0 .and. .not.use_gpu_dens)
+ if (gpu_force_mirror) gpu_dens_mirror = .true.
+ if (gpu_force_mirror) write(iprint,'(a)') ' cosmoSPHere: COSMO_FORCE_MIRROR, GPU force checked against the CPU'
  if (gpu_dens_mirror) write(iprint,'(a)') ' cosmoSPHere: COSMO_DENS_MIRROR, GPU density checked against the CPU'
 #endif
 

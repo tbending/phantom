@@ -38,13 +38,14 @@ module gpu_force_iface
  use gpu_arrays,    only:gpu_arrays_init,gpu_arrays_comp,gpu_arrays_claim_packed, &
                          gpu_arrays_upload, &
                          gpu_arrays_download, &
-                         ibun_vel,ibun_thermo,ibun_force_out,ibun_drag_out,ibun_dragold
+                         ibun_vel,ibun_thermo,ibun_force_out,ibun_drag_out,ibun_dragold, &
+                         ibun_indts_in,ibun_indts_out
  implicit none
 
 #ifdef GPU
  interface
     subroutine force_gpu_c(n,pmass,beta,alphau,disc_viscosity, &
-                         pdv_heating,shock_heating,idrag,dust,drag_tally) bind(C)
+                         pdv_heating,shock_heating,idrag,dust,drag_tally,use_active,has_u) bind(C)
     use iso_c_binding, only:c_double,c_int,c_long_long
 
     integer(c_int), value       :: n
@@ -56,12 +57,24 @@ module gpu_force_iface
     integer(c_int), value       :: idrag             ! 0: no two-fluid drag
     real(c_double), intent(in)  :: dust(11)          ! see dust_params below
     integer(c_long_long), intent(out) :: drag_tally(3)  ! drag, Stokes, supersonic pairs
+    integer(c_int), value       :: use_active        ! individual timesteps
+    integer(c_int), value       :: has_u             ! maxvxyzu >= 4 (force.F90 usej)
     end subroutine force_gpu_c
 
  end interface
 #endif
 
  public :: force_gpu
+ public :: gpu_force_mirror_before, gpu_force_mirror_after
+
+ !--DEV HATCH (GPU_IND_TIMESTEPS_PLAN Phase 1.2, removed before the phase's last
+ !  commit): COSMO_FORCE_MIRROR=1 with COSMO_GPU=0 runs force_gpu beside the CPU force
+ !  on the same inputs at every derivs and compares; the run stays on the CPU path.
+ real,            allocatable :: fmir_f0(:,:),fmir_fg(:,:)
+ real(kind=4),    allocatable :: fmir_dv0(:),fmir_dvg(:)
+ integer(kind=1), allocatable :: fmir_bin0(:),fmir_bing(:),fmir_wake0(:),fmir_wakeg(:)
+ integer(kind=1), save :: fmir_nbinmax0,fmir_nbinmaxg
+ integer, save :: fmir_ncall = 0
  private
 
 contains
@@ -76,7 +89,8 @@ subroutine force_gpu(npart,xyzh,vxyzu,eos_vars,alphaind,fxyzu,divcurlv,dt)
  use part,    only:massoftype,igas
  use options, only:beta,alphau
  use dim,     only:maxvxyzu,driving,disc_viscosity,track_lum,h2chemistry,store_dust_temperature
- use dim,     only:ind_timesteps
+ use dim,     only:ind_timesteps,igradzeta,igradomega
+ use part,    only:gradh,ibin_old,iactive
  use io,      only:fatal
  use part,    only:ien_type,ien_entropy,ien_entropy_s,rho,isdead_or_accreted
  use eos,     only:icooling,ipdv_heating,ishock_heating
@@ -112,6 +126,7 @@ subroutine force_gpu(npart,xyzh,vxyzu,eos_vars,alphaind,fxyzu,divcurlv,dt)
  real(c_double), pointer, contiguous :: vsigmax8(:),divv8(:)
  real(c_double), pointer, contiguous :: fdx8(:),fdy8(:),fdz8(:),tsmin8(:)
  real(c_double), pointer, contiguous :: fdox8(:),fdoy8(:),fdoz8(:)
+ real(c_double), pointer, contiguous :: rhoh8(:),zo8(:),ibo8(:),ibn8(:),touch8(:)
  real(c_double)       :: dust_params(11)
  integer(c_long_long) :: drag_tally(3)
  integer(c_int)       :: idrag_gpu
@@ -127,9 +142,8 @@ subroutine force_gpu(npart,xyzh,vxyzu,eos_vars,alphaind,fxyzu,divcurlv,dt)
 
  if (npart <= 0) return
 
- !--the density pass honours phantom's activity; this one does not yet (it would
- !  overwrite the inactive particles' forces and set no timestep bins)
- if (ind_timesteps) call fatal('force_gpu','individual timesteps not supported on the GPU force pass yet')
+ !--two-fluid dust under individual timesteps needs activity in the drag pass too
+ if (ind_timesteps .and. use_dust) call fatal('force_gpu','two-fluid dust with individual timesteps not supported on GPU yet')
 
  !--two-fluid dust: gas-dust drag, explicit or implicit (drag_implicit), with or without
  !  reconstruction (irecon), as force.F90; idrag = 0 would still need the gas-dust pairs
@@ -203,6 +217,24 @@ subroutine force_gpu(npart,xyzh,vxyzu,eos_vars,alphaind,fxyzu,divcurlv,dt)
 
  call gpu_arrays_upload(ibun_thermo,npart)
 
+ !--individual timesteps: the solve formed rho and gradh for the active particles
+ !  only.  An inactive one enters the force sum as force.F90 reads it, with the rho
+ !  and zeta/Omega (zetaomegaj) of its last active step; and ibin_old feeds the limiter.
+ if (ind_timesteps) then
+    rhoh8 => gpu_arrays_comp(ibun_indts_in,1)
+    zo8   => gpu_arrays_comp(ibun_indts_in,2)
+    ibo8  => gpu_arrays_comp(ibun_indts_in,3)
+    !$omp parallel do default(none) schedule(static) private(i) &
+    !$omp shared(npart,rho,gradh,ibin_old,rhoh8,zo8,ibo8)
+    do i = 1,npart
+       rhoh8(i) = real(rho(i),kind=c_double)
+       zo8(i)   = real(real(gradh(igradzeta,i))*real(gradh(igradomega,i)),kind=c_double)
+       ibo8(i)  = real(ibin_old(i),kind=c_double)
+    enddo
+    !$omp end parallel do
+    call gpu_arrays_upload(ibun_indts_in,npart)
+ endif
+
  !--implicit drag, as force.F90: this pass reads the drag acceleration of the previous
  !  one, so keep it as fxyz_dragold and send it; fxyz_drag is refilled after the pass
  if (use_dust .and. drag_implicit) then
@@ -240,13 +272,19 @@ subroutine force_gpu(npart,xyzh,vxyzu,eos_vars,alphaind,fxyzu,divcurlv,dt)
                   real(alphau,kind=c_double),           &
                   merge(1_c_int,0_c_int,disc_viscosity), &
                   int(ipdv_heating,kind=c_int),int(ishock_heating,kind=c_int), &
-                  idrag_gpu,dust_params,drag_tally)
+                  idrag_gpu,dust_params,drag_tally,merge(1_c_int,0_c_int,ind_timesteps), &
+                  merge(1_c_int,0_c_int,maxvxyzu >= 4))
 
  !--the pass leaves its results on the device; fetch them
  call system_clock(ic2)
 
  call gpu_arrays_download(ibun_force_out,npart)
  if (use_dust) call gpu_arrays_download(ibun_drag_out,npart)
+ if (ind_timesteps) then
+    call gpu_arrays_download(ibun_indts_out,npart)
+    ibn8   => gpu_arrays_comp(ibun_indts_out,1)
+    touch8 => gpu_arrays_comp(ibun_indts_out,2)
+ endif
 
  call system_clock(ic3)
 
@@ -257,6 +295,10 @@ subroutine force_gpu(npart,xyzh,vxyzu,eos_vars,alphaind,fxyzu,divcurlv,dt)
  !$omp shared(npart,fxyzu,divcurlv,fx8,fy8,fz8,f48,divv8,iphase,fdx8,fdy8,fdz8,tsmin8,tstop,xyzh) &
  !$omp shared(fxyz_drag,drag_implicit,ndusttypes)
  do i = 1,npart
+    !--individual timesteps: as force.F90, only the active particles get a new force
+    if (ind_timesteps) then
+       if (.not.iactive(iphase(i))) cycle
+    endif
     if (driving) then
        fxyzu(1,i) = fxyzu(1,i) + real(fx8(i),kind=kind(fxyzu))
        fxyzu(2,i) = fxyzu(2,i) + real(fy8(i),kind=kind(fxyzu))
@@ -297,6 +339,9 @@ subroutine force_gpu(npart,xyzh,vxyzu,eos_vars,alphaind,fxyzu,divcurlv,dt)
     !$omp shared(npart,xyzh,vxyzu,fxyzu,divcurlv,rho,dt,iphase)
     do i = 1,npart
        if (isdead_or_accreted(xyzh(4,i))) cycle
+       if (ind_timesteps) then
+          if (.not.iactive(iphase(i))) cycle
+       endif
        !--as force.F90, cooling is for gas
        if (use_dust) then
           if (iamtype(iphase(i)) /= igas) cycle
@@ -308,8 +353,13 @@ subroutine force_gpu(npart,xyzh,vxyzu,eos_vars,alphaind,fxyzu,divcurlv,dt)
     !$omp end parallel do
  endif
 
- call finish_gpu_force_timesteps(npart,xyzh,vxyzu,fxyzu, &
-                                 fx8,fy8,fz8,vsigmax8,spsound_8,tsmin8)
+ if (ind_timesteps) then
+    call finish_gpu_force_bins(npart,xyzh,vxyzu,fxyzu, &
+                               fx8,fy8,fz8,vsigmax8,spsound_8,ibn8,touch8)
+ else
+    call finish_gpu_force_timesteps(npart,xyzh,vxyzu,fxyzu, &
+                                    fx8,fy8,fz8,vsigmax8,spsound_8,tsmin8)
+ endif
 
  !--as force.F90: the share of drag pairs in the Stokes and supersonic Epstein regimes
  if (use_dust) then
@@ -505,5 +555,205 @@ subroutine finish_gpu_force_timesteps(npart,xyzh,vxyzu,fxyzu, &
  if (ndustres > 0) call summary_variable('dust',iosumdgr,ndustres,dustresfacmean/real(ndustres),dustresfacmax)
 
 end subroutine finish_gpu_force_timesteps
+
+!-----------------------------------------------------------------------
+!+
+!  Individual timesteps: the new bin of every active particle from the
+!  GPU results, and the wake flags, as force.F90 (IND_TIMESTEPS) does it
+!  per particle: the Courant and force timesteps, get_newbin, the
+!  Saitoh-Makino limiter against the neighbours' ibin_old, the new
+!  nbinmax; and ibin_wake on every neighbour of an active particle.
+!  Gas only: two-fluid dust is refused with individual timesteps.
+!+
+!-----------------------------------------------------------------------
+subroutine finish_gpu_force_bins(npart,xyzh,vxyzu,fxyzu, &
+                                 fx8,fy8,fz8,vsigmax8,spsound_8,ibn8,touch8)
+ use options,      only:alpha
+ use timestep,     only:C_cour,C_force,bignumber,dtmax,dtrad
+ use timestep_ind, only:nbinmax,ibinnow,get_newbin
+ use part,         only:isdead_or_accreted,iphase,iactive,ibin,ibin_wake
+ use dim,          only:maxvxyzu,gr
+ use eos,          only:ieos
+ use io,           only:fatal
+
+ integer,        intent(in)    :: npart
+ real,           intent(in)    :: xyzh(:,:),vxyzu(:,:)
+ real,           intent(inout) :: fxyzu(:,:)
+ real(c_double), intent(in)    :: fx8(:),fy8(:),fz8(:),vsigmax8(:),spsound_8(:)
+ real(c_double), intent(in)    :: ibn8(:),touch8(:)
+
+ integer           :: i,nbinmaxnew,ncheckbin
+ integer(kind=1)   :: ibinnow_m1
+ real              :: hi,vsigdtc,f2i,dtc,dtf,dti,dtitmp,eni
+ character(len=16) :: dtchar
+ logical           :: limit_u
+
+ dtrad      = bignumber
+ ibinnow_m1 = ibinnow - 1_1
+ nbinmaxnew = 0
+ ncheckbin  = 0
+ !--as force.F90: du/dt is limited so a Courant step cannot make u negative
+ limit_u = (maxvxyzu >= 4 .and. .not.gr .and. ieos /= 23)
+
+ !$omp parallel do default(none) schedule(static) &
+ !$omp private(i,hi,vsigdtc,f2i,dtc,dtf,dti,dtitmp,eni,dtchar) &
+ !$omp shared(npart,xyzh,vxyzu,fxyzu,limit_u,fx8,fy8,fz8,vsigmax8,spsound_8,ibn8,touch8) &
+ !$omp shared(dtmax,C_cour,C_force,alpha,iphase,ibin,ibin_wake,ibinnow_m1) &
+ !$omp reduction(max:nbinmaxnew) reduction(+:ncheckbin)
+ do i = 1,npart
+    hi = xyzh(4,i)
+    if (isdead_or_accreted(hi)) cycle
+    !--force.F90: every neighbour j of an active particle, active or not, gets
+    !  ibin_wake(j) = max(ibinnow-1, ibin_wake(j)); the corrector wakes it if needed
+    if (touch8(i) > 0.5_c_double) ibin_wake(i) = max(ibinnow_m1,ibin_wake(i))
+    if (.not.iactive(iphase(i))) cycle
+
+    !--Courant, as force.F90 for gas
+    dtc = dtmax
+    vsigdtc = max(vsigmax8(i),spsound_8(i))
+    if (vsigdtc > tiny(vsigdtc)) dtc = C_cour*hi/(vsigdtc*max(alpha,1.0))
+    if (limit_u) then
+       eni = vxyzu(4,i)
+       if (eni + dtc*fxyzu(4,i) < epsilon(0.) .and. eni > epsilon(0.)) then
+          fxyzu(4,i) = fxyzu(4,i)/(1.-dtc*fxyzu(4,i)/eni)
+       endif
+    endif
+    dti = dtc
+    if (dtc < tiny(dtc) .or. dtc > huge(dtc)) call fatal('force_gpu','invalid dtc',var='dtc',val=dtc)
+
+    !--force condition, from the SPH force alone, as force.F90
+    f2i = fx8(i)*fx8(i) + fy8(i)*fy8(i) + fz8(i)*fz8(i)
+    dtf = bignumber
+    if (abs(f2i) > epsilon(f2i)) dtf = C_force*sqrt(hi/sqrt(f2i))
+
+    !--the new timestep for particle i (the other constraints of force.F90 belong to
+    !  physics the GPU path refuses, so they are all bignumber)
+    dtitmp = dtf
+    if (dtitmp < dti + tiny(dtitmp) .and. dtitmp < dtmax) then
+       dti = dtitmp
+       if (dti < tiny(dti) .or. dti > huge(dti)) call fatal('force_gpu','invalid dti',var='dti',val=dti)
+       dtchar = 'dt_gasforce'
+    else
+       dtchar = 'dt_courant'
+    endif
+    !--allow_decrease = (icall < 2) in force.F90; the GPU path runs force with icall = 1
+    call get_newbin(dti,dtmax,ibin(i),.true.,dtchar=dtchar)
+    !--Saitoh-Makino limiter: no more than one bin away from the neighbours
+    ibin(i) = max(ibin(i),int(nint(ibn8(i)),kind=1)-1_1)
+    nbinmaxnew = max(nbinmaxnew,int(ibin(i)))
+    ncheckbin  = ncheckbin + 1
+ enddo
+ !$omp end parallel do
+
+ !--as force.F90: no active particle checked (all dead or inactive) keeps nbinmax
+ if (ncheckbin == 0) nbinmaxnew = nbinmax
+ nbinmax = int(nbinmaxnew,kind=1)
+
+end subroutine finish_gpu_force_bins
+
+!-----------------------------------------------------------------------
+!+
+!  DEV HATCH, Phase 1.2: before the CPU force, run force_gpu on the same
+!  inputs (it needs the GPU density solve of this step, which the density
+!  mirror ran), keep its results, and put back what it changed.
+!+
+!-----------------------------------------------------------------------
+subroutine gpu_force_mirror_before(npart,xyzh,vxyzu,eos_vars,alphaind,fxyzu,divcurlv,dt)
+ use part,         only:ibin,ibin_wake
+ use timestep_ind, only:nbinmax
+ integer,      intent(in)    :: npart
+ real,         intent(in)    :: xyzh(:,:),vxyzu(:,:),eos_vars(:,:)
+ real(kind=4), intent(in)    :: alphaind(:,:)
+ real,         intent(inout) :: fxyzu(:,:)
+ real(kind=4), intent(inout) :: divcurlv(:,:)
+ real,         intent(in)    :: dt
+ integer :: nf
+
+ nf = size(fxyzu,1)
+ if (allocated(fmir_f0)) then
+    if (size(fmir_f0,2) < npart) deallocate(fmir_f0,fmir_fg,fmir_dv0,fmir_dvg,fmir_bin0,fmir_bing, &
+                                            fmir_wake0,fmir_wakeg)
+ endif
+ if (.not.allocated(fmir_f0)) allocate(fmir_f0(nf,npart),fmir_fg(nf,npart),fmir_dv0(npart),fmir_dvg(npart), &
+                                       fmir_bin0(npart),fmir_bing(npart),fmir_wake0(npart),fmir_wakeg(npart))
+ fmir_f0(:,1:npart) = fxyzu(:,1:npart)
+ fmir_dv0(1:npart)  = divcurlv(1,1:npart)
+ fmir_bin0(1:npart) = ibin(1:npart)
+ fmir_wake0(1:npart)= ibin_wake(1:npart)
+ fmir_nbinmax0      = nbinmax
+
+ call force_gpu(npart,xyzh,vxyzu,eos_vars,alphaind,fxyzu,divcurlv,dt)
+
+ fmir_fg(:,1:npart) = fxyzu(:,1:npart)
+ fmir_dvg(1:npart)  = divcurlv(1,1:npart)
+ fmir_bing(1:npart) = ibin(1:npart)
+ fmir_wakeg(1:npart)= ibin_wake(1:npart)
+ fmir_nbinmaxg      = nbinmax
+
+ fxyzu(:,1:npart)    = fmir_f0(:,1:npart)
+ divcurlv(1,1:npart) = fmir_dv0(1:npart)
+ ibin(1:npart)       = fmir_bin0(1:npart)
+ ibin_wake(1:npart)  = fmir_wake0(1:npart)
+ nbinmax             = fmir_nbinmax0
+
+end subroutine gpu_force_mirror_before
+
+!-----------------------------------------------------------------------
+!+
+!  DEV HATCH, Phase 1.2: after the CPU force, compare.  One line per call,
+!  COSMO_FORCE_MIRROR: over the active live particles, rms |f_gpu - f_cpu|
+!  over rms |f_cpu| (SPH force, x,y,z), the same for du/dt when there is u,
+!  and for div v; how many active particles got a different new ibin, and
+!  how many particles a different ibin_wake; both nbinmax; and how many
+!  inactive particles either pass changed (force or bins), which must be 0.
+!+
+!-----------------------------------------------------------------------
+subroutine gpu_force_mirror_after(npart,xyzh,fxyzu,divcurlv)
+ use part,         only:ibin,ibin_wake,iphase,iactive,isdead_or_accreted
+ use timestep_ind, only:nbinmax
+ use io,           only:iprint
+ integer,      intent(in) :: npart
+ real,         intent(in) :: xyzh(:,:),fxyzu(:,:)
+ real(kind=4), intent(in) :: divcurlv(:,:)
+ integer :: i,nact,nbin,nwake,ntouch_gpu,ntouch_cpu,nf
+ real    :: sdf,sf,sdu,su,sdv,sv
+
+ nf = size(fxyzu,1)
+ nact = 0; nbin = 0; nwake = 0; ntouch_gpu = 0; ntouch_cpu = 0
+ sdf = 0.; sf = 0.; sdu = 0.; su = 0.; sdv = 0.; sv = 0.
+ !$omp parallel do default(none) private(i) &
+ !$omp shared(npart,nf,xyzh,fxyzu,divcurlv,ibin,ibin_wake,iphase,fmir_f0,fmir_fg,fmir_dv0,fmir_dvg) &
+ !$omp shared(fmir_bin0,fmir_bing,fmir_wake0,fmir_wakeg) &
+ !$omp reduction(+:nact,nbin,nwake,ntouch_gpu,ntouch_cpu,sdf,sf,sdu,su,sdv,sv)
+ do i = 1, npart
+    if (isdead_or_accreted(xyzh(4,i))) cycle
+    if (fmir_wakeg(i) /= ibin_wake(i)) nwake = nwake + 1
+    if (iactive(iphase(i))) then
+       nact = nact + 1
+       sdf = sdf + sum((fmir_fg(1:3,i) - fxyzu(1:3,i))**2)
+       sf  = sf  + sum(fxyzu(1:3,i)**2)
+       if (nf >= 4) then
+          sdu = sdu + (fmir_fg(4,i) - fxyzu(4,i))**2
+          su  = su  + fxyzu(4,i)**2
+       endif
+       sdv = sdv + (real(fmir_dvg(i)) - real(divcurlv(1,i)))**2
+       sv  = sv  + real(divcurlv(1,i))**2
+       if (fmir_bing(i) /= ibin(i)) nbin = nbin + 1
+    else
+       if (any(fmir_fg(:,i) /= fmir_f0(:,i)) .or. fmir_dvg(i) /= fmir_dv0(i) .or. &
+           fmir_bing(i) /= fmir_bin0(i)) ntouch_gpu = ntouch_gpu + 1
+       if (any(fxyzu(:,i) /= fmir_f0(:,i)) .or. divcurlv(1,i) /= fmir_dv0(i) .or. &
+           ibin(i) /= fmir_bin0(i)) ntouch_cpu = ntouch_cpu + 1
+    endif
+ enddo
+ !$omp end parallel do
+ fmir_ncall = fmir_ncall + 1
+ write(iprint,'(a,i6,a,i10,3(a,es9.2),a,i8,a,i8,a,2i4,a,2i8)') &
+    ' COSMO_FORCE_MIRROR call',fmir_ncall,' active',nact, &
+    ' df',sqrt(sdf/max(sf,tiny(sf))),' ddudt',sqrt(sdu/max(su,tiny(su))), &
+    ' ddivv',sqrt(sdv/max(sv,tiny(sv))),' ibin_differ',nbin,' wake_differ',nwake, &
+    ' nbinmax gpu/cpu',int(fmir_nbinmaxg),int(nbinmax),' inactive_touched gpu/cpu',ntouch_gpu,ntouch_cpu
+
+end subroutine gpu_force_mirror_after
 
 end module gpu_force_iface
