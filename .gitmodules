@@ -5,4 +5,4 @@
 [submodule "cosmoSPHere"]
 	path = cosmoSPHere
 	url = git@github.com:tbending/cosmoSPHere.git
-	branch = phantom
+	branch = main
