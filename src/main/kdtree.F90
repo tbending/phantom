@@ -341,13 +341,20 @@ end subroutine maketree
 !  The queue loop in maketree constructs these nodes one at a time, and although
 !  the centre of mass and size loops are parallel, the partition that splits each
 !  node's particles runs on one thread.  That is log2(nthreads) serial passes over
-!  every particle, which grows with the thread count.  Here each node's particles
-!  are cut into chunks, the node's share of the threads, and the
-!  node construction runs over all chunks of all nodes at once: sums per chunk,
-!  combined per node, then a stable two-pass partition into a scratch buffer, which
-!  then becomes the particle list (the arrays are swapped rather than copied back).
-!  The nodes are those construct_node would give, bar round-off in the sums, but
-!  the order of particles within each child differs.
+!  every particle, which grows with the thread count.  Here every thread keeps its
+!  own share of the particles through all the levels: at the root each takes one
+!  piece of the particle list, and at each level it splits its piece of every node
+!  into a left and a right piece (a stable partition into a scratch buffer, which
+!  then becomes the particle list: the arrays are swapped rather than copied back),
+!  which are its pieces of the two children at the next level.  So a thread only
+!  ever reads particles it has written itself (reading what other cores have just
+!  written is slow on many cores), and every thread has the same number of
+!  particles at every level.  Per level: one pass for each node's size, hmax and
+!  the count to the left of its pivot, and one for the partition, which also sums
+!  the children's centres of mass and bounding boxes (only the root needs a pass
+!  of its own for its centre of mass).  The nodes are those construct_node would
+!  give, bar round-off in the sums, but the order of particles within each child
+!  differs.
 !
 !  On entry queue(1:istack) holds one level of the tree (the root).  Returns once
 !  istack >= nqueue, or earlier, leaving a consistent queue for the serial loop in
@@ -355,6 +362,7 @@ end subroutine maketree
 !+
 !--------------------------------------------------------------------------------
 subroutine build_top_parallel(node,queue,istack,nqueue,leaf_is_active)
+!$ use omp_lib, only:omp_get_thread_num,omp_get_num_threads
  use part,      only:massoftype,igas,npartoftype
  use dim,       only:maxtypes
  use io,        only:fatal
@@ -363,13 +371,13 @@ subroutine build_top_parallel(node,queue,istack,nqueue,leaf_is_active)
  integer,            intent(inout) :: istack
  integer,            intent(in)    :: nqueue
  integer,            intent(inout) :: leaf_is_active(:)
- integer, allocatable :: cnode(:),chunkl(:),chunkr(:),cnl(:),coffl(:),coffr(:)
- integer, allocatable :: nodecl(:),nodecr(:),jnl(:),nodeax(:),chunk(:)
+ ! piece c = (j-1)*nt + t + 1 is thread t's share of node j: chunkl(c) to chunkr(c) in
+ ! the particle list (empty if chunkr < chunkl), and nextl/nextr the same for the next level
+ integer, allocatable :: chunkl(:),chunkr(:),cnl(:),coffl(:),coffr(:),nextl(:),nextr(:)
+ integer, allocatable :: jnl(:),nodeax(:)
  logical, allocatable :: jdegen(:)
- real,    allocatable :: psum(:,:),phm(:),pr2(:),pbox(:,:),nodecom(:,:),nodecog(:,:),remain(:)
+ real,    allocatable :: psum(:,:),phm(:),pr2(:),pbox(:,:),nodecom(:,:),nodecog(:,:)
  real,    allocatable :: psl(:,:),psr(:,:),csum(:,:),nsum(:,:)
- logical :: have_sums
- real    :: sl(4),sr(4)
 #ifdef GRAVITY
  real,    allocatable :: pmom(:,:)
  real    :: quads(6),octs(10)
@@ -377,9 +385,9 @@ subroutine build_top_parallel(node,queue,istack,nqueue,leaf_is_active)
  type(kdbuildstack), allocatable :: newq(:)
  real,    allocatable :: tcswap(:,:)
  integer, allocatable :: ipswap(:)
- integer :: kmax,cmax,k,j,c,m,ncj,nchunk,i,i1,n,nl,pl,pr,iax,nnode,il,ir,isplit
- integer(kind=8) :: ntot
- real    :: pmassi,dfac,fac,sx,sy,sz,sm,hm,r2,dx,dy,dz,xpiv,totmass,x0(3),bl(6),br(6),share
+ integer :: kmax,pmax,k,j,c,i,i1,n,nl,pl,pr,iax,nnode,il,ir,isplit,nt,t,it,nteam,nr
+ logical :: have_sums
+ real    :: pmassi,dfac,fac,hm,r2,dx,dy,dz,xpiv,totmass,x0(3),bl(6),br(6),sl(4),sr(4),sm(4)
 
  if (allocated(tcbuf)) then
     if (size(tcbuf,2) /= size(treecache,2)) deallocate(tcbuf,ipbuf)
@@ -393,26 +401,28 @@ subroutine build_top_parallel(node,queue,istack,nqueue,leaf_is_active)
  if (pmassi > 0.) dfac = 1./pmassi
 
  !
- ! work arrays for every level, at their largest: a level has at most size(queue)/2 nodes
- ! (its children must fit in the queue), and at most threads + nodes chunks (the shares
- ! rounded down add up to at most the thread count, plus one for each node whose share
- ! rounds down to zero)
+ ! work arrays for every level, at their largest: a level has at most size(queue)/2
+ ! nodes (its children must fit in the queue), each with one piece per thread
  !
+ nt   = numthreads
  kmax = size(queue)/2
- cmax = numthreads + kmax
- allocate(nodecl(kmax),nodecr(kmax),jnl(kmax),jdegen(kmax))
- allocate(nodeax(kmax),nodecom(3,kmax),nodecog(3,kmax))
- allocate(chunk(kmax),remain(kmax),newq(2*kmax))
- allocate(cnode(cmax),chunkl(cmax),chunkr(cmax),cnl(cmax),coffl(cmax),coffr(cmax))
- allocate(psum(4,cmax),phm(cmax),pr2(cmax),pbox(12,cmax))
- ! each chunk's sums (mass-weighted position, mass) for the particles it sends to the
- ! left and to the right child, and those combined per child: the next level's centres
- ! of mass, so that it needs no pass of its own to find them
- allocate(psl(4,cmax),psr(4,cmax),csum(4,2*kmax),nsum(4,2*kmax))
- have_sums = .false.
+ pmax = nt*size(queue)
+ allocate(jnl(kmax),nodeax(kmax),jdegen(kmax),nodecom(3,kmax),nodecog(3,kmax),newq(2*kmax))
+ allocate(chunkl(pmax),chunkr(pmax),nextl(pmax),nextr(pmax),cnl(pmax),coffl(pmax),coffr(pmax))
+ allocate(psum(4,pmax),phm(pmax),pr2(pmax),pbox(12,pmax),psl(4,pmax),psr(4,pmax))
+ allocate(csum(4,2*kmax),nsum(4,2*kmax))
 #ifdef GRAVITY
- allocate(pmom(16,cmax))
+ allocate(pmom(16,pmax))
 #endif
+
+ ! the root's particles, one piece per thread
+ i1 = inoderange(1,queue(1)%node)
+ n  = queue(1)%npnode
+ do t = 0,nt-1
+    chunkl(t+1) = i1 + int((int(t,8)*n)/nt)
+    chunkr(t+1) = i1 + int((int(t+1,8)*n)/nt) - 1
+ enddo
+ have_sums = .false.
 
  levels: do while (istack < nqueue)
     k = istack
@@ -423,238 +433,226 @@ subroutine build_top_parallel(node,queue,istack,nqueue,leaf_is_active)
     !
     if (k > kmax .or. queue(1)%level >= maxlevel_indexed) exit levels
     if (any(queue(1:k)%npnode <= max(minpart,64))) exit levels
-    !
-    ! each node gets its share of the threads as chunks: the share rounded down (at
-    ! least one), then the chunks left over go to the nodes that lost most in the
-    ! rounding (largest remainder), so a level with no more nodes than threads has
-    ! exactly one chunk per thread.  A chunk never crosses a node boundary.
-    !
-    ntot = sum(int(queue(1:k)%npnode,kind=8))
     do j = 1,k
-       !-- first share estimate (how many threads need a node)
-       share     = real(numthreads)*real(queue(j)%npnode)/real(ntot)
-       chunk(j)  = max(1,int(share)) !-- cap to 1 as a node should at least have a chunk
-       remain(j) = share - int(share)
-       if (int(share) == 0) remain(j) = -1. ! already given its minimum of one skip from the remainder share
-    enddo
-    do while (sum(chunk(1:k)) < numthreads)
-       j = maxloc(remain(1:k),1)
-       if (remain(j) < 0.) exit
-       chunk(j) = chunk(j) + 1
-       remain(j) = -1.
-    enddo
-    nchunk = 0
-    do j = 1,k
-       ncj = min(chunk(j),queue(j)%npnode)
-       nodecl(j) = nchunk + 1 !-- node chunk left
-       nchunk    = nchunk + ncj
-       nodecr(j) = nchunk     !-- node chunk right
        nodeax(j) = maxloc(queue(j)%xmax - queue(j)%xmin,1)   ! split along the longest axis
        nodecog(:,j) = 0.5*(queue(j)%xmin + queue(j)%xmax)
     enddo
-    do j = 1,k
-       i1  = inoderange(1,queue(j)%node)
-       n   = queue(j)%npnode
-       ncj = nodecr(j) - nodecl(j) + 1
-       do m = 1,ncj
-          c = nodecl(j) + (m-1)
-          cnode(c) = j
-          chunkl(c)   = i1 + int((int(m-1,8)*n)/ncj)
-          chunkr(c)   = i1 + int((int(m,8)*n)/ncj) - 1
-       enddo
-    enddo
 
     !$omp parallel default(none) &
-    !$omp shared(nchunk,k,chunkl,chunkr,cnode,treecache,dfac,psum,nodecl,nodecr) &
-    !$omp shared(nodecom,nodecog,nodeax,jnl,jdegen,node,queue,leaf_is_active,inoderange) &
-    !$omp shared(pr2,phm,cnl,coffl,coffr,tcbuf,ipbuf,inodeparts,pbox,newq,use_geosplit) &
-    !$omp shared(have_sums,psl,psr,csum,nsum) &
+    !$omp shared(have_sums,nt,k,chunkl,chunkr,treecache,dfac,psum,csum,nodecom,nodecog,nodeax) &
+    !$omp shared(node,queue,leaf_is_active,inoderange,inodeparts,tcbuf,ipbuf,use_geosplit) &
+    !$omp shared(pr2,phm,cnl,coffl,coffr,jdegen,jnl,pbox,psl,psr,nextl,nextr,newq,nsum) &
 #ifdef GRAVITY
     !$omp shared(pmom) &
     !$omp private(quads,octs) &
 #endif
-    !$omp private(c,j,i,i1,n,nl,pl,pr,iax,nnode,il,ir,isplit) &
-    !$omp private(pmassi,fac,sx,sy,sz,sm,hm,r2,dx,dy,dz,xpiv,totmass,x0,bl,br,sl,sr)
+    !$omp private(c,j,i,i1,n,nl,pl,pr,iax,nnode,il,ir,isplit,t,it,nteam,nr) &
+    !$omp private(pmassi,fac,hm,r2,dx,dy,dz,xpiv,totmass,x0,bl,br,sl,sr,sm)
+    ! thread it works on the pieces of thread number t = it, it+nteam, ... (its own
+    ! pieces, unless the team is not the usual size)
+    it = 0
+    nteam = 1
+    !$ it = omp_get_thread_num()
+    !$ nteam = omp_get_num_threads()
     !
-    ! mass and centre of mass of each chunk (only for the first level: after that they
-    ! come from the level above's partition, in csum) ...
+    ! the root's mass and centre of mass (every other node's come from the partition
+    ! at the level above) ...
     !
-    !$omp do schedule(static,1)
-    do c = 1,merge(0,nchunk,have_sums)
-       sx = 0.; sy = 0.; sz = 0.; sm = 0.;
-       do i = chunkl(c),chunkr(c)
-          pmassi = treecache(5,i)
-          fac = pmassi*dfac
-          sm  = sm + pmassi
-          sx  = sx + fac*treecache(1,i)
-          sy  = sy + fac*treecache(2,i)
-          sz  = sz + fac*treecache(3,i)
+    if (.not.have_sums) then
+       do t = it,nt-1,nteam
+          do j = 1,k
+             c = (j-1)*nt + t + 1
+             sm = 0.
+             do i = chunkl(c),chunkr(c)
+                pmassi = treecache(5,i)
+                fac = pmassi*dfac
+                sm(1:3) = sm(1:3) + fac*treecache(1:3,i)
+                sm(4)   = sm(4) + pmassi
+             enddo
+             psum(:,c) = sm
+          enddo
        enddo
-       psum(:,c) = (/sx,sy,sz,sm/)
-    enddo
-    !$omp enddo
-    ! ... combined per node, which also fixes the pivot (the centre of mass)
+       !$omp barrier
+    endif
+    ! ... per node, which also fixes the pivot (the centre of mass, or with use_geosplit
+    ! the geometric centre, the centre of mass being the node's centre either way)
     !$omp do schedule(static)
     do j = 1,k
        if (have_sums) then
-          totmass = csum(4,j)
-          if (totmass <= 0.) call fatal('mtree','totmass_node==0',val=totmass)
-          nodecom(:,j) = csum(1:3,j)/(totmass*dfac)
+          sm = csum(:,j)
        else
-          totmass = sum(psum(4,nodecl(j):nodecr(j)))
-          if (totmass <= 0.) call fatal('mtree','totmass_node==0',val=totmass)
-          nodecom(:,j) = sum(psum(1:3,nodecl(j):nodecr(j)),dim=2)/(totmass*dfac)
+          sm = sum(psum(:,(j-1)*nt+1:j*nt),dim=2)
        endif
+       totmass = sm(4)
+       if (totmass <= 0.) call fatal('mtree','totmass_node==0',val=totmass)
+       nodecom(:,j) = sm(1:3)/(totmass*dfac)
 #ifdef GRAVITY
        node(queue(j)%node)%mass = totmass
 #endif
     enddo
     !$omp enddo
     !
-    ! size (and multipole moments) about the centre of mass, and the number of
-    ! particles left of the pivot, in one pass ...
+    ! size (and multipole moments) about the centre of mass, hmax, and the number of
+    ! particles left of the pivot, of each piece ...
     !
-    !$omp do schedule(static,1)
-    do c = 1,nchunk
-       iax  = nodeax(cnode(c))
-       x0   = nodecom(:,cnode(c))
-       if (use_geosplit) then
-          xpiv = nodecog(iax,cnode(c))
-       else
-          xpiv = x0(iax)
-       endif
-       r2 = 0.
-       hm = 0.
-       nl = 0
+    do t = it,nt-1,nteam
+       do j = 1,k
+          c    = (j-1)*nt + t + 1
+          x0   = nodecom(:,j)
+          iax  = nodeax(j)
+          if (use_geosplit) then
+             xpiv = nodecog(iax,j)
+          else
+             xpiv = x0(iax)
+          endif
+          r2 = 0.
+          hm = 0.
+          nl = 0
 #ifdef GRAVITY
-       quads = 0.
-       octs  = 0.
+          quads = 0.
+          octs  = 0.
 #endif
-       do i = chunkl(c),chunkr(c)
-          dx = treecache(1,i) - x0(1)
-          dy = treecache(2,i) - x0(2)
-          dz = treecache(3,i) - x0(3)
-          hm = max(hm,treecache(4,i))
-          r2 = max(r2,dx*dx + dy*dy + dz*dz)
-          if (treecache(iax,i) <= xpiv) nl = nl + 1
+          do i = chunkl(c),chunkr(c)
+             dx = treecache(1,i) - x0(1)
+             dy = treecache(2,i) - x0(2)
+             dz = treecache(3,i) - x0(3)
+             hm = max(hm,treecache(4,i))
+             r2 = max(r2,dx*dx + dy*dy + dz*dz)
+             if (treecache(iax,i) <= xpiv) nl = nl + 1
 #ifdef GRAVITY
-          pmassi = treecache(5,i)
-          call add_node_moments(pmassi,dx,dy,dz,quads,octs)
+             pmassi = treecache(5,i)
+             call add_node_moments(pmassi,dx,dy,dz,quads,octs)
+#endif
+          enddo
+          phm(c) = hm
+          pr2(c) = r2
+          cnl(c) = nl
+#ifdef GRAVITY
+          pmom(1:6,c)  = quads
+          pmom(7:16,c) = octs
 #endif
        enddo
-       phm(c) = hm
-       pr2(c) = r2
-       cnl(c) = nl
-#ifdef GRAVITY
-       pmom(1:6,c)  = quads
-       pmom(7:16,c) = octs
-#endif
     enddo
-    !$omp enddo
-    ! ... combined per node into the node itself, and each chunk's write positions
+    !$omp barrier
+    ! ... combined per node into the node itself, and each piece's write positions
     !$omp do schedule(static)
     do j = 1,k
        nnode = queue(j)%node
        i1 = inoderange(1,nnode)
        n  = queue(j)%npnode
-       r2 = maxval(pr2(nodecl(j):nodecr(j)))
+       r2 = maxval(pr2((j-1)*nt+1:j*nt))
        node(nnode)%xcen   = nodecom(:,j)
        node(nnode)%size   = sqrt(r2) + epsilon(r2)
-       node(nnode)%hmax   = maxval(phm(nodecl(j):nodecr(j)))
+       node(nnode)%hmax   = maxval(phm((j-1)*nt+1:j*nt))
        node(nnode)%parent = queue(j)%parent
        node(nnode)%level  = queue(j)%level
 #ifdef GRAVITY
-       node(nnode)%quads  = sum(pmom(1:6,nodecl(j):nodecr(j)),dim=2)
-       node(nnode)%octs   = sum(pmom(7:16,nodecl(j):nodecr(j)),dim=2)
+       node(nnode)%quads  = sum(pmom(1:6,(j-1)*nt+1:j*nt),dim=2)
+       node(nnode)%octs   = sum(pmom(7:16,(j-1)*nt+1:j*nt),dim=2)
 #endif
        il = 2*nnode   ! indexing as per Gafton & Rosswog (2011), as in construct_node
        ir = il + 1
        node(nnode)%leftchild  = il
        node(nnode)%rightchild = ir
        leaf_is_active(nnode)  = 0
-       nl = sum(cnl(nodecl(j):nodecr(j)))
-       ! all particles on one side: split in half without moving them, as construct_node does
+       nl = sum(cnl((j-1)*nt+1:j*nt))
+       ! all particles on one side: split in half without moving them, as construct_node
+       ! does (each piece stays where it is, its part before the split going left)
        jdegen(j) = (nl == 0 .or. nl == n)
        if (jdegen(j)) nl = n/2
        jnl(j) = nl
+       isplit = i1 + nl   ! first particle of the right child
        pl = i1
        pr = i1 + nl
-       do c = nodecl(j),nodecr(j)
-          coffl(c) = pl
-          coffr(c) = pr
-          pl = pl + cnl(c)
-          pr = pr + (chunkr(c) - chunkl(c) + 1 - cnl(c))
+       do c = (j-1)*nt+1,j*nt
+          if (jdegen(j)) then
+             cnl(c)   = max(0,min(chunkr(c),isplit-1) - chunkl(c) + 1)
+             coffl(c) = chunkl(c)
+             coffr(c) = chunkl(c) + cnl(c)
+          else
+             coffl(c) = pl
+             coffr(c) = pr
+             pl = pl + cnl(c)
+             pr = pr + (chunkr(c) - chunkl(c) + 1 - cnl(c))
+          endif
        enddo
     enddo
     !$omp enddo
     !
-    ! partition: each chunk scatters its particles into the scratch buffer, and in the
-    ! same pass accumulates the bounding box and the sums of each side (the children)
+    ! partition: each piece is scattered into the scratch buffer, and in the same pass
+    ! the bounding box and sums of each side are accumulated; its two parts are this
+    ! thread's pieces of the children at the next level
     !
-    !$omp do schedule(static,1)
-    do c = 1,nchunk
-       j    = cnode(c)
-       iax  = nodeax(j)
-       if (use_geosplit) then
-          xpiv = nodecog(iax,j)
-       else
-          xpiv = nodecom(iax,j)
-       endif
-       bl(1:3) =  huge(1.); bl(4:6) = -huge(1.)
-       br = bl
-       sl = 0.; sr = 0.
-       if (jdegen(j)) then
-          ! nothing moves, but the buffer becomes the particle list: copy as it is (the
-          ! node is split in half by position in the list)
-          isplit = inoderange(1,queue(j)%node) + jnl(j)   ! first particle of the right child
-          tcbuf(:,chunkl(c):chunkr(c)) = treecache(:,chunkl(c):chunkr(c))
-          ipbuf(chunkl(c):chunkr(c))   = inodeparts(chunkl(c):chunkr(c))
-          do i = chunkl(c),chunkr(c)
-             pmassi = treecache(5,i)
-             fac = pmassi*dfac
-             if (i < isplit) then
-                bl(1:3) = min(bl(1:3),treecache(1:3,i))
-                bl(4:6) = max(bl(4:6),treecache(1:3,i))
-                sl(1:3) = sl(1:3) + fac*treecache(1:3,i)
-                sl(4)   = sl(4) + pmassi
-             else
-                br(1:3) = min(br(1:3),treecache(1:3,i))
-                br(4:6) = max(br(4:6),treecache(1:3,i))
-                sr(1:3) = sr(1:3) + fac*treecache(1:3,i)
-                sr(4)   = sr(4) + pmassi
-             endif
-          enddo
-       else
-          pl = coffl(c)
-          pr = coffr(c)
-          do i = chunkl(c),chunkr(c)
-             pmassi = treecache(5,i)
-             fac = pmassi*dfac
-             if (treecache(iax,i) <= xpiv) then
-                tcbuf(:,pl) = treecache(:,i)
-                ipbuf(pl)   = inodeparts(i)
-                pl = pl + 1
-                bl(1:3) = min(bl(1:3),treecache(1:3,i))
-                bl(4:6) = max(bl(4:6),treecache(1:3,i))
-                sl(1:3) = sl(1:3) + fac*treecache(1:3,i)
-                sl(4)   = sl(4) + pmassi
-             else
-                tcbuf(:,pr) = treecache(:,i)
-                ipbuf(pr)   = inodeparts(i)
-                pr = pr + 1
-                br(1:3) = min(br(1:3),treecache(1:3,i))
-                br(4:6) = max(br(4:6),treecache(1:3,i))
-                sr(1:3) = sr(1:3) + fac*treecache(1:3,i)
-                sr(4)   = sr(4) + pmassi
-             endif
-          enddo
-       endif
-       pbox(1:6,c)  = bl
-       pbox(7:12,c) = br
-       psl(:,c) = sl
-       psr(:,c) = sr
+    do t = it,nt-1,nteam
+       do j = 1,k
+          c    = (j-1)*nt + t + 1
+          iax  = nodeax(j)
+          if (use_geosplit) then
+             xpiv = nodecog(iax,j)
+          else
+             xpiv = nodecom(iax,j)
+          endif
+          bl(1:3) =  huge(1.); bl(4:6) = -huge(1.)
+          br = bl
+          sl = 0.; sr = 0.
+          if (jdegen(j)) then
+             ! nothing moves, but the buffer becomes the particle list: copy as it is
+             isplit = inoderange(1,queue(j)%node) + jnl(j)
+             tcbuf(:,chunkl(c):chunkr(c)) = treecache(:,chunkl(c):chunkr(c))
+             ipbuf(chunkl(c):chunkr(c))   = inodeparts(chunkl(c):chunkr(c))
+             do i = chunkl(c),chunkr(c)
+                pmassi = treecache(5,i)
+                fac = pmassi*dfac
+                if (i < isplit) then
+                   bl(1:3) = min(bl(1:3),treecache(1:3,i))
+                   bl(4:6) = max(bl(4:6),treecache(1:3,i))
+                   sl(1:3) = sl(1:3) + fac*treecache(1:3,i)
+                   sl(4)   = sl(4) + pmassi
+                else
+                   br(1:3) = min(br(1:3),treecache(1:3,i))
+                   br(4:6) = max(br(4:6),treecache(1:3,i))
+                   sr(1:3) = sr(1:3) + fac*treecache(1:3,i)
+                   sr(4)   = sr(4) + pmassi
+                endif
+             enddo
+          else
+             pl = coffl(c)
+             pr = coffr(c)
+             do i = chunkl(c),chunkr(c)
+                pmassi = treecache(5,i)
+                fac = pmassi*dfac
+                if (treecache(iax,i) <= xpiv) then
+                   tcbuf(:,pl) = treecache(:,i)
+                   ipbuf(pl)   = inodeparts(i)
+                   pl = pl + 1
+                   bl(1:3) = min(bl(1:3),treecache(1:3,i))
+                   bl(4:6) = max(bl(4:6),treecache(1:3,i))
+                   sl(1:3) = sl(1:3) + fac*treecache(1:3,i)
+                   sl(4)   = sl(4) + pmassi
+                else
+                   tcbuf(:,pr) = treecache(:,i)
+                   ipbuf(pr)   = inodeparts(i)
+                   pr = pr + 1
+                   br(1:3) = min(br(1:3),treecache(1:3,i))
+                   br(4:6) = max(br(4:6),treecache(1:3,i))
+                   sr(1:3) = sr(1:3) + fac*treecache(1:3,i)
+                   sr(4)   = sr(4) + pmassi
+                endif
+             enddo
+          endif
+          pbox(1:6,c)  = bl
+          pbox(7:12,c) = br
+          psl(:,c) = sl
+          psr(:,c) = sr
+          ! this thread's pieces of the children (numbers 2j-1 and 2j at the next level)
+          nr = chunkr(c) - chunkl(c) + 1 - cnl(c)
+          nextl((2*j-2)*nt + t + 1) = coffl(c)
+          nextr((2*j-2)*nt + t + 1) = coffl(c) + cnl(c) - 1
+          nextl((2*j-1)*nt + t + 1) = coffr(c)
+          nextr((2*j-1)*nt + t + 1) = coffr(c) + nr - 1
+       enddo
     enddo
-    !$omp enddo
+    !$omp barrier
     ! the children, as the next level of the queue
     !$omp do schedule(static)
     do j = 1,k
@@ -668,17 +666,17 @@ subroutine build_top_parallel(node,queue,istack,nqueue,leaf_is_active)
        inoderange(2,il) = i1 + nl - 1
        inoderange(1,ir) = i1 + nl
        inoderange(2,ir) = i1 + n - 1
-       ! children's boxes from the chunks' partial boxes (into bl/br first, so that no
+       ! children's boxes from the pieces' partial boxes (into bl/br first, so that no
        ! array temporaries are passed to push_onto_stack)
-       bl(1:3) = minval(pbox(1:3,nodecl(j):nodecr(j)),dim=2)
-       bl(4:6) = maxval(pbox(4:6,nodecl(j):nodecr(j)),dim=2)
-       br(1:3) = minval(pbox(7:9,nodecl(j):nodecr(j)),dim=2)
-       br(4:6) = maxval(pbox(10:12,nodecl(j):nodecr(j)),dim=2)
+       bl(1:3) = minval(pbox(1:3,(j-1)*nt+1:j*nt),dim=2)
+       bl(4:6) = maxval(pbox(4:6,(j-1)*nt+1:j*nt),dim=2)
+       br(1:3) = minval(pbox(7:9,(j-1)*nt+1:j*nt),dim=2)
+       br(4:6) = maxval(pbox(10:12,(j-1)*nt+1:j*nt),dim=2)
        call push_onto_stack(newq(2*j-1),il,nnode,queue(j)%level+1,nl,bl(1:3),bl(4:6))
        call push_onto_stack(newq(2*j),ir,nnode,queue(j)%level+1,n-nl,br(1:3),br(4:6))
        ! the children's sums, for the next level
-       nsum(:,2*j-1) = sum(psl(:,nodecl(j):nodecr(j)),dim=2)
-       nsum(:,2*j)   = sum(psr(:,nodecl(j):nodecr(j)),dim=2)
+       nsum(:,2*j-1) = sum(psl(:,(j-1)*nt+1:j*nt),dim=2)
+       nsum(:,2*j)   = sum(psr(:,(j-1)*nt+1:j*nt),dim=2)
     enddo
     !$omp enddo
     !$omp end parallel
@@ -693,6 +691,8 @@ subroutine build_top_parallel(node,queue,istack,nqueue,leaf_is_active)
 
     queue(1:2*k) = newq(1:2*k)
     csum(:,1:2*k) = nsum(:,1:2*k)
+    chunkl(1:2*k*nt) = nextl(1:2*k*nt)
+    chunkr(1:2*k*nt) = nextr(1:2*k*nt)
     have_sums = .true.
     istack = 2*k
  enddo levels
