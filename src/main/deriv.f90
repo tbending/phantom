@@ -44,6 +44,7 @@ subroutine derivs(icall,npart,nactive,xyzh,vxyzu,fxyzu,fext,divcurlv,divcurlB,&
  use neighkdtree,    only:build_tree
  use densityforce,   only:densityiterate
  use gpu_dens_iface,  only:densityiterate_gpu,use_gpu_dens,init_gpu_switch,xi_gpu
+ use gpu_dens_iface,  only:gpu_dens_mirror,gpu_dens_mirror_before,gpu_dens_mirror_after
  use gpu_force_iface, only:force_gpu
  use ptmass,         only:ipart_rhomax,ptmass_calc_enclosed_mass,ptmass_boundary_crossing,get_pressure_on_sinks
  use externalforces, only:externalforce
@@ -144,6 +145,8 @@ subroutine derivs(icall,npart,nactive,xyzh,vxyzu,fxyzu,fext,divcurlv,divcurlB,&
        call densityiterate_gpu(npart,xyzh,vxyzu,fxyzu,fext,gradh,divcurlv,alphaind)
     else
        !--CPU path: original phantom behaviour, unchanged
+       !  (DEV HATCH, Phase 1.1: COSMO_DENS_MIRROR runs the GPU solve alongside)
+       if (gpu_dens_mirror) call gpu_dens_mirror_before(npart,xyzh,vxyzu,fxyzu,fext,gradh,divcurlv,alphaind)
        call densityiterate(1,npart,nactive,xyzh,vxyzu,divcurlv,divcurlB,Bevol,&
                            stressmax,fxyzu,fext,alphaind,gradh,rad,radprop,dvdx,apr_level)
        if (.not. fast_divcurlB) then
@@ -152,6 +155,7 @@ subroutine derivs(icall,npart,nactive,xyzh,vxyzu,fxyzu,fext,divcurlv,divcurlB,&
                               stressmax,fxyzu,fext,alphaind,gradh,rad,radprop,dvdx,apr_level)
           ! put a similar flag for pressure calculation from dens: call cons2primall/everyhting and densityiterate(3. Import pressure from eos_vars in dens and use it to calculate delta_v
        endif
+       if (gpu_dens_mirror) call gpu_dens_mirror_after(npart,xyzh,gradh,divcurlv,alphaind)
     endif
     set_boundaries_to_active = .false.     ! boundary particles are no longer treated as active
     call do_timing('dens',tlast,tcpulast)

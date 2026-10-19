@@ -56,7 +56,7 @@ module gpu_dens_iface
                          gpu_arrays_mark_packed,gpu_arrays_upload,gpu_arrays_download, &
                          gpu_arrays_positions_moved,gpu_arrays_order_rebuilt, &
                          ibun_pos,ibun_hsml,ibun_vel,ibun_accel, &
-                         ibun_dens_out,ibun_grad_out,ibun_ptype,ibun_dustgas
+                         ibun_dens_out,ibun_grad_out,ibun_ptype,ibun_dustgas,ibun_active
  implicit none
 
 #ifdef GPU
@@ -69,7 +69,7 @@ module gpu_dens_iface
 !--C interface to cosmoSPHere/src/dens_c_api.cu
  interface
   subroutine densityiterate_gpu_c(n, pmass, pmass_dust, &
-                                  periodic, box, tolh, hfact, keep_dvdx) bind(C)
+                                  periodic, box, tolh, hfact, keep_dvdx, use_active) bind(C)
    use iso_c_binding, only:c_double,c_int
    integer(c_int), value         :: n
    real(c_double), value         :: pmass
@@ -79,6 +79,7 @@ module gpu_dens_iface
    real(c_double), value         :: tolh
    real(c_double), value         :: hfact
    integer(c_int), value         :: keep_dvdx
+   integer(c_int), value         :: use_active
   end subroutine densityiterate_gpu_c
 
 !--C interface to cosmo_kernel_radius in cosmoSPHere/src/dens_c_api.cu
@@ -90,6 +91,17 @@ module gpu_dens_iface
 #endif
 
  public :: densityiterate_gpu, init_gpu_switch
+ public :: gpu_dens_mirror_before, gpu_dens_mirror_after
+
+ !--DEV HATCH (GPU_IND_TIMESTEPS_PLAN Phase 1.1, removed before the phase's last
+ !  commit): COSMO_DENS_MIRROR=1 with COSMO_GPU=0 runs the GPU density solve beside the
+ !  CPU one on the same inputs, every derivs, and compares them per particle.  The run
+ !  itself stays on the CPU path.
+ logical, public :: gpu_dens_mirror = .false.
+ real,         allocatable :: mir_h0(:),mir_rho0(:),mir_hg(:),mir_rhog(:)
+ real(kind=4), allocatable :: mir_gradh0(:,:),mir_divv0(:),mir_alpha0(:)
+ real(kind=4), allocatable :: mir_gradhg(:,:),mir_divvg(:),mir_alphag(:)
+ integer, save :: mir_ncall = 0
  private
 
 !
@@ -126,6 +138,9 @@ subroutine init_gpu_switch()
     end select
  endif
  write(iprint,'(a,l1)') ' cosmoSPHere: use_gpu_dens = ',use_gpu_dens
+ call get_environment_variable('COSMO_DENS_MIRROR',val,ln,ierr)
+ gpu_dens_mirror = (ierr == 0 .and. ln > 0 .and. .not.use_gpu_dens)
+ if (gpu_dens_mirror) write(iprint,'(a)') ' cosmoSPHere: COSMO_DENS_MIRROR, GPU density checked against the CPU'
 #endif
 
 end subroutine init_gpu_switch
@@ -164,13 +179,13 @@ subroutine densityiterate_gpu(npart, xyzh, vxyzu, fxyzu, fext, gradh, divcurlv, 
  use ptmass_radiation, only:iget_tdust
  use kernel,           only:kernelname,radkern
  use part,             only:hfact
- use part,             only:iphase,iamtype,iamboundary,igas,idust
+ use part,             only:iphase,iamtype,iamboundary,igas,idust,iactive
  use part,             only:ndustsmall,ndustlarge,dustfrac,ndusttypes
  use dim,              only:use_dustgrowth
  use options,          only:use_dustfrac,use_hybrid
  use dust,             only:irecon
  use dim,              only:maxphase,maxp
- use part,             only:rho,dhdn
+ use part,             only:rho,dhdn,rhoh
  use dim,              only:igradomega,igradzeta
  use options,          only:two_kernel
  use iso_c_binding, only:c_double,c_int
@@ -192,7 +207,7 @@ subroutine densityiterate_gpu(npart, xyzh, vxyzu, fxyzu, fext, gradh, divcurlv, 
  real(c_double), pointer, contiguous :: ax8(:),ay8(:),az8(:)
  real(c_double), pointer, contiguous :: rho8(:),drhofh8(:)
  real(c_double), pointer, contiguous :: divv8(:),xi8(:),ddivvdt8(:)
- real(c_double), pointer, contiguous :: ptype8(:),dustgas8(:)
+ real(c_double), pointer, contiguous :: ptype8(:),dustgas8(:),active8(:)
  real(c_double) :: pmass_dust
  integer(kind=8) :: ic0,ic1,ic2,ic3,ic4,crate
  character(len=8) :: statsenv
@@ -220,9 +235,6 @@ subroutine densityiterate_gpu(npart, xyzh, vxyzu, fxyzu, fext, gradh, divcurlv, 
  if (do_radiation) call fatal('densityiterate_gpu','radiation flux not computed on GPU')
  if (gravity)      call fatal('densityiterate_gpu','gradsoft not computed on GPU')
  if (two_kernel)   call fatal('densityiterate_gpu','two_kernel (n from W~) not computed on GPU')
- !--the GPU force pass evaluates and overwrites every particle, not just the
- !  active ones, so individual timesteps would advance inactive particles
- if (ind_timesteps) call fatal('densityiterate_gpu','individual timesteps not supported on GPU (IND_TIMESTEPS=no)')
  !--the GPU path builds no kd-tree, so refuse everything that queries it
  !  during a step: sink creation, HII regions, APR's merge tree, and the
  !  sink-radiation ray tracer (iget_tdust 3 and 4)
@@ -301,11 +313,12 @@ subroutine densityiterate_gpu(npart, xyzh, vxyzu, fxyzu, fext, gradh, divcurlv, 
  ddivvdt8=> gpu_arrays_comp(ibun_grad_out,3)
  if (use_dust) ptype8   => gpu_arrays_comp(ibun_ptype,1)
  if (use_dust) dustgas8 => gpu_arrays_comp(ibun_dustgas,1)
+ if (ind_timesteps) active8 => gpu_arrays_comp(ibun_active,1)
 
  ncross = 0
  !$omp parallel do default(none) private(i) &
  !$omp shared(npart,xyzh,vxyzu,fxyzu,fext,x8,y8,z8,h8,vx8,vy8,vz8,ax8,ay8,az8) &
- !$omp shared(isperiodic,ptype8,iphase) reduction(+:ncross)
+ !$omp shared(isperiodic,ptype8,active8,iphase) reduction(+:ncross)
  do i = 1, npart
     !--the GPU tree is built in the periodic box, so particles must be inside it
     if (periodic) then
@@ -327,6 +340,8 @@ subroutine densityiterate_gpu(npart, xyzh, vxyzu, fxyzu, fext, gradh, divcurlv, 
     az8(i) = real(fxyzu(3,i) + fext(3,i), kind=c_double)
     !--which tree the particle goes in (the type check above admits only these two)
     if (use_dust) ptype8(i) = merge(1._c_double, 0._c_double, iamtype(iphase(i)) == idust)
+    !--individual timesteps: the solve iterates only the particles active this step
+    if (ind_timesteps) active8(i) = merge(1._c_double, 0._c_double, iactive(iphase(i)))
  enddo
  !$omp end parallel do
  !--the force pass that follows uses the same velocities, from the same bundle, so
@@ -342,6 +357,7 @@ subroutine densityiterate_gpu(npart, xyzh, vxyzu, fxyzu, fext, gradh, divcurlv, 
  call gpu_arrays_upload(ibun_vel,   npart)
  call gpu_arrays_upload(ibun_accel, npart)
  if (use_dust) call gpu_arrays_upload(ibun_ptype, npart)
+ if (ind_timesteps) call gpu_arrays_upload(ibun_active, npart)
  pmass_dust = 0._c_double
  if (use_dust) pmass_dust = real(massoftype(idust), kind=c_double)
 
@@ -354,7 +370,8 @@ subroutine densityiterate_gpu(npart, xyzh, vxyzu, fxyzu, fext, gradh, divcurlv, 
                             real(hfact, kind=c_double), &
                             !--drag reconstruction reads both particles' dv/dx in the
                             !  force pass, so the device keeps it (gpu_arrays ibun_dvdx)
-                            merge(1_c_int, 0_c_int, use_dust .and. irecon >= 0))
+                            merge(1_c_int, 0_c_int, use_dust .and. irecon >= 0), &
+                            merge(1_c_int, 0_c_int, ind_timesteps))
  call gpu_arrays_order_rebuilt()
 
  !--the solve leaves its results on the device; fetch the three bundles it filled
@@ -364,13 +381,24 @@ subroutine densityiterate_gpu(npart, xyzh, vxyzu, fxyzu, fext, gradh, divcurlv, 
  if (use_dust) call gpu_arrays_download(ibun_dustgas, npart)
  call system_clock(ic2)
 
- !--write results back to phantom arrays
- !  Skip inactive/dead particles (xyzh(4,i) < 0 in phantom convention)
+ !--write results back to phantom arrays, for the particles the solve touched: not the
+ !  dead and accreted ones (h < 0), and under individual timesteps only the active ones,
+ !  whose results phantom's densityiterate would have written.  The inactive keep their
+ !  gradh, div v, xi and d(div v)/dt from their last active step and the h predicted in
+ !  step, which the device did not change either; their rho is rhoh(h), as the CPU
+ !  densityiterate sets it for every live particle first (init_rho_from_h).
  !$omp parallel do default(none) private(i,hi,rhoi,drhoi,omega,dhdni,pmassi) &
  !$omp shared(npart,xyzh,gradh,divcurlv,alphaind,xi_gpu,dustfrac,ndustsmall,ndusttypes,rho) &
  !$omp shared(h8,rho8,drhofh8,divv8,xi8,ddivvdt8,dustgas8,iphase,massoftype,maxp,maxphase)
  do i = 1, npart
-    if (xyzh(4,i) < 0.) cycle   ! preserve negative h for inactive particles
+    if (xyzh(4,i) < 0.) cycle   ! dead or accreted: keep the negative h
+    if (ind_timesteps) then
+       if (.not.iactive(iphase(i))) then
+          pmassi = massoftype(iamtype(iphase(i)))
+          rho(i) = rhoh(xyzh(4,i),pmassi)
+          cycle
+       endif
+    endif
     hi    = real(h8(i))
     rhoi  = real(rho8(i))
     drhoi = real(drhofh8(i))    ! d(rho)/d(h), normalised
@@ -429,5 +457,116 @@ subroutine densityiterate_gpu(npart, xyzh, vxyzu, fxyzu, fext, gradh, divcurlv, 
 
 end subroutine densityiterate_gpu
 
+
+!-------------------------------------------------------------
+!+
+!  DEV HATCH, Phase 1.1: before the CPU density pass, run the GPU one on
+!  the same inputs, keep its results, and put the inputs back.
+!+
+!-------------------------------------------------------------
+subroutine gpu_dens_mirror_before(npart,xyzh,vxyzu,fxyzu,fext,gradh,divcurlv,alphaind)
+ use part, only:rho
+ use dim,  only:nalpha
+ integer,      intent(in)    :: npart
+ real,         intent(inout) :: xyzh(:,:)
+ real,         intent(in)    :: vxyzu(:,:),fxyzu(:,:),fext(:,:)
+ real(kind=4), intent(inout) :: gradh(:,:),divcurlv(:,:),alphaind(:,:)
+ integer :: ng
+
+ if (allocated(mir_h0)) then
+    if (size(mir_h0) < npart) deallocate(mir_h0,mir_rho0,mir_hg,mir_rhog,mir_gradh0,mir_divv0, &
+                                         mir_alpha0,mir_gradhg,mir_divvg,mir_alphag)
+ endif
+ ng = size(gradh,1)
+ if (.not.allocated(mir_h0)) allocate(mir_h0(npart),mir_rho0(npart),mir_hg(npart),mir_rhog(npart), &
+                                      mir_gradh0(ng,npart),mir_divv0(npart),mir_alpha0(npart), &
+                                      mir_gradhg(ng,npart),mir_divvg(npart),mir_alphag(npart))
+ mir_h0(1:npart)       = xyzh(4,1:npart)
+ mir_rho0(1:npart)     = rho(1:npart)
+ mir_gradh0(:,1:npart) = gradh(:,1:npart)
+ mir_divv0(1:npart)    = divcurlv(1,1:npart)
+ if (nalpha >= 3) mir_alpha0(1:npart) = alphaind(3,1:npart)
+
+ call densityiterate_gpu(npart,xyzh,vxyzu,fxyzu,fext,gradh,divcurlv,alphaind)
+
+ mir_hg(1:npart)       = xyzh(4,1:npart)
+ mir_rhog(1:npart)     = rho(1:npart)
+ mir_gradhg(:,1:npart) = gradh(:,1:npart)
+ mir_divvg(1:npart)    = divcurlv(1,1:npart)
+ if (nalpha >= 3) mir_alphag(1:npart) = alphaind(3,1:npart)
+
+ xyzh(4,1:npart)       = mir_h0(1:npart)
+ rho(1:npart)          = mir_rho0(1:npart)
+ gradh(:,1:npart)      = mir_gradh0(:,1:npart)
+ divcurlv(1,1:npart)   = mir_divv0(1:npart)
+ if (nalpha >= 3) alphaind(3,1:npart) = mir_alpha0(1:npart)
+
+end subroutine gpu_dens_mirror_before
+
+!-------------------------------------------------------------
+!+
+!  DEV HATCH, Phase 1.1: after the CPU density pass, compare.  One line
+!  per call on stdout, COSMO_DENS_MIRROR, with: the number of active and
+!  inactive live particles; over the active ones the largest relative
+!  difference in h, rho and 1/Omega, the rms difference in div v over the
+!  rms div v, and the same for d(div v)/dt; and, of the inactive particles,
+!  how many the GPU pass left with a different h, rho, gradh, div v or
+!  alphaind(3) from the CPU pass (must be 0: the same formula or no change),
+!  and how many either pass changed from what it was given (rho = rhoh(h)).
+!+
+!-------------------------------------------------------------
+subroutine gpu_dens_mirror_after(npart,xyzh,gradh,divcurlv,alphaind)
+ use part, only:rho,iphase,iactive,maxphase,maxp
+ use dim,  only:nalpha,ind_timesteps
+ use io,   only:iprint
+ integer,      intent(in) :: npart
+ real,         intent(in) :: xyzh(:,:)
+ real(kind=4), intent(in) :: gradh(:,:),divcurlv(:,:),alphaind(:,:)
+ integer :: i,nact,ninact,ntouch_gpu,ntouch_cpu
+ real    :: dh,drho,domega,sdv,sv,sda,sa
+ logical :: act
+
+ nact = 0; ninact = 0; ntouch_gpu = 0; ntouch_cpu = 0
+ dh = 0.; drho = 0.; domega = 0.; sdv = 0.; sv = 0.; sda = 0.; sa = 0.
+ !$omp parallel do default(none) private(i,act) &
+ !$omp shared(npart,xyzh,gradh,divcurlv,alphaind,rho,iphase,mir_h0,mir_rho0,mir_gradh0) &
+ !$omp shared(mir_divv0,mir_alpha0,mir_hg,mir_rhog,mir_gradhg,mir_divvg,mir_alphag,maxphase,maxp) &
+ !$omp reduction(+:nact,ninact,ntouch_gpu,ntouch_cpu,sdv,sv,sda,sa) reduction(max:dh,drho,domega)
+ do i = 1, npart
+    if (mir_h0(i) <= 0.) cycle
+    act = .true.
+    if (ind_timesteps .and. maxphase == maxp) act = iactive(iphase(i))
+    if (act) then
+       nact = nact + 1
+       if (xyzh(4,i) > 0.) dh = max(dh, abs(mir_hg(i)/xyzh(4,i) - 1.))
+       if (rho(i) > 0.) drho = max(drho, abs(mir_rhog(i)/rho(i) - 1.))
+       domega = max(domega, abs(real(mir_gradhg(1,i))/real(gradh(1,i)) - 1.))
+       sdv = sdv + (real(mir_divvg(i)) - real(divcurlv(1,i)))**2
+       sv  = sv  + real(divcurlv(1,i))**2
+       if (nalpha >= 3) then
+          sda = sda + (real(mir_alphag(i)) - real(alphaind(3,i)))**2
+          sa  = sa  + real(alphaind(3,i))**2
+       endif
+    else
+       ninact = ninact + 1
+       if (mir_hg(i) /= xyzh(4,i) .or. mir_rhog(i) /= rho(i) .or. &
+           any(mir_gradhg(:,i) /= gradh(:,i)) .or. mir_divvg(i) /= divcurlv(1,i)) &
+          ntouch_gpu = ntouch_gpu + 1
+       if (nalpha >= 3) then
+          if (mir_alphag(i) /= alphaind(3,i)) ntouch_gpu = ntouch_gpu + 1
+       endif
+       if (xyzh(4,i) /= mir_h0(i) .or. rho(i) /= mir_rho0(i) .or. &
+           any(gradh(:,i) /= mir_gradh0(:,i)) .or. divcurlv(1,i) /= mir_divv0(i)) &
+          ntouch_cpu = ntouch_cpu + 1
+    endif
+ enddo
+ !$omp end parallel do
+ mir_ncall = mir_ncall + 1
+ write(iprint,'(a,i6,a,i10,a,i10,4(a,es9.2),a,es9.2,a,2i8)') &
+    ' COSMO_DENS_MIRROR call',mir_ncall,' active',nact,' inactive',ninact, &
+    ' dh',dh,' drho',drho,' domega',domega,' ddivv',sqrt(sdv/max(sv,tiny(sv))), &
+    ' dddivvdt',sqrt(sda/max(sa,tiny(sa))),' inactive_gpu_ne_cpu/cpu_changed',ntouch_gpu,ntouch_cpu
+
+end subroutine gpu_dens_mirror_after
 
 end module gpu_dens_iface

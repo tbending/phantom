@@ -76,6 +76,7 @@ subroutine force_gpu(npart,xyzh,vxyzu,eos_vars,alphaind,fxyzu,divcurlv,dt)
  use part,    only:massoftype,igas
  use options, only:beta,alphau
  use dim,     only:maxvxyzu,driving,disc_viscosity,track_lum,h2chemistry,store_dust_temperature
+ use dim,     only:ind_timesteps
  use io,      only:fatal
  use part,    only:ien_type,ien_entropy,ien_entropy_s,rho,isdead_or_accreted
  use eos,     only:icooling,ipdv_heating,ishock_heating
@@ -125,6 +126,10 @@ subroutine force_gpu(npart,xyzh,vxyzu,eos_vars,alphaind,fxyzu,divcurlv,dt)
  logical, save    :: stats_checked = .false.
 
  if (npart <= 0) return
+
+ !--the density pass honours phantom's activity; this one does not yet (it would
+ !  overwrite the inactive particles' forces and set no timestep bins)
+ if (ind_timesteps) call fatal('force_gpu','individual timesteps not supported on the GPU force pass yet')
 
  !--two-fluid dust: gas-dust drag, explicit or implicit (drag_implicit), with or without
  !  reconstruction (irecon), as force.F90; idrag = 0 would still need the gas-dust pairs

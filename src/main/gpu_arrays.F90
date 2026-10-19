@@ -118,7 +118,8 @@ module gpu_arrays
  integer, parameter, public :: ibun_drag_out = 11  ! drag ax, ay, az, min pair stopping time
  integer, parameter, public :: ibun_dvdx     = 12  ! velocity gradient tensor, device only
  integer, parameter, public :: ibun_dragold  = 13  ! previous pass's drag ax, ay, az (implicit drag)
- integer, parameter, public :: nbundle       = 13
+ integer, parameter, public :: ibun_active   = 14  ! 1 active / 0 inactive (individual timesteps)
+ integer, parameter, public :: nbundle       = 14
 
  type :: bundle_t
     character(len=10) :: name  = ''
@@ -250,7 +251,7 @@ contains
 !+
 !-------------------------------------------------------------
 subroutine gpu_arrays_init(n)
- use dim,  only:use_dust
+ use dim,  only:use_dust,ind_timesteps
  use dust, only:drag_implicit
 #ifdef GPU
  use io, only:fatal
@@ -298,6 +299,10 @@ subroutine gpu_arrays_init(n)
  !  (force.F90's fxyz_dragold).  The device order changes with every density solve, so
  !  phantom keeps it and sends it before each force pass.
  bundle(ibun_dragold)  = bundle_t('drag_old', 3, idir_up,     use_dust .and. drag_implicit)
+ !--individual timesteps: which particles phantom has active this step (iactive), so
+ !  the solve iterates those alone.  Phantom order, sent with the positions before the
+ !  solve sorts them, never fetched back.  A double per particle for now: one slot type.
+ bundle(ibun_active)   = bundle_t('active',   1, idir_up,     ind_timesteps)
 
  !--lay the live bundles out end to end.  device_only rows take no arena space.
  off = 1
@@ -433,9 +438,10 @@ subroutine gpu_arrays_upload(ib, n)
  else
     !--the ordering on the device is stale, which is only the case between new
     !  positions and the solve that sorts them; the only bundles that belong in
-    !  that window are the ones the solve itself reads
+    !  that window are the ones the solve itself reads (activity: individual timesteps)
     if (ib /= ibun_pos .and. ib /= ibun_hsml .and. &
-        ib /= ibun_vel .and. ib /= ibun_accel .and. ib /= ibun_ptype) &
+        ib /= ibun_vel .and. ib /= ibun_accel .and. ib /= ibun_ptype .and. &
+        ib /= ibun_active) &
        call fatal('gpu_arrays_upload','bundle sent between new positions and the '//&
                   'solve that sorts them: move it after the density solve',ival=ib)
     call cosmo_upload(int(ib, kind=c_int), p, int(n, kind=c_int))
