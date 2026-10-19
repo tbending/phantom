@@ -58,10 +58,15 @@ module kdtree
  integer,         allocatable, private :: leaves_built(:),leafk(:)   ! leaves, and each leaf's number
  ! for revise_all_leaves: the subtrees rooted at level sub_lsub, split into one run of
  ! consecutive subtrees per thread with about equal numbers of particles (thread it
- ! takes roots sub_first(it) to sub_first(it+1)-1), for a team of sub_nthreads
- integer,         allocatable, private :: sub_first(:)
+ ! takes roots sub_first(it) to sub_first(it+1)-1), for a team of sub_nthreads.  The
+ ! tree's nodes are listed subtree by subtree in depth-first preorder (tree_nodes: root
+ ! r's run from sub_node_first(r-2**sub_lsub+1) to the next root's start minus one), so
+ ! that read backwards every node comes before its parent; lev is each node's level.
+ ! in_tree marks the nodes of the levels above the subtrees (the node array keeps stale
+ ! entries from earlier builds).
+ integer,         allocatable, private :: sub_first(:),tree_nodes(:),sub_node_first(:)
  integer, private :: sub_lsub = -1, sub_ltop = -1, sub_nthreads = -1
- integer(kind=1), allocatable, private :: in_tree(:)
+ integer(kind=1), allocatable, private :: in_tree(:),lev(:)
  real,            allocatable, private :: mass_node(:)
  ! phase 2: a leaf whose particles are all inactive (and none newly woken) is given, when
  ! visited, a sphere that holds its particles as they drift until t_valid (the first time one
@@ -126,8 +131,9 @@ subroutine deallocate_kdtree
  if (allocated(inodeparts)) deallocate(inodeparts)
  if (mpi .and. allocated(refinementnode)) deallocate(refinementnode)
  if (allocated(tcbuf)) deallocate(tcbuf,ipbuf)
- if (allocated(leaves_built)) deallocate(leaves_built,leafk,in_tree,mass_node)
+ if (allocated(leaves_built)) deallocate(leaves_built,leafk,in_tree,mass_node,tree_nodes,lev)
  if (allocated(sub_first)) deallocate(sub_first)
+ if (allocated(sub_node_first)) deallocate(sub_node_first)
  if (allocated(leaf_of)) deallocate(leaf_of,ibin_seen)
  if (allocated(was_active)) deallocate(was_active,t_valid,visit_mark,visit_list)
  if (allocated(node_stamp)) deallocate(node_stamp,dirty_list)
@@ -379,119 +385,151 @@ end subroutine maketree
 !--------------------------------------------------------------------------------
 !+
 !  After a full build: record what revise_tree needs to update the tree in place.
-!  The nodes that belong to this tree are found top-down from the root (the node
-!  array keeps stale entries from earlier builds), and the leaves are listed.
-!  Revision is possible only within the indexed levels (children of n are 2n, 2n+1).
+!  The levels above the subtrees are found top down by index (within the indexed
+!  levels the children of n are 2n and 2n+1); then each thread walks its subtrees
+!  depth first, listing their nodes in preorder with each node's level, and the
+!  leaves are numbered in the same order.  Nothing depends on how deep the tree is
+!  or on how the nodes beyond the indexed levels are numbered.
 !+
 !--------------------------------------------------------------------------------
 subroutine record_tree(node,np,ncells,leaf_is_active,apr_tree)
-!$ use omp_lib, only:omp_get_max_threads
+!$ use omp_lib, only:omp_get_max_threads,omp_get_thread_num,omp_get_num_threads
  use part, only:gravity
  type(kdnode),    intent(in) :: node(:)
  integer,         intent(in) :: np
  integer(kind=8), intent(in) :: ncells
  integer,         intent(in) :: leaf_is_active(:)
  logical,         intent(in) :: apr_tree
- integer, allocatable :: nlist(:)
- integer :: n,l,nc,ic,nchunk,k,ltop,lsub,ir,d
+ integer, allocatable :: nlist(:),nleaf(:),mylist(:),tmp(:)
+ integer :: n,l,nc,nchunk,k,ltop,lsub,ir,ir0,ir1,it,nt,nroots,r1,m,i0,nmy,istk
+ integer :: stack(2*maxdepth)
 
  can_revise = .false.
  ! (not with self-gravity: revise_tree does not update the nodes' multipole moments)
- if (gravity .or. apr_tree .or. maxlevel > maxlevel_indexed) return
+ if (gravity .or. apr_tree) return
  nc = int(ncells)
  if (.not.allocated(leaves_built)) then
     allocate(leaves_built(size(node)),leafk(size(node)),in_tree(size(node)),mass_node(size(node)))
+    allocate(tree_nodes(size(node)),lev(size(node)))
  endif
  nchunk = 1
 !$ nchunk = omp_get_max_threads()
- allocate(nlist(0:nchunk))
- nlist = 0
-
- call subtree_levels(nchunk,maxlevel,ltop,lsub)
-
- !$omp parallel default(none) &
- !$omp shared(nc,node,leaf_is_active,in_tree,leaves_built,leafk,nlist,nchunk,maxlevel,ltop,lsub) &
- !$omp shared(inoderange) &
- !$omp private(n,l,ic,k,ir,d)
- !$omp do schedule(static)
- do n=1,nc
-    in_tree(n) = 0
- enddo
- !$omp end do
- ! a node is in the tree if its parent is an internal node of the tree: top down, the
- ! first levels serially, then a loop per level, then whole subtrees (see subtree_levels)
- !$omp single
+ maxlevel_built = maxlevel
+ call subtree_levels(nchunk,maxlevel+1,ltop,lsub)
+ if (lsub > maxlevel_indexed) return   ! (the levels above the subtrees are found by index)
+ nroots = 2**lsub
+ r1 = min(2*nroots-1,nc)
+ ! the levels above the subtrees: a node is in the tree if its parent is an internal
+ ! node of the tree
+ in_tree(1:r1) = 0
  in_tree(1) = 1
- do l=0,ltop-1
+ do l=0,lsub-1
     do n=2**l,min(2**(l+1)-1,nc)
-       call mark_children(n)
-    enddo
- enddo
- !$omp end single
- do l=ltop,lsub-1
-    !$omp do schedule(static)
-    do n=2**l,min(2**(l+1)-1,nc)
-       call mark_children(n)
-    enddo
-    !$omp end do
- enddo
- !$omp do schedule(static,1)
- do ir=2**lsub,min(2**(lsub+1)-1,nc)
-    do d=0,maxlevel-1-lsub
-       do n=ir*2**d,min((ir+1)*2**d-1,nc)
-          call mark_children(n)
-       enddo
-    enddo
- enddo
- !$omp end do
- ! the leaves listed (counted per chunk, then placed)
- !$omp do schedule(static)
- do ic=1,nchunk
-    k = 0
-    do n=int((int(ic-1,8)*nc)/nchunk)+1,int((int(ic,8)*nc)/nchunk)
-       if (in_tree(n) == 1 .and. leaf_is_active(n) /= 0) k = k + 1
-    enddo
-    nlist(ic) = k
- enddo
- !$omp end do
- !$omp single
- do ic=1,nchunk
-    nlist(ic) = nlist(ic) + nlist(ic-1)
- enddo
- !$omp end single
- !$omp do schedule(static)
- do ic=1,nchunk
-    k = nlist(ic-1)
-    do n=int((int(ic-1,8)*nc)/nchunk)+1,int((int(ic,8)*nc)/nchunk)
-       if (in_tree(n) == 1 .and. leaf_is_active(n) /= 0) then
-          k = k + 1
-          leaves_built(k) = n
-          leafk(n) = k
+       if (in_tree(n) /= 1) cycle
+       lev(n) = int(l,kind=1)
+       if (leaf_is_active(n) == 0 .and. inoderange(1,n) > 0) then
+          in_tree(node(n)%leftchild)  = 1
+          in_tree(node(n)%rightchild) = 1
        endif
     enddo
  enddo
- !$omp end do
- !$omp end parallel
-
- nleaves_built  = nlist(nchunk)
- npart_built    = np
- maxlevel_built = maxlevel
- can_revise     = .true.
- deallocate(nlist)
+ ! the subtree roots shared between the threads by particle count
  call split_subtrees(nchunk,nc)
- call record_leaves_of_particles()
-
-contains
-
-subroutine mark_children(n)
- integer, intent(in) :: n
-
- if (in_tree(n) == 1 .and. leaf_is_active(n) == 0 .and. inoderange(1,n) > 0) then
-    in_tree(node(n)%leftchild)  = 1
-    in_tree(node(n)%rightchild) = 1
+ if (allocated(sub_node_first)) then
+    if (size(sub_node_first) /= nroots+1) deallocate(sub_node_first)
  endif
+ if (.not.allocated(sub_node_first)) allocate(sub_node_first(nroots+1))
+ allocate(nlist(0:nchunk),nleaf(0:nchunk))
+ nlist = 0
+ nleaf = 0
 
-end subroutine mark_children
+ !$omp parallel default(none) &
+ !$omp shared(nchunk,nroots,r1,node,leaf_is_active,inoderange,in_tree,lev,sub_first,sub_nthreads) &
+ !$omp shared(sub_node_first,tree_nodes,leaves_built,leafk,nlist,nleaf,lsub) &
+ !$omp private(it,nt,ir0,ir1,ir,n,l,m,k,i0,nmy,istk,stack,mylist,tmp)
+ it = 0
+ nt = 1
+ !$ it = omp_get_thread_num()
+ !$ nt = omp_get_num_threads()
+ if (nt == sub_nthreads) then
+    ir0 = sub_first(it)
+    ir1 = sub_first(it+1) - 1
+ else   ! (a team of another size: an even split)
+    ir0 = nroots + int((int(it,8)*nroots)/nt)
+    ir1 = nroots + int((int(it+1,8)*nroots)/nt) - 1
+ endif
+ ! this thread's subtrees, each walked depth first (preorder: a node, then its left
+ ! subtree, then its right), into its own list
+ allocate(mylist(4096))
+ nmy = 0
+ do ir=ir0,min(ir1,r1)
+    sub_node_first(ir-nroots+1) = nmy + 1   ! (within this thread's list, for now)
+    if (in_tree(ir) /= 1) cycle
+    lev(ir) = int(lsub,kind=1)
+    istk = 1
+    stack(1) = ir
+    do while (istk > 0)
+       n = stack(istk)
+       istk = istk - 1
+       if (nmy == size(mylist)) then
+          allocate(tmp(2*nmy))
+          tmp(1:nmy) = mylist(1:nmy)
+          call move_alloc(tmp,mylist)
+       endif
+       nmy = nmy + 1
+       mylist(nmy) = n
+       if (leaf_is_active(n) == 0 .and. inoderange(1,n) > 0) then
+          l = lev(n) + 1
+          lev(node(n)%leftchild)  = int(l,kind=1)
+          lev(node(n)%rightchild) = int(l,kind=1)
+          stack(istk+1) = node(n)%rightchild
+          stack(istk+2) = node(n)%leftchild
+          istk = istk + 2
+       endif
+    enddo
+ enddo
+ nlist(it+1) = nmy
+ k = 0
+ do m=1,nmy
+    if (leaf_is_active(mylist(m)) /= 0) k = k + 1
+ enddo
+ nleaf(it+1) = k
+ !$omp barrier
+ ! the lists placed one after another (a running total, not a critical section), and
+ ! the leaves numbered in the same order
+ !$omp single
+ do m=1,nchunk
+    nlist(m) = nlist(m) + nlist(m-1)
+    nleaf(m) = nleaf(m) + nleaf(m-1)
+ enddo
+ !$omp end single
+ i0 = nlist(it)
+ tree_nodes(i0+1:i0+nmy) = mylist(1:nmy)
+ do ir=ir0,min(ir1,r1)
+    sub_node_first(ir-nroots+1) = sub_node_first(ir-nroots+1) + i0
+ enddo
+ k = nleaf(it)
+ do m=1,nmy
+    n = mylist(m)
+    if (leaf_is_active(n) /= 0) then
+       k = k + 1
+       leaves_built(k) = n
+       leafk(n) = k
+    endif
+ enddo
+ deallocate(mylist)
+ !$omp end parallel
+ ! (roots past the end of a small tree's node array have no nodes)
+ do ir=r1+1,2*nroots-1
+    sub_node_first(ir-nroots+1) = nlist(nchunk) + 1
+ enddo
+ sub_node_first(nroots+1) = nlist(nchunk) + 1
+
+ nleaves_built = nleaf(nchunk)
+ npart_built   = np
+ can_revise    = .true.
+ deallocate(nlist,nleaf)
+ call record_leaves_of_particles()
 
 end subroutine record_tree
 
@@ -714,7 +752,7 @@ subroutine revise_tree(node,xyzh,np,leaf_is_active,ncells,time,use_bounds,revise
        call revise_leaf(k,n,node,xyzh,leaf_is_active,dfac,use_bounds,time)
        ! mark the internal nodes above it (to be recomputed), stopping at one already
        ! marked; each thread lists those it marked, so no shared counter is contended
-       p = n/2
+       p = node(n)%parent
        do while (p >= 1)
           if (node_stamp(p) == tree_id) exit   ! (a plain read first: the top nodes are shared)
           !$omp atomic capture
@@ -729,7 +767,7 @@ subroutine revise_tree(node,xyzh,np,leaf_is_active,ncells,time,use_bounds,revise
           endif
           nmy = nmy + 1
           mydirty(nmy) = p
-          p = p/2
+          p = node(p)%parent
        enddo
     enddo
     !$omp end do nowait
@@ -748,19 +786,18 @@ subroutine revise_tree(node,xyzh,np,leaf_is_active,ncells,time,use_bounds,revise
     !$omp end parallel
     deallocate(nthread_dirty)
 
-    ! the marked internal nodes from their children, sorted by level (that of node p is
-    ! floor(log2 p)), deepest level first
+    ! the marked internal nodes from their children, sorted by level, deepest first
     allocate(levstart(0:maxlevel_built+1),bylevel(ndirty))
     levstart = 0
     do j=1,ndirty
-       l = bit_size(dirty_list(j)) - 1 - leadz(dirty_list(j))
+       l = lev(dirty_list(j))
        levstart(l+1) = levstart(l+1) + 1
     enddo
     do l=1,maxlevel_built+1
        levstart(l) = levstart(l) + levstart(l-1)
     enddo
     do j=1,ndirty
-       l = bit_size(dirty_list(j)) - 1 - leadz(dirty_list(j))
+       l = lev(dirty_list(j))
        levstart(l) = levstart(l) + 1
        bylevel(levstart(l)) = dirty_list(j)
     enddo
@@ -802,16 +839,16 @@ subroutine revise_all_leaves(node,xyzh,leaf_is_active,ncells,dfac,use_bounds,tim
  integer(kind=8), intent(in)    :: ncells
  real,            intent(in)    :: dfac,time
  logical,         intent(in)    :: use_bounds
- integer :: ltop,lsub,ir,d,n,l,nc,it,nt,ir0,ir1
+ integer :: ltop,lsub,ir,n,l,nc,it,nt,ir0,ir1,j,m
 
  nc   = int(ncells)
  ltop = sub_ltop
  lsub = sub_lsub
 
  !$omp parallel default(none) &
- !$omp shared(ltop,lsub,maxlevel_built,nc,in_tree,leaf_is_active,node,xyzh,dfac,use_bounds,time) &
- !$omp shared(leafk,sub_first,sub_nthreads) &
- !$omp private(ir,d,n,l,it,nt,ir0,ir1)
+ !$omp shared(ltop,lsub,nc,in_tree,leaf_is_active,node,xyzh,dfac,use_bounds,time) &
+ !$omp shared(leafk,sub_first,sub_nthreads,tree_nodes,sub_node_first) &
+ !$omp private(ir,n,l,it,nt,ir0,ir1,j,m)
  ! each thread its own run of neighbouring subtrees, split by particle count when the
  ! tree was built (see split_subtrees); no shared counter to contend on
  it = 0
@@ -827,15 +864,15 @@ subroutine revise_all_leaves(node,xyzh,leaf_is_active,ncells,dfac,use_bounds,tim
  endif
  do ir=ir0,min(ir1,nc)
     if (in_tree(ir) /= 1) cycle
-    do d=maxlevel_built-lsub,0,-1
-       do n=ir*2**d,min((ir+1)*2**d-1,nc)
-          if (in_tree(n) /= 1) cycle
-          if (leaf_is_active(n) /= 0) then
-             call revise_leaf(leafk(n),n,node,xyzh,leaf_is_active,dfac,use_bounds,time)
-          else
-             call combine_children(node,n)
-          endif
-       enddo
+    ! its nodes, every one before its parent (the preorder list read backwards)
+    j = ir - 2**lsub + 1
+    do m=sub_node_first(j+1)-1,sub_node_first(j),-1
+       n = tree_nodes(m)
+       if (leaf_is_active(n) /= 0) then
+          call revise_leaf(leafk(n),n,node,xyzh,leaf_is_active,dfac,use_bounds,time)
+       else
+          call combine_children(node,n)
+       endif
     enddo
  enddo
  !$omp barrier
