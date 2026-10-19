@@ -302,9 +302,14 @@ end subroutine build_tree
 !-----------------------------------------------------------------------
 subroutine list_active_leaves()
 !$ use omp_lib, only:omp_get_max_threads
+ use kdtree, only:active_leaves_of_tree
  integer, allocatable :: nlist(:)
  integer :: icell,ic,nchunk,n,k
+ logical :: listed
 
+ ! from the tree's leaf list when there is one; otherwise every cell slot is scanned
+ call active_leaves_of_tree(leaf_is_active,active_leaves,nactive_leaves,listed)
+ if (listed) return
  n = int(ncells)
  nchunk = 1
 !$ nchunk = omp_get_max_threads()

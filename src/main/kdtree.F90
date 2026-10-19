@@ -94,7 +94,7 @@ module kdtree
 
  public :: allocate_kdtree, deallocate_kdtree
  public :: maketree, revtree,kdnode
- public :: revise_tree
+ public :: revise_tree, active_leaves_of_tree
  public :: maketreeglobal
  public :: empty_tree
  integer, public :: maxlevel_indexed, maxlevel
@@ -532,6 +532,66 @@ subroutine record_tree(node,np,ncells,leaf_is_active,apr_tree)
  call record_leaves_of_particles()
 
 end subroutine record_tree
+
+!--------------------------------------------------------------------------------
+!+
+!  The active leaves (leaf_is_active > 0) of the recorded tree, from its leaf list
+!  rather than a scan of every cell slot (for list_active_leaves, after every build
+!  or revision).  listed is .false. when no tree is recorded (self-gravity, or the
+!  APR merge tree), and the caller scans instead.
+!+
+!--------------------------------------------------------------------------------
+subroutine active_leaves_of_tree(leaf_is_active,active_leaves,nactive,listed)
+!$ use omp_lib, only:omp_get_max_threads
+ integer, intent(in)  :: leaf_is_active(:)
+ integer, intent(out) :: active_leaves(:)
+ integer, intent(out) :: nactive
+ logical, intent(out) :: listed
+ integer, allocatable :: nlist(:)
+ integer :: n,nchunk,ic,k,m
+
+ nactive = 0
+ listed  = can_revise
+ if (.not.listed) return
+ n = nleaves_built
+ nchunk = 1
+!$ nchunk = omp_get_max_threads()
+ allocate(nlist(0:nchunk))
+ nlist = 0
+ ! counted per chunk, then placed
+ !$omp parallel default(none) &
+ !$omp shared(n,nchunk,nlist,leaves_built,leaf_is_active,active_leaves) &
+ !$omp private(ic,k,m)
+ !$omp do schedule(static)
+ do ic=1,nchunk
+    k = 0
+    do m=int((int(ic-1,8)*n)/nchunk)+1,int((int(ic,8)*n)/nchunk)
+       if (leaf_is_active(leaves_built(m)) > 0) k = k + 1
+    enddo
+    nlist(ic) = k
+ enddo
+ !$omp end do
+ !$omp single
+ do ic=1,nchunk
+    nlist(ic) = nlist(ic) + nlist(ic-1)
+ enddo
+ !$omp end single
+ !$omp do schedule(static)
+ do ic=1,nchunk
+    k = nlist(ic-1)
+    do m=int((int(ic-1,8)*n)/nchunk)+1,int((int(ic,8)*n)/nchunk)
+       if (leaf_is_active(leaves_built(m)) > 0) then
+          k = k + 1
+          active_leaves(k) = leaves_built(m)
+       endif
+    enddo
+ enddo
+ !$omp end do
+ !$omp end parallel
+ nactive = nlist(nchunk)
+ deallocate(nlist)
+
+end subroutine active_leaves_of_tree
 
 !--------------------------------------------------------------------------------
 !+
