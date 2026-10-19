@@ -82,7 +82,6 @@ module kdtree
  ! aligned with inodeparts (moved when a revision drops a dead particle).
  logical, public  :: all_fresh = .true.
  integer, private :: tree_id = 0
- integer, public  :: nleaves_visited = 0   ! leaves visited by the last revision (diagnostic)
 
 ! Index of the last node in the local tree that has been copied to
 ! the global tree
@@ -557,17 +556,18 @@ end subroutine record_leaves_of_particles
 !
 !  Internal nodes are recomputed from their two children, deepest first: centre of
 !  mass exactly, and a size that encloses the children's spheres.  When every leaf is
-!  visited (phase 1, and the first phase 2 revision after a build), each thread
-!  updates whole subtrees, leaves and then the nodes above them, so that it reads
-!  back what it has just written itself (see revise_all_leaves).  Otherwise the
-!  visited leaves are updated first, then the nodes above them.
+!  visited (phase 1, the first phase 2 revision after a build, and whenever more than
+!  1/8 of the leaves need visiting), each thread updates whole subtrees, leaves and
+!  then the nodes above them, so that it reads back what it has just written itself
+!  (see revise_all_leaves).  Otherwise only the visited leaves are updated, then only
+!  the nodes above them.
 !
 !  Nodes are never re-split, so their spheres loosen as particles move: the caller
 !  rebuilds periodically (see build_tree).  Returns revised=.false. (the caller must
 !  rebuild with maketree) if there is no tree to revise or particles have been created.
 !+
 !--------------------------------------------------------------------------------
-subroutine revise_tree(node,xyzh,np,leaf_is_active,ncells,time,use_bounds,revised,reason)
+subroutine revise_tree(node,xyzh,np,leaf_is_active,ncells,time,use_bounds,revised)
 !$ use omp_lib, only:omp_get_max_threads,omp_get_thread_num
  use part,         only:iactive,isdead_or_accreted,massoftype,igas,npartoftype,ibin
  use dim,          only:maxtypes
@@ -579,26 +579,18 @@ subroutine revise_tree(node,xyzh,np,leaf_is_active,ncells,time,use_bounds,revise
  real,            intent(in)    :: time
  logical,         intent(in)    :: use_bounds
  logical,         intent(out)   :: revised
- integer,         intent(out)   :: reason   ! 0 revised, 1 no tree, 2 particles created
  integer, allocatable :: nlist(:),bylevel(:),levstart(:),mydirty(:),tmp(:),nthread_dirty(:)
- integer :: k,kk,n,ip,i,l,nvisit,ndirty,nchunk,ic,p,old,j,nmy,nthreads,it,lsub,ir,d,ltop
+ integer :: k,kk,n,ip,i,l,nvisit,ndirty,nchunk,ic,p,old,j,nmy,nthreads,it
  logical :: partial,up_all,deaths
  integer(kind=8) :: ntot
  real    :: pmassi,dfac
 
  revised = .false.
- nleaves_visited = 0
- if (.not.can_revise) then
-    reason = 1
-    return
- endif
+ if (.not.can_revise) return
  ! new particles: rebuild (outside MPI they always raise npart; the alive count also
  ! catches one taking a dead particle's slot)
  ntot = sum(int(npartoftype,kind=8))
- if (np /= npart_built .or. ntot > ntot_seen) then
-    reason = 2
-    return
- endif
+ if (np /= npart_built .or. ntot > ntot_seen) return
  deaths = (ntot < ntot_seen)   ! some have died or been accreted since the last revision
  ! reference mass, as in construct_node, to keep the centre of mass sums well scaled
  pmassi = massoftype(igas)
@@ -692,11 +684,11 @@ subroutine revise_tree(node,xyzh,np,leaf_is_active,ncells,time,use_bounds,revise
  else
     nvisit = nleaves_built
  endif
- ! with few leaves visited, only the internal nodes above them are recomputed
+ ! with many leaves to visit, visit them all (and recompute every internal node, subtree
+ ! by subtree); with few, only those leaves, then only the internal nodes above them
  up_all = (nvisit > nleaves_built/8)
 
- if (.not.partial) then
-    ! every leaf, and every internal node, subtree by subtree
+ if (up_all) then
     call revise_all_leaves(node,xyzh,leaf_is_active,ncells,dfac,use_bounds,time)
  else
     ndirty = 0
@@ -707,12 +699,12 @@ subroutine revise_tree(node,xyzh,np,leaf_is_active,ncells,time,use_bounds,revise
 
     !$omp parallel default(none) &
     !$omp shared(nvisit,visit_list,leaves_built,node,xyzh,leaf_is_active,dfac,use_bounds,time) &
-    !$omp shared(up_all,tree_id,node_stamp,dirty_list,ndirty,nthread_dirty,nthreads) &
+    !$omp shared(tree_id,node_stamp,dirty_list,ndirty,nthread_dirty,nthreads) &
     !$omp private(kk,k,n,p,old,mydirty,tmp,nmy,it,j)
     nmy = 0
     it  = 0
     !$ it = omp_get_thread_num()
-    if (.not.up_all) allocate(mydirty(256))
+    allocate(mydirty(256))
     ! static: the leaves are small and alike, and with few of them a dynamic schedule's
     ! shared counter, contended by every thread, costs more than the work
     !$omp do schedule(static)
@@ -720,121 +712,76 @@ subroutine revise_tree(node,xyzh,np,leaf_is_active,ncells,time,use_bounds,revise
        k = visit_list(kk)
        n = leaves_built(k)
        call revise_leaf(k,n,node,xyzh,leaf_is_active,dfac,use_bounds,time)
-       if (.not.up_all) then
-          ! mark the internal nodes above it (to be recomputed), stopping at one already
-          ! marked; each thread lists those it marked, so no shared counter is contended
-          p = n/2
-          do while (p >= 1)
-             if (node_stamp(p) == tree_id) exit   ! (a plain read first: the top nodes are shared)
-             !$omp atomic capture
-             old = node_stamp(p)
-             node_stamp(p) = tree_id
-             !$omp end atomic
-             if (old == tree_id) exit
-             if (nmy == size(mydirty)) then
-                allocate(tmp(2*nmy))
-                tmp(1:nmy) = mydirty(1:nmy)
-                call move_alloc(tmp,mydirty)
-             endif
-             nmy = nmy + 1
-             mydirty(nmy) = p
-             p = p/2
-          enddo
-       endif
+       ! mark the internal nodes above it (to be recomputed), stopping at one already
+       ! marked; each thread lists those it marked, so no shared counter is contended
+       p = n/2
+       do while (p >= 1)
+          if (node_stamp(p) == tree_id) exit   ! (a plain read first: the top nodes are shared)
+          !$omp atomic capture
+          old = node_stamp(p)
+          node_stamp(p) = tree_id
+          !$omp end atomic
+          if (old == tree_id) exit
+          if (nmy == size(mydirty)) then
+             allocate(tmp(2*nmy))
+             tmp(1:nmy) = mydirty(1:nmy)
+             call move_alloc(tmp,mydirty)
+          endif
+          nmy = nmy + 1
+          mydirty(nmy) = p
+          p = p/2
+       enddo
     enddo
     !$omp end do nowait
-    if (.not.up_all) then
-       ! each thread's marked nodes placed in the list after those of the threads before it
-       ! (a running total, rather than a critical section every thread would queue for)
-       nthread_dirty(it+1) = nmy
-       !$omp barrier
-       !$omp single
-       do j=1,nthreads
-          nthread_dirty(j) = nthread_dirty(j) + nthread_dirty(j-1)
-       enddo
-       ndirty = nthread_dirty(nthreads)
-       !$omp end single
-       dirty_list(nthread_dirty(it)+1:nthread_dirty(it)+nmy) = mydirty(1:nmy)
-       deallocate(mydirty)
-    endif
+    ! each thread's marked nodes placed in the list after those of the threads before it
+    ! (a running total, rather than a critical section every thread would queue for)
+    nthread_dirty(it+1) = nmy
+    !$omp barrier
+    !$omp single
+    do j=1,nthreads
+       nthread_dirty(j) = nthread_dirty(j) + nthread_dirty(j-1)
+    enddo
+    ndirty = nthread_dirty(nthreads)
+    !$omp end single
+    dirty_list(nthread_dirty(it)+1:nthread_dirty(it)+nmy) = mydirty(1:nmy)
+    deallocate(mydirty)
     !$omp end parallel
     deallocate(nthread_dirty)
+
+    ! the marked internal nodes from their children, sorted by level (that of node p is
+    ! floor(log2 p)), deepest level first
+    allocate(levstart(0:maxlevel_built+1),bylevel(ndirty))
+    levstart = 0
+    do j=1,ndirty
+       l = bit_size(dirty_list(j)) - 1 - leadz(dirty_list(j))
+       levstart(l+1) = levstart(l+1) + 1
+    enddo
+    do l=1,maxlevel_built+1
+       levstart(l) = levstart(l) + levstart(l-1)
+    enddo
+    do j=1,ndirty
+       l = bit_size(dirty_list(j)) - 1 - leadz(dirty_list(j))
+       levstart(l) = levstart(l) + 1
+       bylevel(levstart(l)) = dirty_list(j)
+    enddo
+    ! (levstart(l) is now the last entry of level l)
+    !$omp parallel default(none) if (ndirty > 4096) &
+    !$omp shared(maxlevel_built,levstart,bylevel,node) &
+    !$omp private(l,j)
+    do l=maxlevel_built-1,0,-1
+       !$omp do schedule(static)
+       do j=merge(1,levstart(max(l-1,0))+1,l==0),levstart(l)
+          call combine_children(node,bylevel(j))
+       enddo
+       !$omp end do
+    enddo
+    !$omp end parallel
+    deallocate(levstart,bylevel)
  endif
- nleaves_visited = nvisit
  bounds_valid = use_bounds
  all_fresh    = .false.   ! treecache positions are now stale (see cache_neighbours)
  ntot_seen    = ntot
-
- if (partial) then
-    ! internal nodes from their children, deepest level first
-    if (up_all) then
-       call subtree_levels(nthreads,maxlevel_built,ltop,lsub)
-       !$omp parallel default(none) &
-       !$omp shared(ltop,lsub,maxlevel_built,ncells,in_tree,leaf_is_active,node) &
-       !$omp private(ir,d,n,l)
-       ! (static: each thread takes neighbouring subtrees, so that nodes sharing a cache
-       ! line are mostly written by the same thread; no shared counter to contend on)
-       !$omp do schedule(static)
-       do ir=2**lsub,min(2**(lsub+1)-1,int(ncells))
-          if (in_tree(ir) /= 1 .or. leaf_is_active(ir) /= 0) cycle
-          do d=maxlevel_built-1-lsub,0,-1
-             do n=ir*2**d,min((ir+1)*2**d-1,int(ncells))
-                if (in_tree(n) /= 1 .or. leaf_is_active(n) /= 0) cycle
-                call combine_children(node,n)
-             enddo
-          enddo
-       enddo
-       !$omp end do
-       do l=lsub-1,ltop,-1
-          !$omp do schedule(static)
-          do n=2**l,min(2**(l+1)-1,int(ncells))
-             if (in_tree(n) /= 1 .or. leaf_is_active(n) /= 0) cycle
-             call combine_children(node,n)
-          enddo
-          !$omp end do
-       enddo
-       !$omp single
-       do l=ltop-1,0,-1
-          do n=2**l,min(2**(l+1)-1,int(ncells))
-             if (in_tree(n) /= 1 .or. leaf_is_active(n) /= 0) cycle
-             call combine_children(node,n)
-          enddo
-       enddo
-       !$omp end single
-       !$omp end parallel
-    else
-       ! the marked nodes sorted by level (that of node p is floor(log2 p))
-       allocate(levstart(0:maxlevel_built+1),bylevel(ndirty))
-       levstart = 0
-       do j=1,ndirty
-          l = bit_size(dirty_list(j)) - 1 - leadz(dirty_list(j))
-          levstart(l+1) = levstart(l+1) + 1
-       enddo
-       do l=1,maxlevel_built+1
-          levstart(l) = levstart(l) + levstart(l-1)
-       enddo
-       do j=1,ndirty
-          l = bit_size(dirty_list(j)) - 1 - leadz(dirty_list(j))
-          levstart(l) = levstart(l) + 1
-          bylevel(levstart(l)) = dirty_list(j)
-       enddo
-       ! (levstart(l) is now the last entry of level l)
-       !$omp parallel default(none) if (ndirty > 4096) &
-       !$omp shared(maxlevel_built,levstart,bylevel,node) &
-       !$omp private(l,j)
-       do l=maxlevel_built-1,0,-1
-          !$omp do schedule(static)
-          do j=merge(1,levstart(max(l-1,0))+1,l==0),levstart(l)
-             call combine_children(node,bylevel(j))
-          enddo
-          !$omp end do
-       enddo
-       !$omp end parallel
-       deallocate(levstart,bylevel)
-    endif
- endif
- revised = .true.
- reason  = 0
+ revised      = .true.
 
 end subroutine revise_tree
 

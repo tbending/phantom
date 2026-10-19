@@ -16,7 +16,9 @@ module neighkdtree
 ! :Owner: Yann Bernard
 !
 ! :Runtime parameters:
-!   - tree_accuracy : *tree opening criterion (0.0-1.0)*
+!   - tree_accuracy       : *tree opening criterion (0.0-1.0)*
+!   - tree_rebuild_levels : *rebuild the tree every 2**n substeps (when revising it)*
+!   - tree_revise         : *update the tree in place between rebuilds*
 !
 ! :Dependencies: allocutils, boundary, dim, dtypekdtree, infile_utils, io,
 !   kdtree, kernel, mpiutils, part
@@ -57,6 +59,11 @@ module neighkdtree
  integer,         parameter         :: maxneigh_per_node  = 16
  integer,         parameter         :: maxstacksize = 2048
  integer                            :: globallevel,refinelevels
+ ! with individual timesteps, update the tree in place instead of rebuilding it when not
+ ! every particle is active, and rebuild it fully every 2**tree_rebuild_levels substeps
+ ! (see build_tree)
+ logical, public                    :: tree_revise = .true.
+ integer, public                    :: tree_rebuild_levels = 4
 
  public :: allocate_neigh, deallocate_neigh
  public :: build_tree, get_neighbour_list, write_options_tree, read_options_tree
@@ -214,9 +221,9 @@ end subroutine get_distance_from_centre_of_mass
 !+
 !-----------------------------------------------------------------------
 subroutine build_tree(npart,nactive,xyzh,vxyzu,for_apr,time,bounds_ok)
- use io,           only:nprocs,iprint
- use kdtree,       only:maketree,maketreeglobal,revise_tree,nleaves_visited
- use dim,          only:mpi,use_sinktree,ind_timesteps,use_apr
+ use io,           only:nprocs
+ use kdtree,       only:maketree,maketreeglobal,revise_tree
+ use dim,          only:mpi,use_sinktree,use_apr
  use part,         only:nptmass,xyzmh_ptmass,maxp
  use timestep_ind, only:istepfrac
  use allocutils,   only:allocate_array
@@ -229,10 +236,6 @@ subroutine build_tree(npart,nactive,xyzh,vxyzu,for_apr,time,bounds_ok)
  logical, intent(in), optional :: bounds_ok   ! no sinks, external forces or damping: leaves
                                               ! with only inactive particles need not be visited
  logical :: apr_tree,revised,use_bounds
- integer :: reason
- integer, save :: revise_mode = -1   ! EXPERIMENT: env PHANTOM_REVISE_TREE 0 off, 1 on, 2 on + log
- integer, save :: revise_levels = 4  ! EXPERIMENT: env PHANTOM_REVISE_LEVELS
- character(len=8) :: envval
 
  apr_tree = .false.
  if (present(for_apr)) apr_tree = for_apr
@@ -260,31 +263,21 @@ subroutine build_tree(npart,nactive,xyzh,vxyzu,for_apr,time,bounds_ok)
     else
        !
        ! with individual timesteps, update the tree in place when not every particle is
-       ! active (revise_tree says when it cannot, and the tree is rebuilt instead)
+       ! active (revise_tree says when it cannot, and the tree is rebuilt instead).  The
+       ! tree is never re-split between builds, so its nodes loosen as particles move:
+       ! rebuild fully whenever the particles tree_rebuild_levels timestep levels above
+       ! the shortest are active (every 2**tree_rebuild_levels substeps), as well as when
+       ! all are.  Between rebuilds particles are not wrapped back into a periodic box
+       ! (maketree does that), so each stays next to the rest of its leaf.
        !
-       if (revise_mode < 0) then
-          revise_mode = 1
-          call get_environment_variable('PHANTOM_REVISE_TREE',envval)
-          if (len_trim(envval) > 0) read(envval,*) revise_mode
-          call get_environment_variable('PHANTOM_REVISE_LEVELS',envval)
-          if (len_trim(envval) > 0) read(envval,*) revise_levels
-       endif
        revised = .false.
-       reason  = -1
-       !
-       ! the tree is never re-split between builds, so its nodes loosen as particles move:
-       ! rebuild fully whenever the particles revise_levels timestep levels above the
-       ! shortest are active (every 2**revise_levels substeps), as well as when all are
-       !
-       if (ind_timesteps .and. .not.apr_tree .and. .not.use_apr .and. nactive < npart .and. &
-           revise_mode > 0 .and. present(time) .and. mod(istepfrac,2**revise_levels) /= 0) then
+       if (tree_revise .and. revise_possible() .and. .not.apr_tree .and. nactive < npart .and. &
+           present(time) .and. mod(istepfrac,2**tree_rebuild_levels) /= 0) then
           use_bounds = .false.
-          if (present(bounds_ok)) use_bounds = bounds_ok .and. revise_mode /= 3   ! EXPERIMENT: 3 = phase 1
-          call revise_tree(node,xyzh,npart,leaf_is_active,ncells,time,use_bounds,revised,reason)
+          if (present(bounds_ok)) use_bounds = bounds_ok
+          call revise_tree(node,xyzh,npart,leaf_is_active,ncells,time,use_bounds,revised)
        endif
        if (.not.revised) call maketree(node,xyzh,npart,leaf_is_active,ncells,apr_tree)
-       if (revise_mode >= 2) write(iprint,"(a,l2,a,i3,a,i9,a,i9,a,i9)") ' REVISE ',revised,' reason',reason,&
-                                    ' nactive',nactive,' npart',npart,' visited',nleaves_visited
     endif
  endif
  call list_active_leaves()
@@ -470,6 +463,11 @@ subroutine write_options_tree(iunit)
  integer, intent(in) :: iunit
 
  if (gravity) call write_inopt(tree_accuracy,'tree_accuracy','tree opening criterion (0.0-1.0)',iunit)
+ if (revise_possible()) then
+    call write_inopt(tree_revise,'tree_revise','update the tree in place between rebuilds',iunit)
+    call write_inopt(tree_rebuild_levels,'tree_rebuild_levels',&
+                     'rebuild the tree every 2**n substeps (when revising it)',iunit)
+ endif
 
 end subroutine write_options_tree
 
@@ -486,8 +484,27 @@ subroutine read_options_tree(db,nerr)
  integer,      intent(inout) :: nerr
 
  if (gravity) call read_inopt(tree_accuracy,'tree_accuracy',db,errcount=nerr,min=0.,max=1.)
+ if (revise_possible()) then
+    call read_inopt(tree_revise,'tree_revise',db,errcount=nerr,default=.true.)
+    call read_inopt(tree_rebuild_levels,'tree_rebuild_levels',db,errcount=nerr,min=0,max=30,default=4)
+ endif
 
 end subroutine read_options_tree
+
+!-----------------------------------------------------------------------
+!+
+!  whether the tree can be updated in place between rebuilds (revise_tree):
+!  individual timesteps, and not with self-gravity (its multipole moments
+!  are not updated), MPI, APR or sinks in the tree
+!+
+!-----------------------------------------------------------------------
+logical function revise_possible()
+ use dim,  only:ind_timesteps,mpi,use_apr,use_sinktree
+ use part, only:gravity
+
+ revise_possible = ind_timesteps .and. .not.(gravity .or. mpi .or. use_apr .or. use_sinktree)
+
+end function revise_possible
 
 !-----------------------------------------------------------------------
 !+
