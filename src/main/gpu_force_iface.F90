@@ -142,9 +142,6 @@ subroutine force_gpu(npart,xyzh,vxyzu,eos_vars,alphaind,fxyzu,divcurlv,dt)
 
  if (npart <= 0) return
 
- !--two-fluid dust under individual timesteps needs activity in the drag pass too
- if (ind_timesteps .and. use_dust) call fatal('force_gpu','two-fluid dust with individual timesteps not supported on GPU yet')
-
  !--two-fluid dust: gas-dust drag, explicit or implicit (drag_implicit), with or without
  !  reconstruction (irecon), as force.F90; idrag = 0 would still need the gas-dust pairs
  !  for vsig, which the GPU only walks when there is drag.
@@ -355,7 +352,7 @@ subroutine force_gpu(npart,xyzh,vxyzu,eos_vars,alphaind,fxyzu,divcurlv,dt)
 
  if (ind_timesteps) then
     call finish_gpu_force_bins(npart,xyzh,vxyzu,fxyzu, &
-                               fx8,fy8,fz8,vsigmax8,spsound_8,ibn8,touch8)
+                               fx8,fy8,fz8,vsigmax8,spsound_8,tsmin8,ibn8,touch8)
  else
     call finish_gpu_force_timesteps(npart,xyzh,vxyzu,fxyzu, &
                                     fx8,fy8,fz8,vsigmax8,spsound_8,tsmin8)
@@ -563,43 +560,49 @@ end subroutine finish_gpu_force_timesteps
 !  per particle: the Courant and force timesteps, get_newbin, the
 !  Saitoh-Makino limiter against the neighbours' ibin_old, the new
 !  nbinmax; and ibin_wake on every neighbour of an active particle.
-!  Gas only: two-fluid dust is refused with individual timesteps.
+!  Gas, and two-fluid dust with explicit drag (the drag timestep).
 !+
 !-----------------------------------------------------------------------
 subroutine finish_gpu_force_bins(npart,xyzh,vxyzu,fxyzu, &
-                                 fx8,fy8,fz8,vsigmax8,spsound_8,ibn8,touch8)
+                                 fx8,fy8,fz8,vsigmax8,spsound_8,tsmin8,ibn8,touch8)
  use options,      only:alpha
  use timestep,     only:C_cour,C_force,bignumber,dtmax,dtrad
  use timestep_ind, only:nbinmax,ibinnow,get_newbin
- use part,         only:isdead_or_accreted,iphase,iactive,ibin,ibin_wake
- use dim,          only:maxvxyzu,gr
+ use part,         only:isdead_or_accreted,iphase,iactive,ibin,ibin_wake,iamtype,igas
+ use dim,          only:maxvxyzu,gr,use_dust
  use eos,          only:ieos
  use io,           only:fatal
+ use io_summary,   only:summary_variable,iosumdgr
 
  integer,        intent(in)    :: npart
  real,           intent(in)    :: xyzh(:,:),vxyzu(:,:)
  real,           intent(inout) :: fxyzu(:,:)
  real(c_double), intent(in)    :: fx8(:),fy8(:),fz8(:),vsigmax8(:),spsound_8(:)
+ real(c_double), pointer, contiguous, intent(in) :: tsmin8(:)   ! associated only with use_dust
  real(c_double), intent(in)    :: ibn8(:),touch8(:)
 
- integer           :: i,nbinmaxnew,ncheckbin
+ integer           :: i,nbinmaxnew,ncheckbin,ndustres
  integer(kind=1)   :: ibinnow_m1
- real              :: hi,vsigdtc,f2i,dtc,dtf,dti,dtitmp,eni
+ real              :: hi,vsigdtc,f2i,dtc,dtf,dti,dtitmp,eni,ts_min,dtdrag
+ real              :: dustresfacmean,dustresfacmax
  character(len=16) :: dtchar
- logical           :: limit_u
+ logical           :: limit_u,isgas
 
  dtrad      = bignumber
  ibinnow_m1 = ibinnow - 1_1
  nbinmaxnew = 0
  ncheckbin  = 0
+ ndustres       = 0
+ dustresfacmean = 0.
+ dustresfacmax  = 0.
  !--as force.F90: du/dt is limited so a Courant step cannot make u negative
  limit_u = (maxvxyzu >= 4 .and. .not.gr .and. ieos /= 23)
 
  !$omp parallel do default(none) schedule(static) &
- !$omp private(i,hi,vsigdtc,f2i,dtc,dtf,dti,dtitmp,eni,dtchar) &
- !$omp shared(npart,xyzh,vxyzu,fxyzu,limit_u,fx8,fy8,fz8,vsigmax8,spsound_8,ibn8,touch8) &
+ !$omp private(i,hi,vsigdtc,f2i,dtc,dtf,dti,dtitmp,eni,dtchar,isgas,ts_min,dtdrag) &
+ !$omp shared(npart,xyzh,vxyzu,fxyzu,limit_u,fx8,fy8,fz8,vsigmax8,spsound_8,tsmin8,ibn8,touch8) &
  !$omp shared(dtmax,C_cour,C_force,alpha,iphase,ibin,ibin_wake,ibinnow_m1) &
- !$omp reduction(max:nbinmaxnew) reduction(+:ncheckbin)
+ !$omp reduction(max:nbinmaxnew,dustresfacmax) reduction(+:ncheckbin,ndustres,dustresfacmean)
  do i = 1,npart
     hi = xyzh(4,i)
     if (isdead_or_accreted(hi)) cycle
@@ -608,11 +611,20 @@ subroutine finish_gpu_force_bins(npart,xyzh,vxyzu,fxyzu, &
     if (touch8(i) > 0.5_c_double) ibin_wake(i) = max(ibinnow_m1,ibin_wake(i))
     if (.not.iactive(iphase(i))) cycle
 
-    !--Courant, as force.F90 for gas
+    isgas = .true.
+    if (use_dust) isgas = (iamtype(iphase(i)) == igas)
+
+    !--Courant, as force.F90: gas with its own sound speed and alpha, other particles
+    !  (two-fluid dust) from the signal speed of their neighbours alone
     dtc = dtmax
-    vsigdtc = max(vsigmax8(i),spsound_8(i))
-    if (vsigdtc > tiny(vsigdtc)) dtc = C_cour*hi/(vsigdtc*max(alpha,1.0))
-    if (limit_u) then
+    if (isgas) then
+       vsigdtc = max(vsigmax8(i),spsound_8(i))
+       if (vsigdtc > tiny(vsigdtc)) dtc = C_cour*hi/(vsigdtc*max(alpha,1.0))
+    else
+       vsigdtc = vsigmax8(i)
+       if (vsigdtc > tiny(vsigdtc)) dtc = C_cour*hi/vsigdtc
+    endif
+    if (limit_u .and. isgas) then
        eni = vxyzu(4,i)
        if (eni + dtc*fxyzu(4,i) < epsilon(0.) .and. eni > epsilon(0.)) then
           fxyzu(4,i) = fxyzu(4,i)/(1.-dtc*fxyzu(4,i)/eni)
@@ -626,13 +638,29 @@ subroutine finish_gpu_force_bins(npart,xyzh,vxyzu,fxyzu, &
     dtf = bignumber
     if (abs(f2i) > epsilon(f2i)) dtf = C_force*sqrt(hi/sqrt(f2i))
 
+    !--two-fluid dust, as force.F90: tstop is the smallest pair stopping time, the
+    !  drag timestep 0.9 of it (explicit drag), and the check that gas resolves it
+    dtdrag = bignumber
+    if (use_dust) then
+       ts_min = min(real(tsmin8(i)),bignumber)
+       dtdrag = 0.9*ts_min
+       if (isgas .and. ts_min < bignumber) then
+          if (hi > ts_min*spsound_8(i)) then
+             ndustres       = ndustres + 1
+             dustresfacmean = dustresfacmean + hi/(ts_min*spsound_8(i))
+             dustresfacmax  = max(dustresfacmax, hi/(ts_min*real(spsound_8(i))))
+          endif
+       endif
+    endif
+
     !--the new timestep for particle i (the other constraints of force.F90 belong to
     !  physics the GPU path refuses, so they are all bignumber)
-    dtitmp = dtf
+    dtitmp = min(dtf,dtdrag)
     if (dtitmp < dti + tiny(dtitmp) .and. dtitmp < dtmax) then
        dti = dtitmp
        if (dti < tiny(dti) .or. dti > huge(dti)) call fatal('force_gpu','invalid dti',var='dti',val=dti)
        dtchar = 'dt_gasforce'
+       if (dtdrag < dtf) dtchar = 'dt_gasdrag'
     else
        dtchar = 'dt_courant'
     endif
@@ -648,6 +676,7 @@ subroutine finish_gpu_force_bins(npart,xyzh,vxyzu,fxyzu, &
  !--as force.F90: no active particle checked (all dead or inactive) keeps nbinmax
  if (ncheckbin == 0) nbinmaxnew = nbinmax
  nbinmax = int(nbinmaxnew,kind=1)
+ if (ndustres > 0) call summary_variable('dust',iosumdgr,ndustres,dustresfacmean/real(ndustres),dustresfacmax)
 
 end subroutine finish_gpu_force_bins
 
