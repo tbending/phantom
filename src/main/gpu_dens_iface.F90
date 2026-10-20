@@ -52,6 +52,7 @@ module gpu_dens_iface
 !   mpidomain, options, part, ptmass, ptmass_radiation, viscosity
 !
  use iso_c_binding, only:c_double
+ use gpu_arrays,    only:resident_feed
  use gpu_arrays,    only:gpu_arrays_init,gpu_arrays_comp,gpu_arrays_nbuf, &
                          gpu_arrays_mark_packed,gpu_arrays_upload,gpu_arrays_download, &
                          gpu_arrays_positions_moved,gpu_arrays_order_rebuilt, &
@@ -81,6 +82,18 @@ module gpu_dens_iface
    integer(c_int), value         :: keep_dvdx
    integer(c_int), value         :: use_active
   end subroutine densityiterate_gpu_c
+
+!--C interfaces to cosmoSPHere/src/resident.cu: the solve's inputs from the device's
+!  resident state (resident_feed)
+  subroutine cosmo_rs_wrap(n,box,dbound) bind(C)
+   use iso_c_binding, only:c_int,c_double
+   integer(c_int), value :: n
+   real(c_double), intent(in) :: box(6),dbound(3)
+  end subroutine cosmo_rs_wrap
+  subroutine cosmo_rs_feed_density(n,usedust,useactive) bind(C)
+   use iso_c_binding, only:c_int
+   integer(c_int), value :: n,usedust,useactive
+  end subroutine cosmo_rs_feed_density
 
 !--C interface to cosmo_kernel_radius in cosmoSPHere/src/dens_c_api.cu
   real(c_double) function cosmo_kernel_radius() bind(C)
@@ -176,7 +189,7 @@ subroutine densityiterate_gpu(npart, xyzh, vxyzu, fxyzu, fext, gradh, divcurlv, 
  use io,   only:fatal
  use dim,  only:periodic
  use part, only:isdead_or_accreted
- use boundary,  only:cross_boundary,xmin,xmax,ymin,ymax,zmin,zmax
+ use boundary,  only:cross_boundary,xmin,xmax,ymin,ymax,zmin,zmax,dxbound,dybound,dzbound
  use mpidomain, only:isperiodic
  use options,   only:tolh
  use dim,  only:curlv,mhd,use_dust,do_radiation,gravity,ind_timesteps,use_apr,gr,use_sinktree
@@ -359,12 +372,21 @@ subroutine densityiterate_gpu(npart, xyzh, vxyzu, fxyzu, fext, gradh, divcurlv, 
  !--these positions are for a new step, so the device's ordering is now stale; it
  !  describes where the particles were.  The solve below rebuilds it.
  call gpu_arrays_positions_moved()
- call gpu_arrays_upload(ibun_pos,   npart)
- call gpu_arrays_upload(ibun_hsml,  npart)
- call gpu_arrays_upload(ibun_vel,   npart)
- call gpu_arrays_upload(ibun_accel, npart)
- if (use_dust) call gpu_arrays_upload(ibun_ptype, npart)
- if (ind_timesteps) call gpu_arrays_upload(ibun_active, npart)
+ if (resident_feed) then
+    !--the same inputs from the device's own copy, device to device (gpu_resident)
+    if (periodic) call cosmo_rs_wrap(int(npart,kind=c_int), &
+                                     real([xmin,xmax,ymin,ymax,zmin,zmax],kind=c_double), &
+                                     real([dxbound,dybound,dzbound],kind=c_double))
+    call cosmo_rs_feed_density(int(npart,kind=c_int),merge(1_c_int,0_c_int,use_dust), &
+                               merge(1_c_int,0_c_int,ind_timesteps))
+ else
+    call gpu_arrays_upload(ibun_pos,   npart)
+    call gpu_arrays_upload(ibun_hsml,  npart)
+    call gpu_arrays_upload(ibun_vel,   npart)
+    call gpu_arrays_upload(ibun_accel, npart)
+    if (use_dust) call gpu_arrays_upload(ibun_ptype, npart)
+    if (ind_timesteps) call gpu_arrays_upload(ibun_active, npart)
+ endif
  pmass_dust = 0._c_double
  if (use_dust) pmass_dust = real(massoftype(idust), kind=c_double)
 

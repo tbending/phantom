@@ -47,6 +47,7 @@ subroutine derivs(icall,npart,nactive,xyzh,vxyzu,fxyzu,fext,divcurlv,divcurlB,&
  use gpu_dens_iface,  only:gpu_dens_mirror,gpu_dens_mirror_before,gpu_dens_mirror_after
  use gpu_force_iface, only:force_gpu,gpu_force_mirror_before,gpu_force_mirror_after
  use gpu_dens_iface,  only:gpu_force_mirror
+ use gpu_resident,    only:rs_after_cons2prim
  use ptmass,         only:ipart_rhomax,ptmass_calc_enclosed_mass,ptmass_boundary_crossing,get_pressure_on_sinks
  use externalforces, only:externalforce
  use part,           only:dustgasprop,Vrel_disp,dvdx,Bxyz,set_boundaries_to_active,&
@@ -178,6 +179,8 @@ subroutine derivs(icall,npart,nactive,xyzh,vxyzu,fxyzu,fext,divcurlv,divcurlB,&
     !--the GPU returns the xi limiter instead of dv/dx
     call cons2prim_everything(npart,xyzh,vxyzu,dvdx,rad,eos_vars,radprop,Bevol,Bxyz,dustevol,dustfrac,alphaind,&
                               xi_limiter_in=xi_gpu)
+    !--GPU individual timesteps, Phase 2/3: the device's twins (COSMO_MIRROR)
+    call rs_after_cons2prim(npart)
  else
     call cons2prim_everything(npart,xyzh,vxyzu,dvdx,rad,eos_vars,radprop,Bevol,Bxyz,dustevol,dustfrac,alphaind)
  endif

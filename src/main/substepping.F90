@@ -444,6 +444,7 @@ end subroutine substep
 subroutine drift(cki,dt,time_par,npart,nptmass,ntypes,xyzh,xyzmh_ptmass,vxyzu, &
                  vxyz_ptmass,fxyz_ptmass,gtgrad,n_group,n_ingroup,group_info, &
                  bin_info)
+ use gpu_resident, only:gpu_mirror,rs_after_subdrift
  use part, only:isdead_or_accreted,ispinx,ispiny,ispinz,igarg
  use ptmass,   only:ptmass_drift,use_regnbody
  use subgroup, only:subgroup_evolve
@@ -495,6 +496,8 @@ subroutine drift(cki,dt,time_par,npart,nptmass,ntypes,xyzh,xyzmh_ptmass,vxyzu, &
     if (use_regnbody) call bcast_mpi(vxyz_ptmass(:,1:nptmass))
     call bcast_mpi(xyzmh_ptmass(:,1:nptmass))
  endif
+ !--GPU individual timesteps, Phase 2: the device's twin (COSMO_MIRROR)
+ if (gpu_mirror) call rs_after_subdrift(npart,ckdt)
  time_par = time_par + ckdt !! update time for external potential in force routine
 
 end subroutine drift
@@ -507,6 +510,7 @@ end subroutine drift
 
 subroutine kick(dki,dt,npart,nptmass,ntypes,xyzh,pxyzu,xyzmh_ptmass,pxyz_ptmass, &
                 fext,fxyz_ptmass,dsdt_ptmass)
+ use gpu_resident, only:gpu_mirror,rs_after_kick
  use part,           only:isdead_or_accreted,iamtype,iamboundary,iphase,ispinx,ispiny,ispinz,igas,ndptmass
  use ptmass,         only:ptmass_kick
  use io,             only:id,master
@@ -555,6 +559,8 @@ subroutine kick(dki,dt,npart,nptmass,ntypes,xyzh,pxyzu,xyzmh_ptmass,pxyz_ptmass,
     endif
  enddo
  !$omp end parallel do
+ !--GPU individual timesteps, Phase 2: the device's twin (COSMO_MIRROR)
+ if (gpu_mirror) call rs_after_kick(npart,dkdt)
 
 end subroutine kick
 
@@ -566,6 +572,7 @@ end subroutine kick
 subroutine accretion(npart,nptmass,ntypes,xyzh,pxyzu,xyzmh_ptmass,pxyz_ptmass,&
                      fext,fxyz_ptmass,dsdt_ptmass,dptmass,ibin_wake,&
                      nbinmax,timei,fxyz_ptmass_sinksink,accreted)
+ use gpu_resident, only:gpu_mirror,rs_after_accretion
  use part,           only:isdead_or_accreted,massoftype,iamtype,iamboundary,iphase,ispinx,ispiny,ispinz,igas,ndptmass
  use part,           only:apr_level,aprmassoftype,ihacc
  use ptmass,         only:f_acc,ptmass_accrete,pt_write_sinkev,update_ptmass,ptmass_kick
@@ -727,6 +734,13 @@ subroutine accretion(npart,nptmass,ntypes,xyzh,pxyzu,xyzmh_ptmass,pxyz_ptmass,&
     if (npart==0) call pt_write_sinkev(nptmass,timei,xyzmh_ptmass,pxyz_ptmass, &
                                           fxyz_ptmass,fxyz_ptmass_sinksink)
  endif
+ if (gpu_mirror) then
+    if (present(nbinmax)) then
+       call rs_after_accretion(npart,ntypes,nptmass,xyzmh_ptmass,pxyz_ptmass,nbinmax)
+    else
+       call rs_after_accretion(npart,ntypes,nptmass,xyzmh_ptmass,pxyz_ptmass)
+    endif
+ endif
 
 end subroutine accretion
 
@@ -745,6 +759,7 @@ subroutine get_force(nptmass,npart,nsubsteps,ntypes,timei,dtextforce,xyzh,vxyzu,
                      group_info,nmatrix,fsink_old,&
                      metrics,metricderivs,metrics_ptmass,metricderivs_ptmass,dens,pxyzu_ptmass,&
                      skip_metric_update,recompute_gr_force)
+ use gpu_resident, only:gpu_mirror,rs_after_get_force,rs_before_gas_loop
  use io,              only:iverbose,master,id,iprint,warning,fatal
  use dim,             only:maxp,maxvxyzu,itau_alloc,gr,use_apr,maxptmass,use_sinktree
  use ptmass,          only:get_accel_sink_gas,get_accel_sink_sink,merge_sinks, &
@@ -910,6 +925,7 @@ subroutine get_force(nptmass,npart,nsubsteps,ntypes,timei,dtextforce,xyzh,vxyzu,
  !-- Forces on gas particles (Sink/gas,extf,damp,cooling,rad pressure)
  !
  call get_timings(t1,tcpu1)
+ if (gpu_mirror) call rs_before_gas_loop(nptmass,fxyz_ptmass)
 
  !$omp parallel default(none) &
  !$omp shared(maxp,maxphase,use_sinktree) &
@@ -1061,6 +1077,13 @@ subroutine get_force(nptmass,npart,nsubsteps,ntypes,timei,dtextforce,xyzh,vxyzu,
 
  deallocate(merge_ij)
  deallocate(ponsubg)
+ if (gpu_mirror) then
+    if (extrap) then
+       call rs_after_get_force(npart,ntypes,nptmass,xyzmh_ptmass,fxyz_ptmass,fonrmax,extrapfac,fsink_old)
+    else
+       call rs_after_get_force(npart,ntypes,nptmass,xyzmh_ptmass,fxyz_ptmass,fonrmax)
+    endif
+ endif
 
 end subroutine get_force
 

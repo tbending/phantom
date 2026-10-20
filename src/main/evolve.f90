@@ -182,6 +182,7 @@ subroutine evol_prestep(time,dtmax,dt,t1,tcpu1,nactive,inject_flag_present)
  use ptmass,       only:icreate_sinks,ipart_createstars
  use timestep,     only:dtextforce,dtinject,rhomaxnow
  use timestep_ind, only:istepfrac,nbinmax,set_active_particles,write_binsummary,nactivetot,maxbins
+ use gpu_resident,     only:rs_start_step
  use timing,       only:get_timings,timers,itimer_lastdump
  real,         intent(in)    :: time
  real,         intent(inout) :: dt,dtmax
@@ -226,6 +227,8 @@ subroutine evol_prestep(time,dtmax,dt,t1,tcpu1,nactive,inject_flag_present)
 
     !--flag particles as active or not for this timestep
     call set_active_particles(npart,nactive,nalive,nactivetot,nalivetot,iphase,ibin,xyzh)
+    !--GPU individual timesteps, Phase 2: the device's twin (COSMO_MIRROR)
+    call rs_start_step(npart,istepfrac,nbinmax)
     nskip = int(nactivetot)
 
     !--print summary of timestep bins

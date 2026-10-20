@@ -120,6 +120,8 @@ subroutine step(npart,nactive,t,dtsph,dtextforce,dtnew)
  use timestep,       only:dtmax
  use dynamic_dtmax,  only:dtmax_ifactor
  use timestep_ind,   only:get_dt,nbinmax,decrease_dtmax,dt_too_small
+ use gpu_resident,   only:gpu_mirror,rs_after_predictor,rs_after_substep,rs_after_predict_sph,&
+                          rs_after_derivs,rs_after_corrector
  use metric_tools,   only:imet_minkowski,imetric
  use cons2prim,      only:cons2primall,cons2primall_sink
  use extern_gr,      only:get_grforce_all
@@ -234,6 +236,8 @@ subroutine step(npart,nactive,t,dtsph,dtextforce,dtnew)
     endif
  enddo predictor
  !$omp end parallel do
+ !--GPU individual timesteps, Phase 2: the device's twin of the predictor (COSMO_MIRROR)
+ if (gpu_mirror) call rs_after_predictor(npart,timei,ufloor,icooling)
 
  !
  ! 1st ptmass kick (sink-gas)
@@ -276,8 +280,10 @@ subroutine step(npart,nactive,t,dtsph,dtextforce,dtnew)
                     fext,xyzmh_ptmass,vxyz_ptmass,fxyz_ptmass,fxyz_ptmass_tree,dsdt_ptmass,&
                     dptmass,fsink_old,nbinmax,ibin_wake,gtgrad, &
                     group_info,bin_info,nmatrix,n_group,n_ingroup,n_sing)
+       if (gpu_mirror) call rs_after_substep(npart,dtsph,.false.)
     else
        call substep_sph(dtsph,npart,xyzh,vxyzu)
+       if (gpu_mirror) call rs_after_substep(npart,dtsph,.true.)
     endif
  endif
  call get_timings(t2,tcpu2)
@@ -394,6 +400,7 @@ subroutine step(npart,nactive,t,dtsph,dtextforce,dtnew)
     endif
  enddo predict_sph
  !$omp end parallel do
+ if (gpu_mirror) call rs_after_predict_sph(npart,dtsph,timei,ufloor)
  if (use_dustgrowth) then
     if (use_porosity) then
        call get_filfac(npart,xyzh,dustprop(1,:),filfacpred,dustproppred,hdti,rho)
@@ -427,6 +434,7 @@ subroutine step(npart,nactive,t,dtsph,dtextforce,dtnew)
        call summary_printout(iprint,nptmass)
        call fatal('step','step too small: bin would exceed maximum')
     endif
+    if (gpu_mirror) call rs_after_derivs(npart)
  endif
 
 !
@@ -720,6 +728,7 @@ subroutine step(npart,nactive,t,dtsph,dtextforce,dtnew)
        print *, "end of iteration", maxval(vxyzu(4,:)), minval(vxyzu(4,:))
     endif
  enddo iterations
+ if (gpu_mirror) call rs_after_corrector(npart,timei,ibin_dts,maxbins,ithdt,ittwas,nbinmax,ufloor,icooling)
 
  !
  ! 2nd ptmass kick (no need to predict vel ptmass as they are not coupled to any vel dep force)

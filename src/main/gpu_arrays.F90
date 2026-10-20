@@ -166,6 +166,14 @@ module gpu_arrays
 !
  logical :: order_matches = .false.
 
+!
+! Individual timesteps on the GPU, Phase 3: the density and force passes take their
+! inputs from the device's resident state (gpu_resident, cosmoSPHere resident.cu)
+! instead of uploads.  Set by gpu_resident once that state exists, under
+! COSMO_RESIDENT_FEED; read by the density and force interfaces.
+!
+ logical, public :: resident_feed = .false.
+
 #ifdef GPU
  interface
 !--C interface to cosmoSPHere/src/pin_c_api.cu

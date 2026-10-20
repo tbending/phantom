@@ -35,6 +35,7 @@ module gpu_force_iface
 ! :Dependencies: dim, gpu_arrays, iso_c_binding, options, part, timestep
 !
  use iso_c_binding, only:c_double,c_int
+ use gpu_arrays,    only:resident_feed
  use gpu_arrays,    only:gpu_arrays_init,gpu_arrays_comp,gpu_arrays_claim_packed, &
                          gpu_arrays_upload, &
                          gpu_arrays_download, &
@@ -60,6 +61,13 @@ module gpu_force_iface
     integer(c_int), value       :: use_active        ! individual timesteps
     integer(c_int), value       :: has_u             ! maxvxyzu >= 4 (force.F90 usej)
     end subroutine force_gpu_c
+
+    !--the pass's inputs from the device's resident state (resident_feed)
+    subroutine cosmo_rs_feed_force(n,alphaperparticle,alphaconst,useactive) bind(C)
+    import :: c_int,c_double
+    integer(c_int), value :: n,alphaperparticle,useactive
+    real(c_double), value :: alphaconst
+    end subroutine cosmo_rs_feed_force
 
  end interface
 #endif
@@ -87,7 +95,8 @@ contains
 !-----------------------------------------------------------------------
 subroutine force_gpu(npart,xyzh,vxyzu,eos_vars,alphaind,fxyzu,divcurlv,dt)
  use part,    only:massoftype,igas
- use options, only:beta,alphau
+ use options, only:beta,alphau,alpha
+ use dim,     only:maxalpha,maxp
  use dim,     only:maxvxyzu,driving,disc_viscosity,track_lum,h2chemistry,store_dust_temperature
  use dim,     only:ind_timesteps,igradzeta,igradomega
  use part,    only:gradh,ibin_old,iactive
@@ -212,7 +221,13 @@ subroutine force_gpu(npart,xyzh,vxyzu,eos_vars,alphaind,fxyzu,divcurlv,dt)
     call gpu_arrays_upload(ibun_vel,npart)
  endif
 
- call gpu_arrays_upload(ibun_thermo,npart)
+ if (resident_feed) then
+    !--p/rho^2, c_s, alpha, u (and rho, zeta/Omega, ibin_old below) from the device's own copy
+    call cosmo_rs_feed_force(int(npart,c_int),merge(1_c_int,0_c_int,maxalpha == maxp), &
+                             real(alpha,c_double),merge(1_c_int,0_c_int,ind_timesteps))
+ else
+    call gpu_arrays_upload(ibun_thermo,npart)
+ endif
 
  !--individual timesteps: the solve formed rho and gradh for the active particles
  !  only.  An inactive one enters the force sum as force.F90 reads it, with the rho
@@ -229,7 +244,7 @@ subroutine force_gpu(npart,xyzh,vxyzu,eos_vars,alphaind,fxyzu,divcurlv,dt)
        ibo8(i)  = real(ibin_old(i),kind=c_double)
     enddo
     !$omp end parallel do
-    call gpu_arrays_upload(ibun_indts_in,npart)
+    if (.not.resident_feed) call gpu_arrays_upload(ibun_indts_in,npart)
  endif
 
  !--implicit drag, as force.F90: this pass reads the drag acceleration of the previous
