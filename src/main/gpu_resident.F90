@@ -78,6 +78,10 @@ module gpu_resident
    import :: c_int
    integer(c_int), value :: n,nvu
   end subroutine cosmo_rs_init
+  subroutine cosmo_rs_use_slots(n) bind(C)
+   import :: c_int
+   integer(c_int), value :: n
+  end subroutine cosmo_rs_use_slots
   subroutine cosmo_rs_put(field,host,n) bind(C)
    import :: c_int,c_double
    integer(c_int), value :: field,n
@@ -410,6 +414,9 @@ subroutine rs_start_step(npart,istepfrac,nbinmax,nactive,nalive,nactivetot,naliv
 #ifdef GPU
  if (.not.started) then
     call cosmo_rs_init(int(npart,c_int),int(nvu(),c_int))
+    !--with the passes fed from the state, keep it in the tree's order (cosmoSPHere
+    !  re-sorts it at each tree build; puts and gets translate)
+    if (gpu_feed) call cosmo_rs_use_slots(int(npart,c_int))
     do f = rs_pos,rs_last
        if (f == rs_dustgas .and. .not.use_dust) cycle
        if (f /= rs_active .and. f /= rs_vpred) call put(f,npart)
