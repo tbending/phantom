@@ -52,7 +52,7 @@ module gpu_dens_iface
 !   mpidomain, options, part, ptmass, ptmass_radiation, viscosity
 !
  use iso_c_binding, only:c_double
- use gpu_arrays,    only:resident_feed
+ use gpu_arrays,    only:resident_feed,resident_mode
  use gpu_arrays,    only:gpu_arrays_init,gpu_arrays_comp,gpu_arrays_nbuf, &
                          gpu_arrays_mark_packed,gpu_arrays_upload,gpu_arrays_download, &
                          gpu_arrays_positions_moved,gpu_arrays_order_rebuilt, &
@@ -279,8 +279,9 @@ subroutine densityiterate_gpu(npart, xyzh, vxyzu, fxyzu, fext, gradh, divcurlv, 
  !  massoftype(idust).  Boundary particles (wind shells, BHL inflow) are inactive after
  !  the first call on the CPU path, and stars, dark matter and other types have their
  !  own mass and physics, so refuse any other particle.  Checked every call, as
- !  injection adds particles.
- if (maxphase == maxp) then
+ !  injection adds particles.  (COSMO_RESIDENT: the types were checked on the first
+ !  step, and the resident path refuses injection.)
+ if (maxphase == maxp .and. .not.resident_mode) then
     nbound = 0
     nother = 0
     !$omp parallel do default(none) shared(npart,iphase) private(i) reduction(+:nbound,nother)
@@ -336,6 +337,8 @@ subroutine densityiterate_gpu(npart, xyzh, vxyzu, fxyzu, fext, gradh, divcurlv, 
  if (ind_timesteps) active8 => gpu_arrays_comp(ibun_active,1)
 
  ncross = 0
+ !--COSMO_RESIDENT: the device stages its own copy (cosmo_rs_feed_density below)
+ if (.not.resident_mode) then
  !$omp parallel do default(none) private(i) &
  !$omp shared(npart,xyzh,vxyzu,fxyzu,fext,x8,y8,z8,h8,vx8,vy8,vz8,ax8,ay8,az8) &
  !$omp shared(isperiodic,ptype8,active8,iphase) reduction(+:ncross)
@@ -364,6 +367,7 @@ subroutine densityiterate_gpu(npart, xyzh, vxyzu, fxyzu, fext, gradh, divcurlv, 
     if (ind_timesteps) active8(i) = merge(1._c_double, 0._c_double, iactive(iphase(i)))
  enddo
  !$omp end parallel do
+ endif
  !--the force pass that follows uses the same velocities, from the same bundle, so
  !  tell it not to pack them again (gpu_arrays `packed`)
  call gpu_arrays_mark_packed(ibun_vel)
@@ -403,6 +407,13 @@ subroutine densityiterate_gpu(npart, xyzh, vxyzu, fxyzu, fext, gradh, divcurlv, 
                             merge(1_c_int, 0_c_int, ind_timesteps))
  call gpu_arrays_order_rebuilt()
 
+ !--COSMO_RESIDENT: the results stay on the device (gpu_resident's density writeback)
+ if (resident_mode) then
+    call system_clock(ic2)
+    if (stats) write(0,'(a,f8.2,a,f8.2)') 'COSMO_FORT stage=',1.e3*real(ic1-ic0)/real(crate), &
+                                         ' capi=',1.e3*real(ic2-ic1)/real(crate)
+    return
+ endif
  !--the solve leaves its results on the device; fetch the three bundles it filled
  call gpu_arrays_download(ibun_hsml,     npart)
  call gpu_arrays_download(ibun_dens_out, npart)

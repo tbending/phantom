@@ -33,13 +33,15 @@ module gpu_resident
 ! :Dependencies: dim, io, part, shock_capturing, iso_c_binding
 !
  use iso_c_binding, only:c_double,c_int
- use gpu_arrays,    only:resident_feed
+ use gpu_arrays,    only:resident_feed,resident_mode
  implicit none
 
  logical, public :: gpu_mirror = .false.
  logical, save   :: gpu_feed = .false.     ! COSMO_RESIDENT_FEED: the pair passes read the resident state
+ logical, public :: gpu_resident_on = .false.  ! COSMO_RESIDENT: the device is the truth (implies both)
  public :: rs_init_switch,rs_start_step,rs_after_predictor,rs_after_substep
  public :: rs_after_predict_sph,rs_after_derivs,rs_after_corrector,rs_after_cons2prim
+ public :: rs_after_force,rs_download_all
  public :: rs_after_kick,rs_after_subdrift,rs_after_get_force,rs_after_accretion,rs_before_gas_loop
 
  private
@@ -48,7 +50,8 @@ module gpu_resident
  integer, parameter :: rs_pos = 1, rs_h = 2, rs_v = 3, rs_vpred = 4, rs_f = 5, rs_twas = 6, &
                        rs_ibin = 7, rs_ibinold = 8, rs_ibinwake = 9, rs_active = 10, &
                        rs_divv = 11, rs_cs = 12, rs_alpha1 = 13, rs_alphaloc = 14, rs_fext = 15, &
-                       rs_type = 16, rs_rho = 17, rs_gradh = 18, rs_xi = 19, rs_ddivvdt = 20, rs_pres = 21
+                       rs_type = 16, rs_rho = 17, rs_gradh = 18, rs_xi = 19, rs_ddivvdt = 20, rs_pres = 21, &
+                       rs_dustgas = 22, rs_last = 22
 
  !--checks counted per step: set_active, predictor, drift (plain and in the substep),
  !  predict_sph, corrector, kick, sink-gas force and accretion (in the substep), and the
@@ -85,9 +88,10 @@ module gpu_resident
    integer(c_int), value :: field,n
    real(c_double), intent(out) :: host(*)
   end subroutine cosmo_rs_get
-  integer(c_int) function cosmo_rs_set_active(n,istepfrac,nbinmax) bind(C)
+  integer(c_int) function cosmo_rs_set_active(n,istepfrac,nbinmax,nalive) bind(C)
    import :: c_int
    integer(c_int), value :: n,istepfrac,nbinmax
+   integer(c_int), intent(out) :: nalive
   end function cosmo_rs_set_active
   subroutine cosmo_rs_predictor(n,timei,ufloor,icooling) bind(C)
    import :: c_int,c_double
@@ -99,18 +103,20 @@ module gpu_resident
    integer(c_int), value :: n
    real(c_double), value :: dkdt
   end subroutine cosmo_rs_kick
-  real(c_double) function cosmo_rs_sink_gas(n,sink,nsink,massoftype,ntype,extrap,extrapfac,sinkacc) bind(C)
+  real(c_double) function cosmo_rs_sink_gas(n,sink,nsink,massoftype,ntype,extrap,extrapfac,sinkacc, &
+                                             dtfacphi2,dtphi2min) bind(C)
    import :: c_int,c_double
    integer(c_int), value :: n,nsink,ntype,extrap
    real(c_double), intent(in) :: sink(*),massoftype(*)
-   real(c_double), value :: extrapfac
-   real(c_double), intent(out) :: sinkacc(*)
+   real(c_double), value :: extrapfac,dtfacphi2
+   real(c_double), intent(out) :: sinkacc(*),dtphi2min
   end function cosmo_rs_sink_gas
-  integer(c_int) function cosmo_rs_accrete(n,sink,nsink,facc,nbinmax,radkern2) bind(C)
+  integer(c_int) function cosmo_rs_accrete(n,sink,nsink,facc,nbinmax,radkern2,massoftype,ntype,dptmass) bind(C)
    import :: c_int,c_double
-   integer(c_int), value :: n,nsink,nbinmax
-   real(c_double), intent(in) :: sink(*)
+   integer(c_int), value :: n,nsink,nbinmax,ntype
+   real(c_double), intent(in) :: sink(*),massoftype(*)
    real(c_double), value :: facc,radkern2
+   real(c_double), intent(out) :: dptmass(*)
   end function cosmo_rs_accrete
   integer(c_int) function cosmo_rs_new_bins(n,dtmax,ccour,cforce,alpha,istepfrac,nbinmaxold, &
                                             ibinnow,usedust,limitu) bind(C)
@@ -118,9 +124,9 @@ module gpu_resident
    integer(c_int), value :: n,istepfrac,nbinmaxold,ibinnow,usedust,limitu
    real(c_double), value :: dtmax,ccour,cforce,alpha
   end function cosmo_rs_new_bins
-  subroutine cosmo_rs_dens_writeback(n,massoftype,ntype,hfact,nalpha3) bind(C)
+  subroutine cosmo_rs_dens_writeback(n,massoftype,ntype,hfact,nalpha3,usedust) bind(C)
    import :: c_int,c_double
-   integer(c_int), value :: n,ntype,nalpha3
+   integer(c_int), value :: n,ntype,nalpha3,usedust
    real(c_double), intent(in) :: massoftype(*)
    real(c_double), value :: hfact
   end subroutine cosmo_rs_dens_writeback
@@ -173,8 +179,14 @@ subroutine rs_init_switch()
  call get_environment_variable('COSMO_MIRROR',val,ln,ierr)
  gpu_mirror = (ierr == 0 .and. ln > 0 .and. ind_timesteps)
  if (gpu_mirror) write(iprint,'(a)') ' cosmoSPHere: COSMO_MIRROR, device twins of the step checked against the host'
+ call get_environment_variable('COSMO_RESIDENT',val,ln,ierr)
+ gpu_resident_on = (ierr == 0 .and. ln > 0 .and. ind_timesteps)
+ if (gpu_resident_on) then
+    gpu_mirror = .true.
+    write(iprint,'(a)') ' cosmoSPHere: COSMO_RESIDENT, the device is the truth between dumps'
+ endif
  call get_environment_variable('COSMO_RESIDENT_FEED',val,ln,ierr)
- gpu_feed = gpu_mirror .and. (ierr == 0 .and. ln > 0)
+ gpu_feed = gpu_mirror .and. ((ierr == 0 .and. ln > 0) .or. gpu_resident_on)
  if (gpu_feed) write(iprint,'(a)') ' cosmoSPHere: COSMO_RESIDENT_FEED, the GPU passes read the resident state'
 #endif
 
@@ -214,7 +226,7 @@ end subroutine grow
 !-----------------------------------------------------------------------
 subroutine pack(field,npart,ncomp)
  use part, only:xyzh,vxyzu,vpred,fxyzu,twas,ibin,ibin_old,ibin_wake,iphase,iactive, &
-                divcurlv,eos_vars,ics,alphaind,fext,iamtype,rho,gradh,igasP
+                divcurlv,eos_vars,ics,alphaind,fext,iamtype,rho,gradh,igasP,dustfrac,ndustsmall
  use gpu_dens_iface, only:xi_gpu
  use dim,  only:nalpha
  integer, intent(in)  :: field,npart
@@ -284,6 +296,8 @@ subroutine pack(field,npart,ncomp)
     else
        hbuf(1:npart) = 0.
     endif
+ case(rs_dustgas)
+    hbuf(1:npart) = dustfrac(ndustsmall+1,1:npart)
  case(rs_type)
     do i = 1,npart
        hbuf(i) = real(iamtype(iphase(i)),kind=c_double)
@@ -299,8 +313,12 @@ end subroutine pack
 
 !--send one host field to the device
 subroutine put(field,npart)
+ use io, only:fatal
  integer, intent(in) :: field,npart
  integer :: ncomp
+ !--with the device the truth there is no host copy to send: a field reaching here has
+ !  no twin in this configuration
+ if (resident_mode) call fatal('gpu_resident','COSMO_RESIDENT: this field has no device twin here',ival=field)
  call pack(field,npart,ncomp)
 #ifdef GPU
  call cosmo_rs_put(int(field,c_int),hbuf,int(npart,c_int))
@@ -322,6 +340,11 @@ subroutine compare(icheck,field,npart,maxulp)
  integer(kind=8) :: nb
  real :: tol,ulps,ulpmax
  logical :: single   ! the field is real*4 in phantom: ulps at single precision
+
+ if (resident_mode) then   ! nothing to compare with: the host copy is stale by design
+    nrun(icheck) = nrun(icheck) + 1
+    return
+ endif
 
  call pack(field,npart,ncomp)
 #ifdef GPU
@@ -367,10 +390,16 @@ end subroutine compare
 !  whole state; then the activity twin, compared with iphase.
 !+
 !-----------------------------------------------------------------------
-subroutine rs_start_step(npart,istepfrac,nbinmax)
- integer,         intent(in) :: npart,istepfrac
- integer(kind=1), intent(in) :: nbinmax
- integer :: f,ncount
+subroutine rs_start_step(npart,istepfrac,nbinmax,nactive,nalive,nactivetot,nalivetot)
+ use timestep_ind, only:ibinnow
+ use dim,          only:use_dust
+ use part,         only:all_active
+ integer,         intent(in)    :: npart,istepfrac
+ integer(kind=1), intent(in)    :: nbinmax
+ integer,         intent(inout) :: nactive,nalive
+ integer(kind=8), intent(inout) :: nactivetot,nalivetot
+ integer :: f,ncount,i
+ integer(c_int) :: nalive_dev
 
  call rs_init_switch()
  if (.not.gpu_mirror .or. npart <= 0) return
@@ -381,14 +410,29 @@ subroutine rs_start_step(npart,istepfrac,nbinmax)
 #ifdef GPU
  if (.not.started) then
     call cosmo_rs_init(int(npart,c_int),int(nvu(),c_int))
-    do f = rs_pos,rs_pres
+    do f = rs_pos,rs_last
+       if (f == rs_dustgas .and. .not.use_dust) cycle
        if (f /= rs_active .and. f /= rs_vpred) call put(f,npart)
     enddo
     started = .true.
     resident_feed = gpu_feed
  endif
- ncount = cosmo_rs_set_active(int(npart,c_int),int(istepfrac,c_int),int(nbinmax,c_int))
+ ncount = cosmo_rs_set_active(int(npart,c_int),int(istepfrac,c_int),int(nbinmax,c_int),nalive_dev)
  call compare(1,rs_active,npart)
+ if (resident_mode) then
+    !--the host skipped set_active_particles: its counts and ibinnow from here
+    nactive = ncount; nalive = nalive_dev
+    nactivetot = ncount; nalivetot = nalive_dev
+    ibinnow = nbinmax
+    i = 0
+    do while (ibinnow == nbinmax .and. i < nbinmax)
+       if (mod(istepfrac,2**(nbinmax-i))==0) ibinnow = int(i,kind=1)
+       i = i + 1
+    enddo
+    all_active = (nactive == nalive)
+ endif
+ !--from the step after the one that sent the state, the device is the truth
+ if (gpu_resident_on .and. started) resident_mode = .true.
 #endif
 
 end subroutine rs_start_step
@@ -470,18 +514,19 @@ end subroutine rs_before_gas_loop
 !  Anything else, fext is re-sent.
 !+
 !-----------------------------------------------------------------------
-subroutine rs_after_get_force(npart,ntypes,nptmass,xyzmh_ptmass,fxyz_ptmass,fonrmax,extrapfac,fsink_old)
+subroutine rs_after_get_force(npart,ntypes,nptmass,xyzmh_ptmass,fxyz_ptmass,fonrmax,dtphi2,extrapfac,fsink_old)
  use dim,              only:use_sinktree,gr
  use options,          only:iexternalforce
  use damping,          only:idamp
- use ptmass,           only:isink_potential,use_regnbody
+ use ptmass,           only:isink_potential,use_regnbody,dtfacphi2
  use ptmass_radiation, only:isink_radiation
  use part,             only:ihsoft,iJ2,massoftype,igas,maxtypes
- integer, intent(in) :: npart,ntypes,nptmass
- real,    intent(in) :: xyzmh_ptmass(:,:),fonrmax,fxyz_ptmass(:,:)
+ integer, intent(in)    :: npart,ntypes,nptmass
+ real,    intent(in)    :: xyzmh_ptmass(:,:)
+ real,    intent(inout) :: fxyz_ptmass(:,:),fonrmax,dtphi2
  real,    intent(in), optional :: extrapfac,fsink_old(:,:)
  real(c_double), allocatable :: sink(:),sinkacc(:)
- real(c_double) :: fonrmax_dev
+ real(c_double) :: fonrmax_dev,dtphi2_dev
  real    :: fhost(3),scale
  integer :: j
  logical :: twin
@@ -505,16 +550,26 @@ subroutine rs_after_get_force(npart,ntypes,nptmass,xyzmh_ptmass,fxyz_ptmass,fonr
  if (present(extrapfac)) then
     fonrmax_dev = cosmo_rs_sink_gas(int(npart,c_int),sink,int(nptmass,c_int), &
                                     real(massoftype(1:maxtypes),c_double),int(maxtypes,c_int), &
-                                    1_c_int,real(extrapfac,c_double),sinkacc)
+                                    1_c_int,real(extrapfac,c_double),sinkacc,real(dtfacphi2,c_double),dtphi2_dev)
  else
     fonrmax_dev = cosmo_rs_sink_gas(int(npart,c_int),sink,int(nptmass,c_int), &
                                     real(massoftype(1:maxtypes),c_double),int(maxtypes,c_int), &
-                                    0_c_int,0._c_double,sinkacc)
+                                    0_c_int,0._c_double,sinkacc,real(dtfacphi2,c_double),dtphi2_dev)
+ endif
+ if (resident_mode) then
+    !--the host skipped its gas loop: the particles' pull on the sinks, and the sink-gas
+    !  timestep's inputs, from the device
+    do j = 1,nptmass
+       fxyz_ptmass(1:3,j) = fxyz_ptmass(1:3,j) + sinkacc(6*j-5:6*j-3)
+    enddo
+    fonrmax = max(fonrmax,fonrmax_dev)
+    dtphi2  = min(dtphi2,dtphi2_dev)
+    call compare(7,rs_fext,npart)
+    return
  endif
  call compare(7,rs_fext,npart)
  if (fonrmax_dev /= fonrmax) nbad(7) = nbad(7) + 1
- !--the particles' pull on each sink: sums in another order, so to 1e-12 of the sum of
- !  the absolute terms (a disc's net pull on its star nearly cancels)
+ if (dtphi2_dev /= dtphi2)   nbad(7) = nbad(7) + 1
  if (allocated(fsink_before)) then
     if (size(fsink_before,2) == nptmass) then
        do j = 1,nptmass
@@ -532,24 +587,30 @@ end subroutine rs_after_get_force
 
 !-----------------------------------------------------------------------
 !+
-!  After accretion.  The particle's side has a twin (h = -|h| for the
-!  accreted, the wake flags): one particle type, at most nfastacc sinks,
-!  no external-force accretion, no star formation (icreate_sinks 2), no
-!  APR.  Otherwise h and the wake flags are re-sent.
+!  Accretion, after the host's particle loop (skipped with COSMO_RESIDENT)
+!  and before it updates the sinks.  The particle's side has a twin (h =
+!  -|h| for the accreted, the wake flags) and the device also sums what
+!  each sink takes (dptmass): one particle type or gas and dust, at most
+!  nfastacc sinks, no external-force accretion, no star formation, no APR.
+!  Mirror: the count exactly, dptmass to 1e-12 relative.  Resident: the
+!  host gets the device's count and sums.
 !+
 !-----------------------------------------------------------------------
-subroutine rs_after_accretion(npart,ntypes,nptmass,xyzmh_ptmass,pxyz_ptmass,nbinmax)
+subroutine rs_after_accretion(npart,ntypes,nptmass,xyzmh_ptmass,pxyz_ptmass,dptmass,naccreted,nlive,nbinmax)
  use dim,         only:use_apr
  use options,     only:iexternalforce
  use ptmass,      only:icreate_sinks,f_acc
  use ptmass_tree, only:nfastacc
- use part,        only:ihacc
+ use part,        only:ihacc,massoftype,maxtypes
  use kernel,      only:radkern2
- integer,         intent(in) :: npart,ntypes,nptmass
- real,            intent(in) :: xyzmh_ptmass(:,:),pxyz_ptmass(:,:)
+ integer,         intent(in)    :: npart,ntypes,nptmass
+ real,            intent(in)    :: xyzmh_ptmass(:,:),pxyz_ptmass(:,:)
+ real,            intent(inout) :: dptmass(:,:)
+ integer,         intent(inout) :: naccreted,nlive
  integer(kind=1), intent(in), optional :: nbinmax
- real(c_double), allocatable :: sink(:)
+ real(c_double), allocatable :: sink(:),dd(:)
  integer :: j,nacc
+ real    :: scale
  logical :: twin
 
  if (.not.gpu_mirror .or. npart <= 0) return
@@ -560,15 +621,29 @@ subroutine rs_after_accretion(npart,ntypes,nptmass,xyzmh_ptmass,pxyz_ptmass,nbin
     call put(rs_ibinwake,npart)
     return
  endif
- allocate(sink(8*nptmass))
+ allocate(sink(8*nptmass),dd(13*nptmass))
  do j = 1,nptmass
     sink(8*j-7:8*j) = (/xyzmh_ptmass(1:4,j),xyzmh_ptmass(ihacc,j),pxyz_ptmass(1:3,j)/)
  enddo
 #ifdef GPU
  nacc = cosmo_rs_accrete(int(npart,c_int),sink,int(nptmass,c_int),real(f_acc,c_double), &
-                         int(nbinmax,c_int),real(radkern2,c_double))
+                         int(nbinmax,c_int),real(radkern2,c_double), &
+                         real(massoftype(1:maxtypes),c_double),int(maxtypes,c_int),dd)
  call compare(8,rs_h,npart)
  call compare(8,rs_ibinwake,npart)
+ if (resident_mode) then
+    naccreted = nacc
+    nlive     = npart    ! only feeds the host's 'all particles accreted' check
+    do j = 1,nptmass
+       dptmass(1:13,j) = dd(13*j-12:13*j)
+    enddo
+    return
+ endif
+ if (nacc /= naccreted) nbad(8) = nbad(8) + 1
+ do j = 1,nptmass
+    scale = max(maxval(abs(dptmass(1:13,j))),tiny(scale))
+    if (maxval(abs(dd(13*j-12:13*j) - dptmass(1:13,j))) > 1.e-12*scale) nbad(8) = nbad(8) + 1
+ enddo
 #else
  nacc = 0
 #endif
@@ -600,54 +675,65 @@ end subroutine rs_after_predict_sph
 
 !-----------------------------------------------------------------------
 !+
-!  After derivs, whose passes have no twins yet: re-send what they
-!  changed.  h (density, active particles), positions (wrapped into a
-!  periodic box), the force, div v, the sound speed, the local alpha, the
-!  new bins and the wake flags.
+!  In derivs, on the GPU path, straight after the force pass (derivs sets
+!  dtnew from nbinmax next): the force writeback twin, unless the host
+!  adds to the force (driving, cooling in the force pass), and the new
+!  bins, wake flags and du/dt limit.  Resident: the host's nbinmax is the
+!  device's.
 !+
 !-----------------------------------------------------------------------
-subroutine rs_after_derivs(npart)
- use dim,             only:maxalpha,maxp,nalpha,use_dust,maxvxyzu,gr,driving
- use gpu_dens_iface,  only:use_gpu_dens
+subroutine rs_after_force(npart)
+ use dim,             only:use_dust,maxvxyzu,gr,driving
  use timestep,        only:dtmax,C_cour,C_force
  use timestep_ind,    only:nbinmax,istepfrac,ibinnow
  use shock_capturing, only:alpha
- use part,            only:massoftype,maxtypes,hfact
  use options,         only:icooling
  use cooling,         only:cooling_in_step
  use eos,             only:ieos
  integer, intent(in) :: npart
  integer :: nbm
  logical :: force_twin,limit_u
- if (.not.gpu_mirror .or. npart <= 0) return
+ if (.not.gpu_mirror .or. npart <= 0 .or. .not.started) return
 #ifdef GPU
- if (use_gpu_dens) then
-    !--(the density writeback and cons2prim twins ran in rs_after_cons2prim)
-    !--the force pass's writeback, unless the host adds to the force (driving, cooling)
-    force_twin = .not.driving .and. .not.(maxvxyzu >= 4 .and. icooling > 0 .and. .not.cooling_in_step)
-    if (force_twin) then
-       call cosmo_rs_force_writeback(int(npart,c_int),merge(1_c_int,0_c_int,use_dust))
-    else
-       call put(rs_f,npart)
-       call put(rs_divv,npart)
-    endif
-    !--the new bins and wake flags (and the du/dt limit) from the force pass's results
-    limit_u = (maxvxyzu >= 4 .and. .not.gr .and. ieos /= 23 .and. force_twin)
-    nbm = cosmo_rs_new_bins(int(npart,c_int),real(dtmax,c_double),real(C_cour,c_double), &
-                            real(C_force,c_double),real(alpha,c_double),int(istepfrac,c_int), &
-                            int(nbinmax_before_derivs,c_int),int(ibinnow,c_int), &
-                            merge(1_c_int,0_c_int,use_dust),merge(1_c_int,0_c_int,limit_u))
-    call compare(9,rs_ibin,npart)
-    call compare(9,rs_ibinwake,npart)
-    if (nbm /= int(nbinmax)) nbad(9) = nbad(9) + 1
-    if (force_twin) then
-       call compare(11,rs_f,npart)
-       call compare(11,rs_divv,npart)
-    endif
-    return
+ force_twin = .not.driving .and. .not.(maxvxyzu >= 4 .and. icooling > 0 .and. .not.cooling_in_step)
+ if (force_twin) then
+    call cosmo_rs_force_writeback(int(npart,c_int),merge(1_c_int,0_c_int,use_dust))
+ else
+    call put(rs_f,npart)
+    call put(rs_divv,npart)
+ endif
+ limit_u = (maxvxyzu >= 4 .and. .not.gr .and. ieos /= 23 .and. force_twin)
+ nbm = cosmo_rs_new_bins(int(npart,c_int),real(dtmax,c_double),real(C_cour,c_double), &
+                         real(C_force,c_double),real(alpha,c_double),int(istepfrac,c_int), &
+                         int(nbinmax_before_derivs,c_int),int(ibinnow,c_int), &
+                         merge(1_c_int,0_c_int,use_dust),merge(1_c_int,0_c_int,limit_u))
+ call compare(9,rs_ibin,npart)
+ call compare(9,rs_ibinwake,npart)
+ if (resident_mode) then
+    nbinmax = int(nbm,kind=1)
+ elseif (nbm /= int(nbinmax)) then
+    nbad(9) = nbad(9) + 1
+ endif
+ if (force_twin) then
+    call compare(11,rs_f,npart)
+    call compare(11,rs_divv,npart)
  endif
 #endif
- nbm = 0
+end subroutine rs_after_force
+
+!-----------------------------------------------------------------------
+!+
+!  After derivs.  On the GPU path the twins ran inside it (rs_after_cons2prim,
+!  rs_after_force).  On the CPU path its passes have no twins: re-send what
+!  they changed.
+!+
+!-----------------------------------------------------------------------
+subroutine rs_after_derivs(npart)
+ use dim,             only:maxalpha,maxp,nalpha
+ use gpu_dens_iface,  only:use_gpu_dens
+ integer, intent(in) :: npart
+ if (.not.gpu_mirror .or. npart <= 0) return
+ if (use_gpu_dens) return
  call put(rs_pos,npart)
  call put(rs_cs,npart)
  call put(rs_pres,npart)
@@ -664,6 +750,103 @@ end subroutine rs_after_derivs
 
 !-----------------------------------------------------------------------
 !+
+!  COSMO_RESIDENT: copy the whole resident state to the host arrays, for
+!  the .ev file and dumps.  The host's copy is then current; nothing is
+!  sent back, as the device copy is the same.
+!+
+!-----------------------------------------------------------------------
+subroutine rs_download_all(npart)
+ use dim,  only:maxalpha,maxp,nalpha,use_dust
+ integer, intent(in) :: npart
+ integer :: f
+ if (.not.resident_mode .or. npart <= 0) return
+#ifdef GPU
+ do f = rs_pos,rs_last
+    if (f == rs_type) cycle
+    if (f == rs_dustgas .and. .not.use_dust) cycle
+    if (f == rs_alpha1 .and. maxalpha /= maxp) cycle
+    if (f == rs_alphaloc .and. .not.(maxalpha == maxp .and. nalpha >= 2)) cycle
+    if (f == rs_ddivvdt .and. nalpha < 3) cycle
+    call cosmo_rs_get(int(f,c_int),dbuf,int(npart,c_int))
+    call unpack(f,npart)
+ enddo
+#endif
+end subroutine rs_download_all
+
+!--the inverse of pack: dbuf (ncomp runs of npart doubles) into the host field
+subroutine unpack(field,npart)
+ use part, only:xyzh,vxyzu,vpred,fxyzu,twas,ibin,ibin_old,ibin_wake,iphase,iamtype, &
+                divcurlv,eos_vars,ics,alphaind,fext,rho,gradh,igasP,isetphase, &
+                dustfrac,ndustsmall
+ use gpu_dens_iface, only:xi_gpu
+ integer, intent(in) :: field,npart
+ integer :: i,c,ncomp
+
+ call grow(npart)
+ select case(field)
+ case(rs_pos)
+    do c = 1,3
+       xyzh(c,1:npart) = dbuf((c-1)*npart+1:c*npart)
+    enddo
+ case(rs_h)
+    xyzh(4,1:npart) = dbuf(1:npart)
+ case(rs_v,rs_vpred,rs_f)
+    ncomp = nvu()
+    do c = 1,ncomp
+       select case(field)
+       case(rs_v);     vxyzu(c,1:npart) = dbuf((c-1)*npart+1:c*npart)
+       case(rs_vpred); vpred(c,1:npart) = dbuf((c-1)*npart+1:c*npart)
+       case(rs_f);     fxyzu(c,1:npart) = dbuf((c-1)*npart+1:c*npart)
+       end select
+    enddo
+ case(rs_twas)
+    twas(1:npart) = dbuf(1:npart)
+ case(rs_ibin)
+    ibin(1:npart) = int(nint(dbuf(1:npart)),kind=1)
+ case(rs_ibinold)
+    ibin_old(1:npart) = int(nint(dbuf(1:npart)),kind=1)
+ case(rs_ibinwake)
+    ibin_wake(1:npart) = int(nint(dbuf(1:npart)),kind=1)
+ case(rs_active)
+    do i = 1,npart
+       iphase(i) = isetphase(iamtype(iphase(i)),iactive=(dbuf(i) > 0.5_c_double))
+    enddo
+ case(rs_divv)
+    divcurlv(1,1:npart) = real(dbuf(1:npart),kind=4)
+ case(rs_cs)
+    eos_vars(ics,1:npart) = dbuf(1:npart)
+ case(rs_alpha1)
+    alphaind(1,1:npart) = real(dbuf(1:npart),kind=4)
+ case(rs_alphaloc)
+    alphaind(2,1:npart) = real(dbuf(1:npart),kind=4)
+ case(rs_pres)
+    eos_vars(igasP,1:npart) = dbuf(1:npart)
+ case(rs_rho)
+    rho(1:npart) = dbuf(1:npart)
+ case(rs_gradh)
+    gradh(1,1:npart) = real(dbuf(1:npart),kind=4)
+    gradh(2,1:npart) = real(dbuf(npart+1:2*npart),kind=4)
+ case(rs_xi)
+    if (allocated(xi_gpu)) then
+       if (size(xi_gpu) >= npart) xi_gpu(1:npart) = dbuf(1:npart)
+    endif
+ case(rs_ddivvdt)
+    alphaind(3,1:npart) = real(dbuf(1:npart),kind=4)
+ case(rs_fext)
+    do c = 1,3
+       fext(c,1:npart) = dbuf((c-1)*npart+1:c*npart)
+    enddo
+ case(rs_dustgas)
+    !--the device's copy changed where densityiterate_gpu's writeback would have, and
+    !  holds the host's value elsewhere (one large grain size on the GPU, so this is the
+    !  only dustfrac row in use)
+    dustfrac(ndustsmall+1,1:npart) = dbuf(1:npart)
+ end select
+
+end subroutine unpack
+
+!-----------------------------------------------------------------------
+!+
 !  In derivs, on the GPU path, after the density pass and cons2prim and
 !  before the force pass: the density writeback and cons2prim twins, so
 !  that the resident state the force pass may read (COSMO_RESIDENT_FEED)
@@ -673,7 +856,7 @@ end subroutine rs_after_derivs
 !+
 !-----------------------------------------------------------------------
 subroutine rs_after_cons2prim(npart)
- use dim,  only:nalpha
+ use dim,  only:nalpha,use_dust
  use part, only:massoftype,maxtypes,hfact
  integer, intent(in) :: npart
  if (.not.gpu_mirror .or. npart <= 0 .or. .not.started) return
@@ -684,12 +867,14 @@ subroutine rs_after_cons2prim(npart)
  endif
 #ifdef GPU
  call cosmo_rs_dens_writeback(int(npart,c_int),real(massoftype(1:maxtypes),c_double), &
-                              int(maxtypes,c_int),real(hfact,c_double),merge(1_c_int,0_c_int,nalpha >= 3))
+                              int(maxtypes,c_int),real(hfact,c_double),merge(1_c_int,0_c_int,nalpha >= 3), &
+                              merge(1_c_int,0_c_int,use_dust))
  call compare(10,rs_h,npart)
  call compare(10,rs_rho,npart)
  call compare(10,rs_gradh,npart)
  call compare(10,rs_xi,npart)
  if (nalpha >= 3) call compare(10,rs_ddivvdt,npart)
+ if (use_dust) call compare(10,rs_dustgas,npart)
  call rs_cons2prim_twin(npart)
 #endif
 end subroutine rs_after_cons2prim

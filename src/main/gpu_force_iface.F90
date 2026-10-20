@@ -35,7 +35,7 @@ module gpu_force_iface
 ! :Dependencies: dim, gpu_arrays, iso_c_binding, options, part, timestep
 !
  use iso_c_binding, only:c_double,c_int
- use gpu_arrays,    only:resident_feed
+ use gpu_arrays,    only:resident_feed,resident_mode
  use gpu_arrays,    only:gpu_arrays_init,gpu_arrays_comp,gpu_arrays_claim_packed, &
                          gpu_arrays_upload, &
                          gpu_arrays_download, &
@@ -201,8 +201,12 @@ subroutine force_gpu(npart,xyzh,vxyzu,eos_vars,alphaind,fxyzu,divcurlv,dt)
     tsmin8 => gpu_arrays_comp(ibun_drag_out,4)
  endif
 
- call prepare_pro2_gpu(npart,xyzh,vxyzu,eos_vars,alphaind, &
-                       pro2_8,spsound_8,alphaAV_8,u_8)
+ !--(COSMO_RESIDENT: from the device's copy, cosmo_rs_feed_force below; the host's
+ !  eos_vars are stale by design)
+ if (.not.resident_mode) call prepare_pro2_gpu(npart,xyzh,vxyzu,eos_vars,alphaind, &
+                                               pro2_8,spsound_8,alphaAV_8,u_8)
+ if (resident_mode .and. use_dust .and. drag_implicit) &
+    call fatal('force_gpu','COSMO_RESIDENT: implicit drag has no device twin (drag_implicit = F)')
 
  !--positions and h are not sent: the GPU uses its copies from the density solve.
  !  Velocity is shared with the density pass, so if that pass packed it for this
@@ -210,6 +214,7 @@ subroutine force_gpu(npart,xyzh,vxyzu,eos_vars,alphaind,fxyzu,divcurlv,dt)
  !  later force pass on the same tree is the leapfrog corrector, whose velocities
  !  have changed, and the mark is gone by then, so it packs.
  if (.not. gpu_arrays_claim_packed(ibun_vel)) then
+    if (resident_mode) call fatal('force_gpu','COSMO_RESIDENT: a force pass without its density pass')
     !$omp parallel do default(none) schedule(static) private(i) shared(npart,vxyzu,vx8,vy8,vz8)
     do i = 1,npart
        vx8(i) = real(vxyzu(1,i),kind=c_double)
@@ -232,7 +237,7 @@ subroutine force_gpu(npart,xyzh,vxyzu,eos_vars,alphaind,fxyzu,divcurlv,dt)
  !--individual timesteps: the solve formed rho and gradh for the active particles
  !  only.  An inactive one enters the force sum as force.F90 reads it, with the rho
  !  and zeta/Omega (zetaomegaj) of its last active step; and ibin_old feeds the limiter.
- if (ind_timesteps) then
+ if (ind_timesteps .and. .not.resident_feed) then
     rhoh8 => gpu_arrays_comp(ibun_indts_in,1)
     zo8   => gpu_arrays_comp(ibun_indts_in,2)
     ibo8  => gpu_arrays_comp(ibun_indts_in,3)
@@ -244,7 +249,7 @@ subroutine force_gpu(npart,xyzh,vxyzu,eos_vars,alphaind,fxyzu,divcurlv,dt)
        ibo8(i)  = real(ibin_old(i),kind=c_double)
     enddo
     !$omp end parallel do
-    if (.not.resident_feed) call gpu_arrays_upload(ibun_indts_in,npart)
+    call gpu_arrays_upload(ibun_indts_in,npart)
  endif
 
  !--implicit drag, as force.F90: this pass reads the drag acceleration of the previous
@@ -290,6 +295,11 @@ subroutine force_gpu(npart,xyzh,vxyzu,eos_vars,alphaind,fxyzu,divcurlv,dt)
  !--the pass leaves its results on the device; fetch them
  call system_clock(ic2)
 
+ !--COSMO_RESIDENT: the results stay on the device (gpu_resident's force writeback
+ !  and new-bins twins, rs_after_force)
+ ic3 = ic2
+ ic4 = ic2
+ if (.not.resident_mode) then
  call gpu_arrays_download(ibun_force_out,npart)
  if (use_dust) call gpu_arrays_download(ibun_drag_out,npart)
  if (ind_timesteps) then
@@ -371,6 +381,7 @@ subroutine force_gpu(npart,xyzh,vxyzu,eos_vars,alphaind,fxyzu,divcurlv,dt)
  else
     call finish_gpu_force_timesteps(npart,xyzh,vxyzu,fxyzu, &
                                     fx8,fy8,fz8,vsigmax8,spsound_8,tsmin8)
+ endif
  endif
 
  !--as force.F90: the share of drag pairs in the Stokes and supersonic Epstein regimes

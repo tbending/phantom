@@ -183,6 +183,7 @@ subroutine evol_prestep(time,dtmax,dt,t1,tcpu1,nactive,inject_flag_present)
  use timestep,     only:dtextforce,dtinject,rhomaxnow
  use timestep_ind, only:istepfrac,nbinmax,set_active_particles,write_binsummary,nactivetot,maxbins
  use gpu_resident,     only:rs_start_step
+ use gpu_arrays,       only:resident_mode
  use timing,       only:get_timings,timers,itimer_lastdump
  real,         intent(in)    :: time
  real,         intent(inout) :: dt,dtmax
@@ -226,13 +227,14 @@ subroutine evol_prestep(time,dtmax,dt,t1,tcpu1,nactive,inject_flag_present)
     endif
 
     !--flag particles as active or not for this timestep
-    call set_active_particles(npart,nactive,nalive,nactivetot,nalivetot,iphase,ibin,xyzh)
-    !--GPU individual timesteps, Phase 2: the device's twin (COSMO_MIRROR)
-    call rs_start_step(npart,istepfrac,nbinmax)
+    !  (COSMO_RESIDENT: by the device, whose counts rs_start_step returns)
+    if (.not.resident_mode) call set_active_particles(npart,nactive,nalive,nactivetot,nalivetot,iphase,ibin,xyzh)
+    !--GPU individual timesteps: the device's twin (COSMO_MIRROR, COSMO_RESIDENT)
+    call rs_start_step(npart,istepfrac,nbinmax,nactive,nalive,nactivetot,nalivetot)
     nskip = int(nactivetot)
 
     !--print summary of timestep bins
-    if (iverbose >= 2) call write_binsummary(npart,nbinmax,dtmax,iphase,ibin,xyzh)
+    if (iverbose >= 2 .and. .not.resident_mode) call write_binsummary(npart,nbinmax,dtmax,iphase,ibin,xyzh)
 
     !--Implement dynamic boundaries (for individual-timestepping) once per dump
     if (dynamic_bdy .and. nactive==nalive .and. istepfrac==2**nbinmax) then
@@ -283,6 +285,9 @@ subroutine evol_poststep(infile,logfile,evfile,dumpfile,time,t1,tcpu1,dt,dtmax,n
  use timestep,        only:nsteps,rhomaxnow,use_divb_proj,divb_tol,divb_maxit
  use timestep_ind,    only:istepfrac
  use divb_projection, only:project_divb
+ use gpu_resident,    only:rs_download_all
+ use gpu_arrays,      only:resident_mode
+ use io,              only:iverbose
  character(len=*), intent(in)    :: infile
  character(len=*), intent(inout) :: logfile,evfile,dumpfile
  real,             intent(inout) :: time
@@ -323,6 +328,12 @@ subroutine evol_poststep(infile,logfile,evfile,dumpfile,time,t1,tcpu1,dt,dtmax,n
  !--Calculate total energy etc and write to ev file. Do this before writing dumps
  !   so that values calculated in energies are correctly included in the dumpfiles
  !
+ !  (COSMO_RESIDENT: the host's particle arrays are refreshed from the device first,
+ !  under write_ev_files' own condition, which also covers the dumps)
+ if (resident_mode) then
+    if (nskipped + nskip >= int(1.99*ntot,kind=8) .or. at_dump_time .or. iverbose == 5) &
+       call rs_download_all(npart)
+ endif
  call write_ev_files(ntot,time,dt,nskip,nskipped,nskipped_sink,at_dump_time)
  !
  !--write to data file if time is right

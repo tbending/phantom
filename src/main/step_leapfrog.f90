@@ -122,6 +122,7 @@ subroutine step(npart,nactive,t,dtsph,dtextforce,dtnew)
  use timestep_ind,   only:get_dt,nbinmax,decrease_dtmax,dt_too_small
  use gpu_resident,   only:gpu_mirror,rs_after_predictor,rs_after_substep,rs_after_predict_sph,&
                           rs_after_derivs,rs_after_corrector
+ use gpu_arrays,     only:resident_mode
  use metric_tools,   only:imet_minkowski,imetric
  use cons2prim,      only:cons2primall,cons2primall_sink
  use extern_gr,      only:get_grforce_all
@@ -151,12 +152,18 @@ subroutine step(npart,nactive,t,dtsph,dtextforce,dtnew)
  logical, parameter :: allow_waking = .true.
  integer, parameter :: maxits = 30
  logical            :: converged,store_itype
+ integer            :: nloop_rs   ! npart, or 0 when the device does the particles (COSMO_RESIDENT)
 
 !
 ! set initial quantities
 !
  timei  = t
  hdtsph = 0.5*dtsph
+ nloop_rs = npart
+ if (resident_mode) then
+    nloop_rs = 0
+    if (dtmax_ifactor /= 0) call fatal('step','COSMO_RESIDENT: changing dtmax mid-run has no device twin')
+ endif
  dterr  = bignumber
 ! determine twas for each ibin
  if (ind_timesteps) then
@@ -174,6 +181,7 @@ subroutine step(npart,nactive,t,dtsph,dtextforce,dtnew)
  ialphaloc = 2
  nvfloorp  = 0
  !$omp parallel do default(none) &
+ !$omp shared(nloop_rs) &
  !$omp shared(npart,xyzh,vxyzu,fxyzu,iphase,hdtsph,store_itype) &
  !$omp shared(rad,drad,pxyzu) &
  !$omp shared(Bevol,dBevol,dustevol,ddustevol,use_dustfrac) &
@@ -183,7 +191,7 @@ subroutine step(npart,nactive,t,dtsph,dtextforce,dtnew)
  !$omp firstprivate(itype) &
  !$omp private(i,hdti) &
  !$omp reduction(+:nvfloorp)
- predictor: do i=1,npart
+ predictor: do i=1,nloop_rs
     ! print *, "predictor, i=", i
     if (.not.isdead_or_accreted(xyzh(4,i))) then
        if (ind_timesteps) then
@@ -297,6 +305,7 @@ subroutine step(npart,nactive,t,dtsph,dtextforce,dtnew)
 ! force evaluations, using dtsph
 !----------------------------------------------------
 !$omp parallel do default(none) schedule(guided,1) &
+!$omp shared(nloop_rs) &
 !$omp shared(maxp,maxphase,maxalpha) &
 !$omp shared(xyzh,vxyzu,vpred,fxyzu,divcurlv,npart,store_itype,rho) &
 !$omp shared(pxyzu,ppred) &
@@ -311,7 +320,7 @@ subroutine step(npart,nactive,t,dtsph,dtextforce,dtnew)
 !$omp private(i,spsoundi,alphaloci) &
 !$omp firstprivate(itype,alpha) &
 !$omp reduction(+:nvfloorps)
- predict_sph: do i=1,npart
+ predict_sph: do i=1,nloop_rs
     if (.not.isdead_or_accreted(xyzh(4,i))) then
        if (store_itype) then
           itype = iamtype(iphase(i))
@@ -464,6 +473,7 @@ subroutine step(npart,nactive,t,dtsph,dtextforce,dtnew)
     ntypes  = get_ntypes(npartoftypetot)
     store_itype = (maxphase==maxp .and. ntypes > 1)
 !$omp parallel default(none) &
+!$omp shared(nloop_rs) &
 !$omp shared(xyzh,vxyzu,vpred,fxyzu,npart,hdtsph,store_itype) &
 !$omp shared(pxyzu,ppred) &
 !$omp shared(Bevol,dBevol,iphase,its) &
@@ -482,7 +492,7 @@ subroutine step(npart,nactive,t,dtsph,dtextforce,dtnew)
 !$omp reduction(+:np,v2mean,p2mean,nwake,nvfloorc) &
 !$omp firstprivate(itype)
 !$omp do
-    corrector: do i=1,npart
+    corrector: do i=1,nloop_rs
        if (.not.isdead_or_accreted(xyzh(4,i))) then
           if (store_itype) itype = iamtype(iphase(i))
           if (iamboundary(itype)) cycle corrector

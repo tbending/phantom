@@ -119,7 +119,7 @@ module ptmass
  real, parameter :: dtfacphi2fsi = dtfacphifsi**2
 
  real :: dtfacphi = dtfacphifsi
- real :: dtfacphi2 = dtfacphi2fsi
+ real, public :: dtfacphi2 = dtfacphi2fsi   ! public for the GPU path's device twin of get_force
 
  ! parameters to control output regarding sink particles
  logical, private, parameter :: record_created   = .false. ! verbose tracking of why sinks are not created

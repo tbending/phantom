@@ -47,7 +47,8 @@ subroutine derivs(icall,npart,nactive,xyzh,vxyzu,fxyzu,fext,divcurlv,divcurlB,&
  use gpu_dens_iface,  only:gpu_dens_mirror,gpu_dens_mirror_before,gpu_dens_mirror_after
  use gpu_force_iface, only:force_gpu,gpu_force_mirror_before,gpu_force_mirror_after
  use gpu_dens_iface,  only:gpu_force_mirror
- use gpu_resident,    only:rs_after_cons2prim
+ use gpu_resident,    only:rs_after_cons2prim,rs_after_force
+ use gpu_arrays,      only:resident_mode
  use ptmass,         only:ipart_rhomax,ptmass_calc_enclosed_mass,ptmass_boundary_crossing,get_pressure_on_sinks
  use externalforces, only:externalforce
  use part,           only:dustgasprop,Vrel_disp,dvdx,Bxyz,set_boundaries_to_active,&
@@ -176,9 +177,11 @@ subroutine derivs(icall,npart,nactive,xyzh,vxyzu,fxyzu,fext,divcurlv,divcurlB,&
  if (gr) then
     call cons2primall(npart,xyzh,metrics,pxyzu,vxyzu,dens,eos_vars)
  elseif (use_gpu_dens) then
-    !--the GPU returns the xi limiter instead of dv/dx
-    call cons2prim_everything(npart,xyzh,vxyzu,dvdx,rad,eos_vars,radprop,Bevol,Bxyz,dustevol,dustfrac,alphaind,&
-                              xi_limiter_in=xi_gpu)
+    !--the GPU returns the xi limiter instead of dv/dx.  COSMO_RESIDENT: the device's
+    !  twin below is the only one (the host's inputs are stale by design)
+    if (.not.resident_mode) &
+       call cons2prim_everything(npart,xyzh,vxyzu,dvdx,rad,eos_vars,radprop,Bevol,Bxyz,dustevol,dustfrac,alphaind,&
+                                 xi_limiter_in=xi_gpu)
     !--GPU individual timesteps, Phase 2/3: the device's twins (COSMO_MIRROR)
     call rs_after_cons2prim(npart)
  else
@@ -214,6 +217,9 @@ subroutine derivs(icall,npart,nactive,xyzh,vxyzu,fxyzu,fext,divcurlv,divcurlB,&
  !  leaves behind; it becomes its own switch in due course.
  if (use_gpu_dens) then
     call force_gpu(npart,xyzh,vxyzu,eos_vars,alphaind,fxyzu,divcurlv,dt)
+    !--GPU individual timesteps: the force writeback and new-bins twins (sets nbinmax
+    !  under COSMO_RESIDENT, read just below)
+    call rs_after_force(npart)
  else
     !--(DEV HATCH, Phase 1.2: COSMO_FORCE_MIRROR runs the GPU force alongside)
     if (gpu_force_mirror .and. icall==1) &

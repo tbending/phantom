@@ -173,6 +173,12 @@ module gpu_arrays
 ! COSMO_RESIDENT_FEED; read by the density and force interfaces.
 !
  logical, public :: resident_feed = .false.
+!
+! ... and with COSMO_RESIDENT, the device is the truth between dumps: the host skips its
+! per-particle loops in step, and its particle arrays are refreshed only from the device
+! (before .ev writes and dumps).  Set by gpu_resident once the state exists.
+!
+ logical, public :: resident_mode = .false.
 
 #ifdef GPU
  interface

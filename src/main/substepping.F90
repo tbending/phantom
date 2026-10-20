@@ -240,16 +240,19 @@ end subroutine substep_gr
 !----------------------------------------------------------------
 subroutine substep_sph(dt,npart,xyzh,vxyzu)
  use part, only:isdead_or_accreted
+ use gpu_arrays, only:resident_mode
  real,    intent(in)    :: dt
  integer, intent(in)    :: npart
  real,    intent(inout) :: xyzh(:,:)
  real,    intent(in)    :: vxyzu(:,:)
- integer :: i
+ integer :: i,nloop_rs
 
+ nloop_rs = npart
+ if (resident_mode) nloop_rs = 0   ! the device does the particles
  !$omp parallel do default(none) &
- !$omp shared(npart,xyzh,vxyzu,dt) &
+ !$omp shared(nloop_rs,xyzh,vxyzu,dt) &
  !$omp private(i)
- do i=1,npart
+ do i=1,nloop_rs
     if (.not.isdead_or_accreted(xyzh(4,i))) then
        !
        ! main position update
@@ -445,6 +448,7 @@ subroutine drift(cki,dt,time_par,npart,nptmass,ntypes,xyzh,xyzmh_ptmass,vxyzu, &
                  vxyz_ptmass,fxyz_ptmass,gtgrad,n_group,n_ingroup,group_info, &
                  bin_info)
  use gpu_resident, only:gpu_mirror,rs_after_subdrift
+ use gpu_arrays,   only:resident_mode
  use part, only:isdead_or_accreted,ispinx,ispiny,ispinz,igarg
  use ptmass,   only:ptmass_drift,use_regnbody
  use subgroup, only:subgroup_evolve
@@ -459,18 +463,20 @@ subroutine drift(cki,dt,time_par,npart,nptmass,ntypes,xyzh,xyzmh_ptmass,vxyzu, &
  real,    intent(inout) :: fxyz_ptmass(:,:),gtgrad(:,:),bin_info(:,:)
  integer, intent(in)    :: n_ingroup,n_group
  integer, intent(inout) :: group_info(:,:)
- integer :: i
+ integer :: i,nloop_rs
  real    :: ckdt
  real(kind=4) :: t1,t2,tcpu1,tcpu2
 
  ckdt = cki*dt
 
  ! Drift gas particles
+ nloop_rs = npart
+ if (resident_mode) nloop_rs = 0   ! the device does the particles
 
  !$omp parallel do default(none) &
- !$omp shared(npart,xyzh,vxyzu,ckdt) &
+ !$omp shared(nloop_rs,xyzh,vxyzu,ckdt) &
  !$omp private(i)
- do i=1,npart
+ do i=1,nloop_rs
     if (.not.isdead_or_accreted(xyzh(4,i))) then
        xyzh(1,i) = xyzh(1,i) + ckdt*vxyzu(1,i)
        xyzh(2,i) = xyzh(2,i) + ckdt*vxyzu(2,i)
@@ -511,6 +517,7 @@ end subroutine drift
 subroutine kick(dki,dt,npart,nptmass,ntypes,xyzh,pxyzu,xyzmh_ptmass,pxyz_ptmass, &
                 fext,fxyz_ptmass,dsdt_ptmass)
  use gpu_resident, only:gpu_mirror,rs_after_kick
+ use gpu_arrays,   only:resident_mode
  use part,           only:isdead_or_accreted,iamtype,iamboundary,iphase,ispinx,ispiny,ispinz,igas,ndptmass
  use ptmass,         only:ptmass_kick
  use io,             only:id,master
@@ -521,11 +528,13 @@ subroutine kick(dki,dt,npart,nptmass,ntypes,xyzh,pxyzu,xyzmh_ptmass,pxyz_ptmass,
  real,    intent(inout) :: xyzh(:,:)
  real,    intent(inout) :: pxyzu(:,:),fext(:,:)
  real,    intent(inout) :: xyzmh_ptmass(:,:),pxyz_ptmass(:,:),fxyz_ptmass(:,:),dsdt_ptmass(:,:)
- integer         :: i,itype
+ integer         :: i,itype,nloop_rs
  real            :: dkdt
 
  itype = igas
  dkdt = dki*dt
+ nloop_rs = npart
+ if (resident_mode) nloop_rs = 0   ! the device does the particles
  !
  ! Kick sink particles
  !
@@ -544,10 +553,10 @@ subroutine kick(dki,dt,npart,nptmass,ntypes,xyzh,pxyzu,xyzmh_ptmass,pxyz_ptmass,
  !$omp parallel do default(none) &
  !$omp shared(maxp,maxphase) &
  !$omp shared(iphase,ntypes) &
- !$omp shared(npart,fext,xyzh,pxyzu,dkdt) &
+ !$omp shared(nloop_rs,fext,xyzh,pxyzu,dkdt) &
  !$omp firstprivate(itype) &
  !$omp private(i)
- do i=1,npart
+ do i=1,nloop_rs
     if (.not.isdead_or_accreted(xyzh(4,i))) then
        if (ntypes > 1 .and. maxphase==maxp) then
           itype = iamtype(iphase(i))
@@ -573,6 +582,7 @@ subroutine accretion(npart,nptmass,ntypes,xyzh,pxyzu,xyzmh_ptmass,pxyz_ptmass,&
                      fext,fxyz_ptmass,dsdt_ptmass,dptmass,ibin_wake,&
                      nbinmax,timei,fxyz_ptmass_sinksink,accreted)
  use gpu_resident, only:gpu_mirror,rs_after_accretion
+ use gpu_arrays,   only:resident_mode
  use part,           only:isdead_or_accreted,massoftype,iamtype,iamboundary,iphase,ispinx,ispiny,ispinz,igas,ndptmass
  use part,           only:apr_level,aprmassoftype,ihacc
  use ptmass,         only:f_acc,ptmass_accrete,pt_write_sinkev,update_ptmass,ptmass_kick
@@ -599,7 +609,7 @@ subroutine accretion(npart,nptmass,ntypes,xyzh,pxyzu,xyzmh_ptmass,pxyz_ptmass,&
  integer(kind=1) :: ibin_wakei
  logical         :: was_accreted,fast_acc
  integer         :: i,itype,nfaili
- integer         :: naccreted,nfail,nlive,nboundary,nneigh
+ integer         :: naccreted,nfail,nlive,nboundary,nneigh,nloop_rs
  real            :: pmassi,xi,yi,zi,fxi,fyi,fzi,accretedmass
  real            :: rsearch
 
@@ -620,7 +630,10 @@ subroutine accretion(npart,nptmass,ntypes,xyzh,pxyzu,xyzmh_ptmass,pxyz_ptmass,&
  ibin_wakei   = 0
  rsearch      = maxval(xyzmh_ptmass(ihacc,1:nptmass))
  dptmass(:,1:nptmass) = 0.
+ nloop_rs = npart
+ if (resident_mode) nloop_rs = 0   ! the device does the particles
  !$omp parallel do default(none) &
+ !$omp shared(nloop_rs) &
  !$omp shared(maxp,maxphase) &
  !$omp shared(npart,xyzh,pxyzu,fext,iphase,ntypes,massoftype,timei,nptmass) &
  !$omp shared(xyzmh_ptmass,pxyz_ptmass,fxyz_ptmass,f_acc,apr_level,aprmassoftype) &
@@ -634,7 +647,7 @@ subroutine accretion(npart,nptmass,ntypes,xyzh,pxyzu,xyzmh_ptmass,pxyz_ptmass,&
  !$omp reduction(+:nlive) &
  !$omp reduction(+:nboundary) &
  !$omp reduction(+:dptmass)
- accreteloop: do i=1,npart
+ accreteloop: do i=1,nloop_rs
     if (.not.isdead_or_accreted(xyzh(4,i))) then
        if (ntypes > 1 .and. maxphase==maxp) then
           itype = iamtype(iphase(i))
@@ -699,6 +712,13 @@ subroutine accretion(npart,nptmass,ntypes,xyzh,pxyzu,xyzmh_ptmass,pxyz_ptmass,&
     endif
  enddo accreteloop
  !$omp end parallel do
+ if (gpu_mirror) then
+    if (present(nbinmax)) then
+       call rs_after_accretion(npart,ntypes,nptmass,xyzmh_ptmass,pxyz_ptmass,dptmass,naccreted,nlive,nbinmax)
+    else
+       call rs_after_accretion(npart,ntypes,nptmass,xyzmh_ptmass,pxyz_ptmass,dptmass,naccreted,nlive)
+    endif
+ endif
 
  call get_timings(t2,tcpu2)
  call increment_timer(itimer_acc,t2-t1,tcpu2-tcpu1)
@@ -734,13 +754,6 @@ subroutine accretion(npart,nptmass,ntypes,xyzh,pxyzu,xyzmh_ptmass,pxyz_ptmass,&
     if (npart==0) call pt_write_sinkev(nptmass,timei,xyzmh_ptmass,pxyz_ptmass, &
                                           fxyz_ptmass,fxyz_ptmass_sinksink)
  endif
- if (gpu_mirror) then
-    if (present(nbinmax)) then
-       call rs_after_accretion(npart,ntypes,nptmass,xyzmh_ptmass,pxyz_ptmass,nbinmax)
-    else
-       call rs_after_accretion(npart,ntypes,nptmass,xyzmh_ptmass,pxyz_ptmass)
-    endif
- endif
 
 end subroutine accretion
 
@@ -760,6 +773,7 @@ subroutine get_force(nptmass,npart,nsubsteps,ntypes,timei,dtextforce,xyzh,vxyzu,
                      metrics,metricderivs,metrics_ptmass,metricderivs_ptmass,dens,pxyzu_ptmass,&
                      skip_metric_update,recompute_gr_force)
  use gpu_resident, only:gpu_mirror,rs_after_get_force,rs_before_gas_loop
+ use gpu_arrays,   only:resident_mode
  use io,              only:iverbose,master,id,iprint,warning,fatal
  use dim,             only:maxp,maxvxyzu,itau_alloc,gr,use_apr,maxptmass,use_sinktree
  use ptmass,          only:get_accel_sink_gas,get_accel_sink_sink,merge_sinks, &
@@ -804,6 +818,7 @@ subroutine get_force(nptmass,npart,nsubsteps,ntypes,timei,dtextforce,xyzh,vxyzu,
  integer              :: i,itype
  real, save           :: dmdt = 0.
  real                 :: dtf,dtextforcenew,dtsinkgas,dtphi2,fonrmax
+ integer              :: nloop_rs
  real                 :: fextx,fexty,fextz,xi,yi,zi,pmassi,damp_fac
  real                 :: fonrmaxi,phii,dtphi2i
  real                 :: dkdt,extrapfac
@@ -926,8 +941,11 @@ subroutine get_force(nptmass,npart,nsubsteps,ntypes,timei,dtextforce,xyzh,vxyzu,
  !
  call get_timings(t1,tcpu1)
  if (gpu_mirror) call rs_before_gas_loop(nptmass,fxyz_ptmass)
+ nloop_rs = npart
+ if (resident_mode) nloop_rs = 0   ! the device does the particles
 
  !$omp parallel default(none) &
+ !$omp shared(nloop_rs) &
  !$omp shared(maxp,maxphase,use_sinktree) &
  !$omp shared(npart,nptmass,xyzh,vxyzu,xyzmh_ptmass,fext) &
  !$omp shared(eos_vars,dust_temp,idamp,damp_fac,abundance,iphase,ntypes,massoftype,dens,rho) &
@@ -945,7 +963,7 @@ subroutine get_force(nptmass,npart,nsubsteps,ntypes,timei,dtextforce,xyzh,vxyzu,
  !$omp reduction(max:fonrmax) &
  !$omp reduction(+:fxyz_ptmass,dsdt_ptmass,ponsubg)
  !$omp do
- do i=1,npart
+ do i=1,nloop_rs
     if (.not.isdead_or_accreted(xyzh(4,i))) then
        if (ntypes > 1 .and. maxphase==maxp) then
           itype  = iamtype(iphase(i))
@@ -1049,6 +1067,13 @@ subroutine get_force(nptmass,npart,nsubsteps,ntypes,timei,dtextforce,xyzh,vxyzu,
  enddo
  !$omp enddo
  !$omp end parallel
+ if (gpu_mirror) then
+    if (extrap) then
+       call rs_after_get_force(npart,ntypes,nptmass,xyzmh_ptmass,fxyz_ptmass,fonrmax,dtphi2,extrapfac,fsink_old)
+    else
+       call rs_after_get_force(npart,ntypes,nptmass,xyzmh_ptmass,fxyz_ptmass,fonrmax,dtphi2)
+    endif
+ endif
  call get_timings(t2,tcpu2)
  call increment_timer(itimer_gasf,t2-t1,tcpu2-tcpu1)
 
@@ -1077,13 +1102,6 @@ subroutine get_force(nptmass,npart,nsubsteps,ntypes,timei,dtextforce,xyzh,vxyzu,
 
  deallocate(merge_ij)
  deallocate(ponsubg)
- if (gpu_mirror) then
-    if (extrap) then
-       call rs_after_get_force(npart,ntypes,nptmass,xyzmh_ptmass,fxyz_ptmass,fonrmax,extrapfac,fsink_old)
-    else
-       call rs_after_get_force(npart,ntypes,nptmass,xyzmh_ptmass,fxyz_ptmass,fonrmax)
-    endif
- endif
 
 end subroutine get_force
 
