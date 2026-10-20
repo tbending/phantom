@@ -32,7 +32,7 @@ module gpu_resident
 !
 ! :Dependencies: dim, io, part, shock_capturing, iso_c_binding
 !
- use iso_c_binding, only:c_double,c_int
+ use iso_c_binding, only:c_double,c_int,c_ptr,c_size_t
  use gpu_arrays,    only:resident_feed,resident_mode
  implicit none
 
@@ -70,7 +70,7 @@ module gpu_resident
  integer, save :: nrun(nchecks) = 0   ! comparisons made this step, per check
  integer, save :: nstep = 0
  logical, save :: started = .false., checked = .false.
- real(c_double), allocatable :: hbuf(:),dbuf(:)
+ real(c_double), allocatable, target :: hbuf(:),dbuf(:)
 
 #ifdef GPU
  interface
@@ -78,6 +78,15 @@ module gpu_resident
    import :: c_int
    integer(c_int), value :: n,nvu
   end subroutine cosmo_rs_init
+  subroutine cosmo_pin_host(ptr,nbytes) bind(C)
+   import :: c_ptr,c_size_t
+   type(c_ptr),       value :: ptr
+   integer(c_size_t), value :: nbytes
+  end subroutine cosmo_pin_host
+  subroutine cosmo_unpin_host(ptr) bind(C)
+   import :: c_ptr
+   type(c_ptr), value :: ptr
+  end subroutine cosmo_unpin_host
   subroutine cosmo_rs_use_slots(n) bind(C)
    import :: c_int
    integer(c_int), value :: n
@@ -215,12 +224,25 @@ integer function nvu()
 end function nvu
 
 subroutine grow(n)
+#ifdef GPU
+ use iso_c_binding, only:c_loc,c_size_t,c_sizeof
+#endif
  integer, intent(in) :: n
  if (allocated(hbuf)) then
     if (size(hbuf) >= 4*n) return
+#ifdef GPU
+    call cosmo_unpin_host(c_loc(hbuf(1)))
+    call cosmo_unpin_host(c_loc(dbuf(1)))
+#endif
     deallocate(hbuf,dbuf)
  endif
  allocate(hbuf(4*n),dbuf(4*n))
+#ifdef GPU
+ !--registered with the driver: the whole-state copies (.ev writes, dumps) go at pinned
+ !  speed rather than through pageable staging (19.2M particles: ~17 ms per field)
+ call cosmo_pin_host(c_loc(hbuf(1)),int(size(hbuf),kind=c_size_t)*c_sizeof(hbuf(1)))
+ call cosmo_pin_host(c_loc(dbuf(1)),int(size(dbuf),kind=c_size_t)*c_sizeof(dbuf(1)))
+#endif
 end subroutine grow
 
 !-----------------------------------------------------------------------
@@ -765,18 +787,31 @@ end subroutine rs_after_derivs
 subroutine rs_download_all(npart)
  use dim,  only:maxalpha,maxp,nalpha,use_dust
  integer, intent(in) :: npart
- integer :: f
+ integer :: f,nf
+ integer(kind=8) :: ic0,ic1,ica,icb,icopy,crate
+ character(len=8) :: statsenv
  if (.not.resident_mode .or. npart <= 0) return
 #ifdef GPU
+ call system_clock(ic0,crate)
+ icopy = 0
+ nf = 0
  do f = rs_pos,rs_last
     if (f == rs_type) cycle
     if (f == rs_dustgas .and. .not.use_dust) cycle
     if (f == rs_alpha1 .and. maxalpha /= maxp) cycle
     if (f == rs_alphaloc .and. .not.(maxalpha == maxp .and. nalpha >= 2)) cycle
     if (f == rs_ddivvdt .and. nalpha < 3) cycle
+    call system_clock(ica)
     call cosmo_rs_get(int(f,c_int),dbuf,int(npart,c_int))
+    call system_clock(icb)
+    icopy = icopy + (icb - ica)
     call unpack(f,npart)
+    nf = nf + 1
  enddo
+ call system_clock(ic1)
+ call get_environment_variable('COSMO_DENS_STATS',statsenv)
+ if (len_trim(statsenv) > 0) write(0,'(a,i3,a,f10.2,a,f10.2)') 'COSMO_DOWNLOAD_ALL fields=',nf, &
+    ' ms=',1.e3*real(ic1-ic0)/real(crate),' of which copies=',1.e3*real(icopy)/real(crate)
 #endif
 end subroutine rs_download_all
 
@@ -788,67 +823,156 @@ subroutine unpack(field,npart)
  use gpu_dens_iface, only:xi_gpu
  integer, intent(in) :: field,npart
  integer :: i,c,ncomp
+ logical :: hasxi
 
+ !--every case is a parallel loop over particles: at 19.2M particles the whole-state
+ !  refresh is ~20 fields of strided writes, and serial it cost ~2 s per .ev write
  call grow(npart)
+ ncomp = nvu()
+ hasxi = .false.
+ if (allocated(xi_gpu)) hasxi = (size(xi_gpu) >= npart)
+ !$omp parallel default(shared) private(i,c)
  select case(field)
  case(rs_pos)
-    do c = 1,3
-       xyzh(c,1:npart) = dbuf((c-1)*npart+1:c*npart)
+    !$omp do schedule(static)
+    do i = 1,npart
+       xyzh(1,i) = dbuf(i); xyzh(2,i) = dbuf(npart+i); xyzh(3,i) = dbuf(2*npart+i)
     enddo
+    !$omp end do
  case(rs_h)
-    xyzh(4,1:npart) = dbuf(1:npart)
- case(rs_v,rs_vpred,rs_f)
-    ncomp = nvu()
-    do c = 1,ncomp
-       select case(field)
-       case(rs_v);     vxyzu(c,1:npart) = dbuf((c-1)*npart+1:c*npart)
-       case(rs_vpred); vpred(c,1:npart) = dbuf((c-1)*npart+1:c*npart)
-       case(rs_f);     fxyzu(c,1:npart) = dbuf((c-1)*npart+1:c*npart)
-       end select
+    !$omp do schedule(static)
+    do i = 1,npart
+       xyzh(4,i) = dbuf(i)
     enddo
+    !$omp end do
+ case(rs_v)
+    !$omp do schedule(static)
+    do i = 1,npart
+       do c = 1,ncomp
+          vxyzu(c,i) = dbuf((c-1)*npart+i)
+       enddo
+    enddo
+    !$omp end do
+ case(rs_vpred)
+    !$omp do schedule(static)
+    do i = 1,npart
+       do c = 1,ncomp
+          vpred(c,i) = dbuf((c-1)*npart+i)
+       enddo
+    enddo
+    !$omp end do
+ case(rs_f)
+    !$omp do schedule(static)
+    do i = 1,npart
+       do c = 1,ncomp
+          fxyzu(c,i) = dbuf((c-1)*npart+i)
+       enddo
+    enddo
+    !$omp end do
  case(rs_twas)
-    twas(1:npart) = dbuf(1:npart)
+    !$omp do schedule(static)
+    do i = 1,npart
+       twas(i) = dbuf(i)
+    enddo
+    !$omp end do
  case(rs_ibin)
-    ibin(1:npart) = int(nint(dbuf(1:npart)),kind=1)
+    !$omp do schedule(static)
+    do i = 1,npart
+       ibin(i) = int(nint(dbuf(i)),kind=1)
+    enddo
+    !$omp end do
  case(rs_ibinold)
-    ibin_old(1:npart) = int(nint(dbuf(1:npart)),kind=1)
+    !$omp do schedule(static)
+    do i = 1,npart
+       ibin_old(i) = int(nint(dbuf(i)),kind=1)
+    enddo
+    !$omp end do
  case(rs_ibinwake)
-    ibin_wake(1:npart) = int(nint(dbuf(1:npart)),kind=1)
+    !$omp do schedule(static)
+    do i = 1,npart
+       ibin_wake(i) = int(nint(dbuf(i)),kind=1)
+    enddo
+    !$omp end do
  case(rs_active)
+    !$omp do schedule(static)
     do i = 1,npart
        iphase(i) = isetphase(iamtype(iphase(i)),iactive=(dbuf(i) > 0.5_c_double))
     enddo
+    !$omp end do
  case(rs_divv)
-    divcurlv(1,1:npart) = real(dbuf(1:npart),kind=4)
+    !$omp do schedule(static)
+    do i = 1,npart
+       divcurlv(1,i) = real(dbuf(i),kind=4)
+    enddo
+    !$omp end do
  case(rs_cs)
-    eos_vars(ics,1:npart) = dbuf(1:npart)
+    !$omp do schedule(static)
+    do i = 1,npart
+       eos_vars(ics,i) = dbuf(i)
+    enddo
+    !$omp end do
  case(rs_alpha1)
-    alphaind(1,1:npart) = real(dbuf(1:npart),kind=4)
+    !$omp do schedule(static)
+    do i = 1,npart
+       alphaind(1,i) = real(dbuf(i),kind=4)
+    enddo
+    !$omp end do
  case(rs_alphaloc)
-    alphaind(2,1:npart) = real(dbuf(1:npart),kind=4)
+    !$omp do schedule(static)
+    do i = 1,npart
+       alphaind(2,i) = real(dbuf(i),kind=4)
+    enddo
+    !$omp end do
  case(rs_pres)
-    eos_vars(igasP,1:npart) = dbuf(1:npart)
+    !$omp do schedule(static)
+    do i = 1,npart
+       eos_vars(igasP,i) = dbuf(i)
+    enddo
+    !$omp end do
  case(rs_rho)
-    rho(1:npart) = dbuf(1:npart)
+    !$omp do schedule(static)
+    do i = 1,npart
+       rho(i) = dbuf(i)
+    enddo
+    !$omp end do
  case(rs_gradh)
-    gradh(1,1:npart) = real(dbuf(1:npart),kind=4)
-    gradh(2,1:npart) = real(dbuf(npart+1:2*npart),kind=4)
+    !$omp do schedule(static)
+    do i = 1,npart
+       gradh(1,i) = real(dbuf(i),kind=4)
+       gradh(2,i) = real(dbuf(npart+i),kind=4)
+    enddo
+    !$omp end do
  case(rs_xi)
-    if (allocated(xi_gpu)) then
-       if (size(xi_gpu) >= npart) xi_gpu(1:npart) = dbuf(1:npart)
+    if (hasxi) then
+       !$omp do schedule(static)
+       do i = 1,npart
+          xi_gpu(i) = dbuf(i)
+       enddo
+       !$omp end do
     endif
  case(rs_ddivvdt)
-    alphaind(3,1:npart) = real(dbuf(1:npart),kind=4)
- case(rs_fext)
-    do c = 1,3
-       fext(c,1:npart) = dbuf((c-1)*npart+1:c*npart)
+    !$omp do schedule(static)
+    do i = 1,npart
+       alphaind(3,i) = real(dbuf(i),kind=4)
     enddo
+    !$omp end do
+ case(rs_fext)
+    !$omp do schedule(static)
+    do i = 1,npart
+       fext(1,i) = dbuf(i); fext(2,i) = dbuf(npart+i); fext(3,i) = dbuf(2*npart+i)
+    enddo
+    !$omp end do
  case(rs_dustgas)
     !--the device's copy changed where densityiterate_gpu's writeback would have, and
     !  holds the host's value elsewhere (one large grain size on the GPU, so this is the
     !  only dustfrac row in use)
-    dustfrac(ndustsmall+1,1:npart) = dbuf(1:npart)
+    !$omp do schedule(static)
+    do i = 1,npart
+       dustfrac(ndustsmall+1,i) = dbuf(i)
+    enddo
+    !$omp end do
  end select
+ !$omp end parallel
 
 end subroutine unpack
 
