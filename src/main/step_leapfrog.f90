@@ -181,7 +181,7 @@ subroutine step(npart,nactive,t,dtsph,dtextforce,dtnew)
  ialphaloc = 2
  nvfloorp  = 0
  !$omp parallel do default(none) &
- !$omp shared(nloop_rs) &
+ !$omp shared(nloop_rs) if(nloop_rs > 0) &
  !$omp shared(npart,xyzh,vxyzu,fxyzu,iphase,hdtsph,store_itype) &
  !$omp shared(rad,drad,pxyzu) &
  !$omp shared(Bevol,dBevol,dustevol,ddustevol,use_dustfrac) &
@@ -305,7 +305,7 @@ subroutine step(npart,nactive,t,dtsph,dtextforce,dtnew)
 ! force evaluations, using dtsph
 !----------------------------------------------------
 !$omp parallel do default(none) schedule(guided,1) &
-!$omp shared(nloop_rs) &
+!$omp shared(nloop_rs) if(nloop_rs > 0) &
 !$omp shared(maxp,maxphase,maxalpha) &
 !$omp shared(xyzh,vxyzu,vpred,fxyzu,divcurlv,npart,store_itype,rho) &
 !$omp shared(pxyzu,ppred) &
@@ -473,7 +473,7 @@ subroutine step(npart,nactive,t,dtsph,dtextforce,dtnew)
     ntypes  = get_ntypes(npartoftypetot)
     store_itype = (maxphase==maxp .and. ntypes > 1)
 !$omp parallel default(none) &
-!$omp shared(nloop_rs) &
+!$omp shared(nloop_rs) if(nloop_rs > 0) &
 !$omp shared(xyzh,vxyzu,vpred,fxyzu,npart,hdtsph,store_itype) &
 !$omp shared(pxyzu,ppred) &
 !$omp shared(Bevol,dBevol,iphase,its) &

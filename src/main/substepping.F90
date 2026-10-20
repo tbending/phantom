@@ -250,7 +250,7 @@ subroutine substep_sph(dt,npart,xyzh,vxyzu)
  nloop_rs = npart
  if (resident_mode) nloop_rs = 0   ! the device does the particles
  !$omp parallel do default(none) &
- !$omp shared(nloop_rs,xyzh,vxyzu,dt) &
+ !$omp shared(nloop_rs,xyzh,vxyzu,dt) if(nloop_rs > 0) &
  !$omp private(i)
  do i=1,nloop_rs
     if (.not.isdead_or_accreted(xyzh(4,i))) then
@@ -474,7 +474,7 @@ subroutine drift(cki,dt,time_par,npart,nptmass,ntypes,xyzh,xyzmh_ptmass,vxyzu, &
  if (resident_mode) nloop_rs = 0   ! the device does the particles
 
  !$omp parallel do default(none) &
- !$omp shared(nloop_rs,xyzh,vxyzu,ckdt) &
+ !$omp shared(nloop_rs,xyzh,vxyzu,ckdt) if(nloop_rs > 0) &
  !$omp private(i)
  do i=1,nloop_rs
     if (.not.isdead_or_accreted(xyzh(4,i))) then
@@ -553,7 +553,7 @@ subroutine kick(dki,dt,npart,nptmass,ntypes,xyzh,pxyzu,xyzmh_ptmass,pxyz_ptmass,
  !$omp parallel do default(none) &
  !$omp shared(maxp,maxphase) &
  !$omp shared(iphase,ntypes) &
- !$omp shared(nloop_rs,fext,xyzh,pxyzu,dkdt) &
+ !$omp shared(nloop_rs,fext,xyzh,pxyzu,dkdt) if(nloop_rs > 0) &
  !$omp firstprivate(itype) &
  !$omp private(i)
  do i=1,nloop_rs
@@ -633,7 +633,7 @@ subroutine accretion(npart,nptmass,ntypes,xyzh,pxyzu,xyzmh_ptmass,pxyz_ptmass,&
  nloop_rs = npart
  if (resident_mode) nloop_rs = 0   ! the device does the particles
  !$omp parallel do default(none) &
- !$omp shared(nloop_rs) &
+ !$omp shared(nloop_rs) if(nloop_rs > 0) &
  !$omp shared(maxp,maxphase) &
  !$omp shared(npart,xyzh,pxyzu,fext,iphase,ntypes,massoftype,timei,nptmass) &
  !$omp shared(xyzmh_ptmass,pxyz_ptmass,fxyz_ptmass,f_acc,apr_level,aprmassoftype) &
@@ -945,7 +945,7 @@ subroutine get_force(nptmass,npart,nsubsteps,ntypes,timei,dtextforce,xyzh,vxyzu,
  if (resident_mode) nloop_rs = 0   ! the device does the particles
 
  !$omp parallel default(none) &
- !$omp shared(nloop_rs) &
+ !$omp shared(nloop_rs) if(nloop_rs > 0) &
  !$omp shared(maxp,maxphase,use_sinktree) &
  !$omp shared(npart,nptmass,xyzh,vxyzu,xyzmh_ptmass,fext) &
  !$omp shared(eos_vars,dust_temp,idamp,damp_fac,abundance,iphase,ntypes,massoftype,dens,rho) &
