@@ -6,3 +6,6 @@
 	path = cosmoSPHere
 	url = git@github.com:tbending/cosmoSPHere.git
 	branch = main
+[submodule "cornerstone-octree"]
+	path = cornerstone-octree
+	url = https://github.com/sekelle/cornerstone-octree.git
