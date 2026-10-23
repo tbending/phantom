@@ -110,6 +110,8 @@ subroutine startrun(infile,logfile,evfile,dumpfile,noread)
  use inject,           only:init_inject,inject_particles
  use krome_interface,  only:initialise_krome
  use mpibalance,       only:balancedomains
+ use gpu_domain,       only:gpu_domain_assign
+ use gpu_dens_iface,   only:use_gpu_dens,init_gpu_switch
  use mpiutils,         only:reduceall_mpi
  use part,             only:npart,npartoftype,alphaind,ntot,update_npartoftypetot,&
                             iamtype,igas,nptmass,xyzmh_ptmass,vxyz_ptmass,&
@@ -174,9 +176,16 @@ subroutine startrun(infile,logfile,evfile,dumpfile,noread)
  ! (make sure this is called AFTER iphase has been set)
  !
  if (mpi) then
-    do i=1,npart
-       ibelong(i) = id
-    enddo
+    call init_gpu_switch()
+    if (use_gpu_dens) then
+       ! GPU path: Cornerstone's space-filling-curve split, computed on the host, decides
+       ! which rank owns each particle; balancedomains moves them (GPU_MPI_PLAN.md Phase 1)
+       call gpu_domain_assign(npart)
+    else
+       do i=1,npart
+          ibelong(i) = id
+       enddo
+    endif
     call balancedomains(npart)
  endif
 

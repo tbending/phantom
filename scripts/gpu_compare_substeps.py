@@ -61,24 +61,25 @@ def read_dump(fn):
             vals = np.frombuffer(next(rec), DTYPES[k])
             for j in range(nv):
                 hdr.setdefault(tags[16 * j:16 * j + 16].decode().strip(), vals[j])
-    ntot = struct.unpack('<i', next(rec))[0]
-    blocks = []
-    for _ in range(ntot):
-        r = next(rec)
-        number = struct.unpack('<q', r[:8])[0]
-        nums = struct.unpack('<8i', r[8:40])
-        blocks.append((number, nums))
+    nblockarrays = struct.unpack('<i', next(rec))[0]     # nblocks * narraylengths
+    nblocks = int(hdr.get('nblocks', 1))
+    nlen = nblockarrays // nblocks
     out = []
-    for number, nums in blocks:
-        arrs = {}
-        for k in range(8):
-            for _ in range(nums[k]):
-                tag = next(rec).decode().strip()
-                a = np.frombuffer(next(rec), DTYPES[k])
-                if len(a) != number:
-                    raise ValueError(f"{fn}: array {tag} has {len(a)} values, expected {number}")
-                arrs.setdefault(tag, a)
-        out.append(arrs)
+    for _ in range(nblocks):                               # per block (one per MPI rank):
+        heads = []                                         # its narraylengths headers, then its arrays
+        for _ in range(nlen):
+            r = next(rec)
+            heads.append((struct.unpack('<q', r[:8])[0], struct.unpack('<8i', r[8:40])))
+        for number, nums in heads:
+            arrs = {}
+            for k in range(8):
+                for _ in range(nums[k]):
+                    tag = next(rec).decode().strip()
+                    a = np.frombuffer(next(rec), DTYPES[k])
+                    if len(a) != number:
+                        raise ValueError(f"{fn}: array {tag} has {len(a)} values, expected {number}")
+                    arrs.setdefault(tag, a)
+            out.append(arrs)                               # (block, array length) order: p1, s1, p2, s2, ...
     return hdr, out
 
 

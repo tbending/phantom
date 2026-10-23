@@ -712,6 +712,7 @@ end subroutine rs_after_predict_sph
 !+
 !-----------------------------------------------------------------------
 subroutine rs_after_force(npart)
+ use mpiutils, only:reduceall_mpi
  use dim,             only:use_dust,maxvxyzu,gr,driving
  use timestep,        only:dtmax,C_cour,C_force
  use timestep_ind,    only:nbinmax,istepfrac,ibinnow
@@ -738,6 +739,8 @@ subroutine rs_after_force(npart)
                          merge(1_c_int,0_c_int,use_dust),merge(1_c_int,0_c_int,limit_u))
  call compare(9,rs_ibin,npart)
  call compare(9,rs_ibinwake,npart)
+ ! the bins are global: every rank must take the same substeps (MPI; no-op otherwise)
+ nbm = int(reduceall_mpi('max',int(nbm)),kind=c_int)
  if (resident_mode) then
     nbinmax = int(nbm,kind=1)
  elseif (nbm /= int(nbinmax)) then
