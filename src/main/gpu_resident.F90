@@ -736,6 +736,12 @@ subroutine rs_after_force(npart)
  use cooling,         only:cooling_in_step
  use eos,             only:ieos
  integer, intent(in) :: npart
+#ifdef MPI
+ interface
+  subroutine cosmo_dom_reverse_wake() bind(C)
+  end subroutine cosmo_dom_reverse_wake
+ end interface
+#endif
  integer :: nbm
  logical :: force_twin,limit_u
  if (.not.gpu_mirror .or. npart <= 0 .or. .not.started) return
@@ -754,6 +760,10 @@ subroutine rs_after_force(npart)
                          merge(1_c_int,0_c_int,use_dust),merge(1_c_int,0_c_int,limit_u))
  call compare(9,rs_ibin,npart)
  call compare(9,rs_ibinwake,npart)
+#ifdef MPI
+ !--the wake-up flags set on halo copies back to their owners, before the corrector reads them
+ if (gpu_domain_on) call cosmo_dom_reverse_wake()
+#endif
  ! the bins are global: every rank must take the same substeps (MPI; no-op otherwise)
  nbm = int(reduceall_mpi('max',int(nbm)),kind=c_int)
  if (resident_mode) then
@@ -1135,7 +1145,10 @@ subroutine rs_first_send(npart,everything)
  call cosmo_rs_init(int(npart,c_int),int(nvu(),c_int))
  !--with the passes fed from the state, keep it in the tree's order (cosmoSPHere
  !  re-sorts it at each tree build; puts and gets translate)
- if (gpu_feed) call cosmo_rs_use_slots(int(npart,c_int))
+ !--one rank: the state in the tree's order (slot mode).  MPI: the state stays in the
+ !  Domain's layout and the solve has its own order (the type permutation of plan
+ !  section 3): dead and dust particles then sort as they always did
+ if (gpu_feed .and. nprocs == 1) call cosmo_rs_use_slots(int(npart,c_int))
  if (everything) vpred(:,1:npart) = vxyzu(:,1:npart)
  do f = rs_pos,rs_last
     if (f == rs_dustgas .and. .not.use_dust) cycle
@@ -1217,14 +1230,14 @@ end subroutine rs_put_alpha1
 subroutine dom_start(npart)
  use mpi
  use io,       only:nprocs
- use dim,      only:periodic
+ use dim,      only:periodic,use_dust
  use boundary, only:xmin,xmax,ymin,ymax,zmin,zmax
  use mpiutils, only:reduceall_mpi
  integer, intent(in) :: npart
  interface
-  subroutine cosmo_dom_init(bucket,bucketfocus,periodic,box,fcomm) bind(C)
+  subroutine cosmo_dom_init(bucket,bucketfocus,periodic,box,fcomm,withdvdx) bind(C)
    import c_int,c_double
-   integer(c_int), value :: bucket,bucketfocus,periodic,fcomm
+   integer(c_int), value :: bucket,bucketfocus,periodic,fcomm,withdvdx
    real(c_double)        :: box(6)
   end subroutine cosmo_dom_init
  end interface
@@ -1235,7 +1248,9 @@ subroutine dom_start(npart)
  ntot   = reduceall_mpi('+',npart)
  bucket = int(max(64_8, ntot/(100_8*int(nprocs,kind=8))))   ! as gpu_domain_assign
  box    = (/xmin,xmax,ymin,ymax,zmin,zmax/)
- call cosmo_dom_init(int(bucket,c_int),64_c_int,merge(1_c_int,0_c_int,periodic),box,int(MPI_COMM_WORLD,c_int))
+ !--dust: the record carries dvdx (a partner's drag reconstruction reads it)
+ call cosmo_dom_init(int(bucket,c_int),64_c_int,merge(1_c_int,0_c_int,periodic),box,int(MPI_COMM_WORLD,c_int), &
+                     merge(1_c_int,0_c_int,use_dust))
  gpu_domain_on = .true.
  np = npart
  call dom_sync(np,.true.)
