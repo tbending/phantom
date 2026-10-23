@@ -179,6 +179,9 @@ module gpu_arrays
 ! (before .ev writes and dumps).  Set by gpu_resident once the state exists.
 !
  logical, public :: resident_mode = .false.
+! MPI (GPU_MPI_PLAN.md Phase 2): the device Domain over the resident state exists, so the
+! force pass exchanges its halo inputs first (gpu_force_iface).  Set by gpu_resident.
+ logical, public :: gpu_domain_on = .false.
 
 #ifdef GPU
  interface

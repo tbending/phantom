@@ -5,6 +5,7 @@
 ! http://phantomsph.github.io/                                              !
 !--------------------------------------------------------------------------!
 module gpu_force_iface
+ use gpu_arrays, only:gpu_domain_on   ! MPI: the device Domain exists (gpu_resident)
 !
 ! Fortran interface to the cosmoSPHere GPU force pass.
 !
@@ -84,6 +85,13 @@ module gpu_force_iface
  integer(kind=1), save :: fmir_nbinmax0,fmir_nbinmaxg
  integer, save :: fmir_ncall = 0
  private
+
+#ifdef MPI
+ interface
+  subroutine cosmo_dom_exchange_force_inputs() bind(C)
+  end subroutine cosmo_dom_exchange_force_inputs
+ end interface
+#endif
 
 contains
 
@@ -227,6 +235,10 @@ subroutine force_gpu(npart,xyzh,vxyzu,eos_vars,alphaind,fxyzu,divcurlv,dt)
  endif
 
  if (resident_feed) then
+#ifdef MPI
+    !--the halos' density-pass outputs from their owners (GPU_MPI_PLAN.md Phase 2)
+    if (gpu_domain_on) call cosmo_dom_exchange_force_inputs()
+#endif
     !--p/rho^2, c_s, alpha, u (and rho, zeta/Omega, ibin_old below) from the device's own copy
     call cosmo_rs_feed_force(int(npart,c_int),merge(1_c_int,0_c_int,maxalpha == maxp), &
                              real(alpha,c_double),merge(1_c_int,0_c_int,ind_timesteps))

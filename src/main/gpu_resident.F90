@@ -33,7 +33,7 @@ module gpu_resident
 ! :Dependencies: dim, io, part, shock_capturing, iso_c_binding
 !
  use iso_c_binding, only:c_double,c_int,c_ptr,c_size_t
- use gpu_arrays,    only:resident_feed,resident_mode
+ use gpu_arrays,    only:resident_feed,resident_mode,gpu_domain_on
  implicit none
 
  logical, public :: gpu_mirror = .false.
@@ -43,6 +43,7 @@ module gpu_resident
  public :: rs_after_predict_sph,rs_after_derivs,rs_after_corrector,rs_after_cons2prim
  public :: rs_after_force,rs_download_all
  public :: rs_after_kick,rs_after_subdrift,rs_after_get_force,rs_after_accretion,rs_before_gas_loop
+ public :: rs_prime,rs_put_alpha1,rs_resync
 
  private
 
@@ -51,7 +52,7 @@ module gpu_resident
                        rs_ibin = 7, rs_ibinold = 8, rs_ibinwake = 9, rs_active = 10, &
                        rs_divv = 11, rs_cs = 12, rs_alpha1 = 13, rs_alphaloc = 14, rs_fext = 15, &
                        rs_type = 16, rs_rho = 17, rs_gradh = 18, rs_xi = 19, rs_ddivvdt = 20, rs_pres = 21, &
-                       rs_dustgas = 22, rs_last = 22
+                       rs_dustgas = 22, rs_iorig = 23, rs_last = 23
 
  !--checks counted per step: set_active, predictor, drift (plain and in the substep),
  !  predict_sph, corrector, kick, sink-gas force and accretion (in the substep), and the
@@ -67,6 +68,9 @@ module gpu_resident
  integer(kind=1), save :: nbinmax_before_derivs = 0
  real, allocatable, save :: fsink_before(:,:)   ! fxyz_ptmass before get_force's gas loop
  integer(kind=8), save :: nbad(nchecks) = 0, nbadtot(nchecks) = 0
+ integer, save :: nsync = 0          ! device Domain syncs so far (MPI)
+ logical, save :: priming = .false.  ! rs_prime sent the state; the first step's bookkeeping is still to come
+ real,    save :: tsync_tot = 0.     ! and the seconds they took, this rank
  integer, save :: nrun(nchecks) = 0   ! comparisons made this step, per check
  integer, save :: nstep = 0
  logical, save :: started = .false., checked = .false.
@@ -185,10 +189,13 @@ subroutine rs_init_switch()
  use io,  only:iprint
  character(len=16) :: val
  integer :: ln,ierr
+ logical, save :: switch_done = .false.
 
  if (checked) return
  checked = .true.
 #ifdef GPU
+ if (switch_done) return
+ switch_done = .true.
  call get_environment_variable('COSMO_MIRROR',val,ln,ierr)
  gpu_mirror = (ierr == 0 .and. ln > 0 .and. ind_timesteps)
  if (gpu_mirror) write(iprint,'(a)') ' cosmoSPHere: COSMO_MIRROR, device twins of the step checked against the host'
@@ -252,7 +259,7 @@ end subroutine grow
 !-----------------------------------------------------------------------
 subroutine pack(field,npart,ncomp)
  use part, only:xyzh,vxyzu,vpred,fxyzu,twas,ibin,ibin_old,ibin_wake,iphase,iactive, &
-                divcurlv,eos_vars,ics,alphaind,fext,iamtype,rho,gradh,igasP,dustfrac,ndustsmall
+                divcurlv,eos_vars,ics,alphaind,fext,iamtype,rho,gradh,igasP,dustfrac,ndustsmall,iorig
  use gpu_dens_iface, only:xi_gpu
  use dim,  only:nalpha
  integer, intent(in)  :: field,npart
@@ -328,6 +335,8 @@ subroutine pack(field,npart,ncomp)
     do i = 1,npart
        hbuf(i) = real(iamtype(iphase(i)),kind=c_double)
     enddo
+ case(rs_iorig)
+    hbuf(1:npart) = real(iorig(1:npart),kind=c_double)
  case(rs_fext)
     ncomp = 3
     do c = 1,3
@@ -338,13 +347,15 @@ subroutine pack(field,npart,ncomp)
 end subroutine pack
 
 !--send one host field to the device
-subroutine put(field,npart)
+subroutine put(field,npart,force)
  use io, only:fatal
  integer, intent(in) :: field,npart
+ logical, intent(in), optional :: force   ! the host's copy is the truth for this field (priming)
  integer :: ncomp
  !--with the device the truth there is no host copy to send: a field reaching here has
  !  no twin in this configuration
- if (resident_mode) call fatal('gpu_resident','COSMO_RESIDENT: this field has no device twin here',ival=field)
+ if (resident_mode .and. .not.present(force)) &
+    call fatal('gpu_resident','COSMO_RESIDENT: this field has no device twin here',ival=field)
  call pack(field,npart,ncomp)
 #ifdef GPU
  call cosmo_rs_put(int(field,c_int),hbuf,int(npart,c_int))
@@ -424,7 +435,7 @@ subroutine rs_start_step(npart,istepfrac,nbinmax,nactive,nalive,nactivetot,naliv
  integer(kind=1), intent(in)    :: nbinmax
  integer,         intent(inout) :: nactive,nalive
  integer(kind=8), intent(inout) :: nactivetot,nalivetot
- integer :: f,ncount,i
+ integer :: ncount,i
  integer(c_int) :: nalive_dev
 
  call rs_init_switch()
@@ -434,17 +445,17 @@ subroutine rs_start_step(npart,istepfrac,nbinmax,nactive,nalive,nactivetot,naliv
  maxulp_step = 0.
  nstep = nstep + 1
 #ifdef GPU
- if (.not.started) then
-    call cosmo_rs_init(int(npart,c_int),int(nvu(),c_int))
-    !--with the passes fed from the state, keep it in the tree's order (cosmoSPHere
-    !  re-sorts it at each tree build; puts and gets translate)
-    if (gpu_feed) call cosmo_rs_use_slots(int(npart,c_int))
-    do f = rs_pos,rs_last
-       if (f == rs_dustgas .and. .not.use_dust) cycle
-       if (f /= rs_active .and. f /= rs_vpred) call put(f,npart)
-    enddo
-    started = .true.
-    resident_feed = gpu_feed
+ if (.not.started) call rs_first_send(npart,.false.)
+ if (priming) then
+    !--primed in initial (MPI): the device has the density and force with halos, but the
+    !  bins and twas are the host's, as the unprimed first send has them: at t = 0 phantom
+    !  puts every particle on the finest bin (step_leapfrog init_step), ibin_old and
+    !  ibin_wake are 0 and twas is untouched, whatever the new-bins twin did in initial
+    call put(rs_twas,npart,force=.true.)
+    call put(rs_ibin,npart,force=.true.)
+    call put(rs_ibinold,npart,force=.true.)
+    call put(rs_ibinwake,npart,force=.true.)
+    priming = .false.
  endif
  ncount = cosmo_rs_set_active(int(npart,c_int),int(istepfrac,c_int),int(nbinmax,c_int),nalive_dev)
  call compare(1,rs_active,npart)
@@ -684,7 +695,7 @@ subroutine rs_after_predict_sph(npart,dtsph,timei,ufloor)
  use dim,             only:maxalpha,maxp,nalpha
  use shock_capturing, only:avdecayconst,alpha,alphamax
  use timestep_ind,    only:nbinmax
- integer, intent(in) :: npart
+ integer, intent(inout) :: npart   ! MPI: the rank's owned count after the sync
  real,    intent(in) :: dtsph,timei,ufloor
  integer :: amode
  if (.not.gpu_mirror .or. npart <= 0) return
@@ -699,6 +710,10 @@ subroutine rs_after_predict_sph(npart,dtsph,timei,ufloor)
  call compare(4,rs_h,npart)
  call compare(4,rs_vpred,npart)
  if (amode > 0) call compare(4,rs_alpha1,npart)
+#endif
+#ifdef MPI
+ !--the positions have drifted and derivs is next: re-decompose, find the halos
+ if (gpu_domain_on .and. resident_mode) call dom_sync(npart,.false.)
 #endif
 end subroutine rs_after_predict_sph
 
@@ -789,6 +804,7 @@ end subroutine rs_after_derivs
 !-----------------------------------------------------------------------
 subroutine rs_download_all(npart)
  use dim,  only:maxalpha,maxp,nalpha,use_dust
+ use part, only:recount_npartoftype
  integer, intent(in) :: npart
  integer :: f,nf
  integer(kind=8) :: ic0,ic1,ica,icb,icopy,crate
@@ -799,7 +815,7 @@ subroutine rs_download_all(npart)
  icopy = 0
  nf = 0
  do f = rs_pos,rs_last
-    if (f == rs_type) cycle
+    if ((f == rs_type .or. f == rs_iorig) .and. .not.gpu_domain_on) cycle
     if (f == rs_dustgas .and. .not.use_dust) cycle
     if (f == rs_alpha1 .and. maxalpha /= maxp) cycle
     if (f == rs_alphaloc .and. .not.(maxalpha == maxp .and. nalpha >= 2)) cycle
@@ -812,9 +828,13 @@ subroutine rs_download_all(npart)
     nf = nf + 1
  enddo
  call system_clock(ic1)
+ !--particles have changed rank since the read: the per-type counts in the dump header
+ if (gpu_domain_on) call recount_npartoftype
  call get_environment_variable('COSMO_DENS_STATS',statsenv)
  if (len_trim(statsenv) > 0) write(0,'(a,i3,a,f10.2,a,f10.2)') 'COSMO_DOWNLOAD_ALL fields=',nf, &
     ' ms=',1.e3*real(ic1-ic0)/real(crate),' of which copies=',1.e3*real(icopy)/real(crate)
+ if (len_trim(statsenv) > 0 .and. gpu_domain_on) write(0,'(a,i8,a,f10.3)') 'COSMO_DOMAIN syncs=',nsync, &
+    ' s=',tsync_tot
 #endif
 end subroutine rs_download_all
 
@@ -822,7 +842,7 @@ end subroutine rs_download_all
 subroutine unpack(field,npart)
  use part, only:xyzh,vxyzu,vpred,fxyzu,twas,ibin,ibin_old,ibin_wake,iphase,iamtype, &
                 divcurlv,eos_vars,ics,alphaind,fext,rho,gradh,igasP,isetphase, &
-                dustfrac,ndustsmall
+                dustfrac,ndustsmall,iorig,iactive
  use gpu_dens_iface, only:xi_gpu
  integer, intent(in) :: field,npart
  integer :: i,c,ncomp
@@ -900,6 +920,18 @@ subroutine unpack(field,npart)
     !$omp do schedule(static)
     do i = 1,npart
        iphase(i) = isetphase(iamtype(iphase(i)),iactive=(dbuf(i) > 0.5_c_double))
+    enddo
+    !$omp end do
+ case(rs_type)
+    !$omp do schedule(static)
+    do i = 1,npart
+       iphase(i) = isetphase(int(nint(dbuf(i))),iactive=iactive(iphase(i)))
+    enddo
+    !$omp end do
+ case(rs_iorig)
+    !$omp do schedule(static)
+    do i = 1,npart
+       iorig(i) = nint(dbuf(i),kind=8)
     enddo
     !$omp end do
  case(rs_divv)
@@ -1081,5 +1113,175 @@ subroutine rs_after_corrector(npart,timei,ibin_dts,nbins,ithdt,ittwas,nbinmax,uf
     (trim(checkname(f))//'=',int(nbad(f)),'/',nrun(f),f=1,nchecks),' maxulp=',maxulp_step
  nbadtot = nbadtot + nbad
 end subroutine rs_after_corrector
+
+#ifdef MPI
+!-----------------------------------------------------------------------
+!+
+!  The whole state to the device, once: the first step's send (rs_start_step)
+!  or, under MPI, before the first derivs in initial (rs_prime).  With
+!  everything = .true. the active flags and vpred go too (initial: every
+!  particle active, vpred = v), else the step sets them.  Then, under MPI,
+!  the device Domain (dom_start), whose first sync moves nothing.
+!+
+!-----------------------------------------------------------------------
+subroutine rs_first_send(npart,everything)
+ use dim,  only:use_dust
+ use io,   only:nprocs
+ use part, only:vpred,vxyzu
+ integer, intent(in) :: npart
+ logical, intent(in) :: everything
+ integer :: f
+#ifdef GPU
+ call cosmo_rs_init(int(npart,c_int),int(nvu(),c_int))
+ !--with the passes fed from the state, keep it in the tree's order (cosmoSPHere
+ !  re-sorts it at each tree build; puts and gets translate)
+ if (gpu_feed) call cosmo_rs_use_slots(int(npart,c_int))
+ if (everything) vpred(:,1:npart) = vxyzu(:,1:npart)
+ do f = rs_pos,rs_last
+    if (f == rs_dustgas .and. .not.use_dust) cycle
+    if (.not.everything .and. (f == rs_active .or. f == rs_vpred)) cycle
+    call put(f,npart)
+ enddo
+ started = .true.
+ resident_feed = gpu_feed
+#ifdef MPI
+ !--the device Domain over the state (GPU_MPI_PLAN.md Phase 2); its first sync moves nothing
+ if (gpu_feed .and. nprocs > 1) call dom_start(npart)
+#endif
+#else
+ f = npart; if (everything) f = 0
+#endif
+end subroutine rs_first_send
+
+!-----------------------------------------------------------------------
+!+
+!  MPI: the resident state and the device Domain BEFORE the first derivs
+!  in initial (get_derivs_initial), so that derivs already runs with the
+!  halos: on its own, a rank's first density and force are wrong at the
+!  seams, and the wrong f and h would be sent to the device as the state.
+!  The device is the truth from here (resident_mode); initial then
+!  downloads before the alpha update and the t = 0 dump.
+!+
+!-----------------------------------------------------------------------
+subroutine rs_prime(npart)
+ use io, only:iprint,id,master
+ integer, intent(in) :: npart
+ call rs_init_switch()
+ if (.not.gpu_resident_on .or. started .or. npart <= 0) return
+ !--every resident run, not only MPI ones: the first derivs then takes one path on any
+ !  rank count (the host's own Cullen-Dehnen initialisation and the device twin's differ
+ !  at the threshold on a few particles), and the P-rank gate compares like with like
+ call rs_first_send(npart,.true.)
+ resident_mode = .true.
+ priming = .true.
+ if (id==master) write(iprint,'(a)') ' gpu_resident: state primed before the first derivs (and the Domain, under MPI)'
+end subroutine rs_prime
+
+!--MPI: a sync between initial's two derivs calls, so the second sees the first's forces
+!  and densities on the halos too (div_a for the Cullen-Dehnen switch reads a neighbour's f)
+subroutine rs_resync(npart)
+ integer, intent(inout) :: npart
+#ifdef MPI
+ if (gpu_domain_on .and. resident_mode) call dom_sync(npart,.false.)
+#else
+ if (npart < 0) npart = 0   ! nothing to do
+#endif
+end subroutine rs_resync
+
+!--initial's alpha = max(alpha, alphaloc) after the first derivs, on the device's copy
+subroutine rs_put_alpha1(npart)
+ integer, intent(in) :: npart
+ interface
+  subroutine cosmo_rs_alpha_max(n) bind(C)
+   import c_int
+   integer(c_int), value :: n
+  end subroutine cosmo_rs_alpha_max
+ end interface
+ if (.not.resident_mode .or. npart <= 0) return
+#ifdef GPU
+ call cosmo_rs_alpha_max(int(npart,c_int))
+#endif
+end subroutine rs_put_alpha1
+
+!-----------------------------------------------------------------------
+!+
+!  MPI (GPU_MPI_PLAN.md Phase 2): the device Domain over the resident
+!  state.  dom_start creates it with the startup split's parameters and
+!  runs the first sync, which moves nothing (Phase 1's split, the same
+!  curve, box and bucket size); dom_sync runs every later one, after the
+!  drift and before derivs, and adopts the rank's new owned count as
+!  npart.  Between dumps the host arrays are stale by design (resident
+!  mode): the ids are refreshed here, the rest by rs_download_all.
+!+
+!-----------------------------------------------------------------------
+subroutine dom_start(npart)
+ use mpi
+ use io,       only:nprocs
+ use dim,      only:periodic
+ use boundary, only:xmin,xmax,ymin,ymax,zmin,zmax
+ use mpiutils, only:reduceall_mpi
+ integer, intent(in) :: npart
+ interface
+  subroutine cosmo_dom_init(bucket,bucketfocus,periodic,box,fcomm) bind(C)
+   import c_int,c_double
+   integer(c_int), value :: bucket,bucketfocus,periodic,fcomm
+   real(c_double)        :: box(6)
+  end subroutine cosmo_dom_init
+ end interface
+ integer(kind=8) :: ntot
+ integer         :: bucket,np
+ real(c_double)  :: box(6)
+
+ ntot   = reduceall_mpi('+',npart)
+ bucket = int(max(64_8, ntot/(100_8*int(nprocs,kind=8))))   ! as gpu_domain_assign
+ box    = (/xmin,xmax,ymin,ymax,zmin,zmax/)
+ call cosmo_dom_init(int(bucket,c_int),64_c_int,merge(1_c_int,0_c_int,periodic),box,int(MPI_COMM_WORLD,c_int))
+ gpu_domain_on = .true.
+ np = npart
+ call dom_sync(np,.true.)
+
+end subroutine dom_start
+
+subroutine dom_sync(npart,first)
+ use io,       only:id,master,iprint,fatal
+ use part,     only:iorig
+ use mpiutils, only:reduceall_mpi
+ integer, intent(inout) :: npart
+ logical, intent(in)    :: first
+ interface
+  subroutine cosmo_dom_sync(first,nown,nhalo,tsync) bind(C)
+   import c_int,c_double
+   integer(c_int), value :: first
+   integer(c_int)        :: nown,nhalo
+   real(c_double)        :: tsync
+  end subroutine cosmo_dom_sync
+ end interface
+ integer(c_int)  :: nown,nhalo
+ real(c_double)  :: tsync
+ integer(kind=8) :: nhalotot,ntot
+ integer         :: i
+
+ call cosmo_dom_sync(merge(1_c_int,0_c_int,first),nown,nhalo,tsync)
+ if (first .and. nown /= npart) call fatal('gpu_resident','the first device sync changed the owned count', &
+                                           ival=int(nown))
+ npart     = int(nown)
+ nsync     = nsync + 1
+ tsync_tot = tsync_tot + real(tsync)
+ !--the ids follow the particles; the rest of the host copy waits for rs_download_all
+ call grow(npart)
+ call cosmo_rs_get(int(rs_iorig,c_int),dbuf,int(npart,c_int))
+ do i=1,npart
+    iorig(i) = nint(dbuf(i),kind=8)
+ enddo
+ if (first .or. mod(nsync,1000) == 0) then
+    ntot     = reduceall_mpi('+',int(npart,kind=8))
+    nhalotot = reduceall_mpi('+',int(nhalo,kind=8))
+    tsync    = reduceall_mpi('max',tsync)
+    if (id==master) write(iprint,"(a,i8,a,i11,a,i11,a,f7.2,a,f8.4,a)") ' gpu_domain: sync',nsync,': owned ',ntot, &
+       ' halos ',nhalotot,' (',100.*real(nhalotot)/real(ntot),'%) ',tsync,' s'
+ endif
+
+end subroutine dom_sync
+#endif
 
 end module gpu_resident

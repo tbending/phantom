@@ -110,7 +110,7 @@ subroutine startrun(infile,logfile,evfile,dumpfile,noread)
  use inject,           only:init_inject,inject_particles
  use krome_interface,  only:initialise_krome
  use mpibalance,       only:balancedomains
- use gpu_domain,       only:gpu_domain_assign
+ use gpu_domain,       only:gpu_domain_assign,gpu_domain_check
  use gpu_dens_iface,   only:use_gpu_dens,init_gpu_switch
  use mpiutils,         only:reduceall_mpi
  use part,             only:npart,npartoftype,alphaind,ntot,update_npartoftypetot,&
@@ -187,6 +187,7 @@ subroutine startrun(infile,logfile,evfile,dumpfile,noread)
        enddo
     endif
     call balancedomains(npart)
+    if (use_gpu_dens) call gpu_domain_check(npart)
  endif
 
  ! setup external forces and get timestep constraint
@@ -695,6 +696,7 @@ end subroutine initialise_sink_particle_forces
 !+
 !----------------------------------------------------------------
 subroutine get_derivs_initial(time,dumpfile,ntot,dtnew_first,ierr)
+ use gpu_resident,     only:rs_prime,rs_download_all,rs_put_alpha1,rs_resync
  use dim,              only:maxalpha,maxp,nalpha,do_radiation
  use part,             only:npart,fxyzu,alphaind
  use deriv,            only:get_derivs_global,get_density_global
@@ -727,7 +729,10 @@ subroutine get_derivs_initial(time,dumpfile,ntot,dtnew_first,ierr)
  enddo
  !$omp end parallel do
 
+ !--MPI, GPU resident: the device state and Domain before derivs, so it runs with halos
+ call rs_prime(npart)
  do j=1,nderivinit
+    if (j > 1) call rs_resync(npart)   ! MPI: the halos' f and rho from the first call
     if (ntot > 0) call get_derivs_global(dt_new=dtnew_first,dt=0.,icall=1)
 #ifdef LIVE_ANALYSIS
     call do_analysis(dumpfile,numfromfile(dumpfile),xyzh,vxyzu, &
@@ -737,12 +742,15 @@ subroutine get_derivs_initial(time,dumpfile,ntot,dtnew_first,ierr)
 #endif
  enddo
 
+ !--resident: the host copy from the device, for the alpha update, energies and the dump
+ call rs_download_all(npart)
  if (nalpha >= 2) then
     ialphaloc = 2
     !$omp parallel do default(none) shared(npart,alphaind,ialphaloc) private(i)
     do i=1,npart
        alphaind(1,i) = max(alphaind(1,i),alphaind(ialphaloc,i)) ! set alpha = max(alphaloc,alpha)
     enddo
+    call rs_put_alpha1(npart)
  endif
 
 end subroutine get_derivs_initial
