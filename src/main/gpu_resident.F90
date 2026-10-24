@@ -73,8 +73,8 @@ module gpu_resident
  !--MPI: a full Domain sync only when the coarsest active bin is within sync_levels of the
  !  finest (COSMO_SYNC_LEVELS, default 4: at most every 16 substeps), or the guard fires
  integer, save :: sync_levels = 4
- real(kind=8), save :: wall_syncstep = 0.d0   ! host wall in the sync decision + syncs (COSMO_DOMTIME)
 #ifdef MPI
+ real(kind=8), save :: wall_syncstep = 0.d0   ! host wall in the sync decision + syncs (COSMO_DOMTIME)
  interface
   integer(c_int) function cosmo_dom_need_sync() bind(C)
    import c_int
@@ -732,10 +732,15 @@ end subroutine rs_after_accretion
 subroutine rs_after_predict_sph(npart,dtsph,timei,ufloor)
  use dim,             only:maxalpha,maxp,nalpha
  use shock_capturing, only:avdecayconst,alpha,alphamax
- use timestep_ind,    only:nbinmax,ibinnow
+ use timestep_ind,    only:nbinmax
+#ifdef MPI
+ use timestep_ind,    only:ibinnow
+#endif
  integer, intent(inout) :: npart   ! MPI: the rank's owned count after the sync
  real,    intent(in) :: dtsph,timei,ufloor
+#ifdef MPI
  integer(kind=8) :: wc0,wc1,wcrate
+#endif
  integer :: amode
  if (.not.gpu_mirror .or. npart <= 0) return
  !--derivs is next, and the force pass changes nbinmax; the new-bins twin needs it before
@@ -870,7 +875,9 @@ end subroutine rs_after_derivs
 subroutine rs_download_all(npart)
  use dim,  only:maxalpha,maxp,nalpha,use_dust
  use part, only:recount_npartoftype
+#ifdef MPI
  use io,   only:id
+#endif
  integer, intent(in) :: npart
  integer :: f,nf
  integer(kind=8) :: ic0,ic1,ica,icb,icopy,crate
@@ -1192,7 +1199,6 @@ subroutine rs_after_corrector(npart,timei,ibin_dts,nbins,ithdt,ittwas,nbinmax,uf
  nbadtot = nbadtot + nbad
 end subroutine rs_after_corrector
 
-#ifdef MPI
 !-----------------------------------------------------------------------
 !+
 !  The whole state to the device, once: the first step's send (rs_start_step)
@@ -1284,6 +1290,7 @@ subroutine rs_put_alpha1(npart)
 #endif
 end subroutine rs_put_alpha1
 
+#ifdef MPI
 !-----------------------------------------------------------------------
 !+
 !  MPI (GPU_MPI_PLAN.md Phase 2): the device Domain over the resident

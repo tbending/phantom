@@ -149,6 +149,7 @@ subroutine calculate_stacksize(npart)
  use io,  only:nprocs,id,master
  integer, intent(in) :: npart
  integer, parameter  :: safety = 8
+ integer :: ln,ierr
 
  ! size of the stack needed for communication,
  ! should be at least the maximum number of cells that need
@@ -160,6 +161,11 @@ subroutine calculate_stacksize(npart)
  if (mpi .and. nprocs > 1) then
     ! assume that every cell will be exported, with some safety factor
     stacksize = (npart / minpart / nprocs) * safety
+    ! GPU resident runs (COSMO_RESIDENT) do density and force on the device: these CPU export
+    ! stacks go unused, and at 80M particles on 2 ranks their allocation failed.  Start small;
+    ! they grow on demand (increase_mpi_memory)
+    call get_environment_variable('COSMO_RESIDENT',length=ln,status=ierr)
+    if (ierr == 0 .and. ln > 0) stacksize = min(stacksize, 100000)
 
     if (id == master) then
        write(iprint, *) 'MPI memory stack size = ', stacksize
