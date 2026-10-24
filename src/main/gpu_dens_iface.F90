@@ -183,7 +183,10 @@ end subroutine init_gpu_switch
 !+
 !-------------------------------------------------------------
 subroutine densityiterate_gpu(npart, xyzh, vxyzu, fxyzu, fext, gradh, divcurlv, alphaind)
- use part, only:massoftype,igas
+ use part, only:igas
+#ifdef GPU
+ use part, only:massoftype
+#endif
  use dim,  only:nalpha
 #ifdef GPU
  use io,   only:fatal

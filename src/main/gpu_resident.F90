@@ -37,7 +37,9 @@ module gpu_resident
  implicit none
 
  logical, public :: gpu_mirror = .false.
- logical, save   :: gpu_feed = .false.     ! COSMO_RESIDENT_FEED: the pair passes read the resident state
+#ifdef GPU
+ logical, save   :: gpu_feed = .false. ! COSMO_RESIDENT_FEED: the pair passes read the resident state
+#endif
  logical, public :: gpu_resident_on = .false.  ! COSMO_RESIDENT: the device is the truth (implies both)
  public :: rs_init_switch,rs_start_step,rs_after_predictor,rs_after_substep
  public :: rs_after_predict_sph,rs_after_derivs,rs_after_corrector,rs_after_cons2prim
@@ -68,12 +70,16 @@ module gpu_resident
  integer(kind=1), save :: nbinmax_before_derivs = 0
  real, allocatable, save :: fsink_before(:,:)   ! fxyz_ptmass before get_force's gas loop
  integer(kind=8), save :: nbad(nchecks) = 0, nbadtot(nchecks) = 0
- integer, save :: nsync = 0          ! device Domain syncs so far (MPI)
+#ifdef GPU
+ integer, save :: nsync = 0 ! device Domain syncs so far (MPI)
+#endif
  logical, save :: priming = .false.  ! rs_prime sent the state; the first step's bookkeeping is still to come
  !--MPI: a full Domain sync only when the coarsest active bin is within sync_levels of the
  !  finest (COSMO_SYNC_LEVELS, default 4: at most every 16 substeps), or the guard fires
+#ifdef GPU
  integer, save :: sync_levels = 4
-#ifdef MPI
+#endif
+#if defined(MPI) && defined(GPU)
  real(kind=8), save :: wall_syncstep = 0.d0   ! host wall in the sync decision + syncs (COSMO_DOMTIME)
  interface
   integer(c_int) function cosmo_dom_need_sync() bind(C)
@@ -92,8 +98,8 @@ module gpu_resident
    integer(c_int), value :: sub
   end subroutine cosmo_dom_check_halos
  end interface
+ real,    save :: tsync_tot = 0. ! and the seconds they took, this rank
 #endif
- real,    save :: tsync_tot = 0.     ! and the seconds they took, this rank
  integer, save :: nrun(nchecks) = 0   ! comparisons made this step, per check
  integer, save :: nstep = 0
  logical, save :: started = .false., checked = .false.
@@ -209,10 +215,12 @@ contains
 !-----------------------------------------------------------------------
 subroutine rs_init_switch()
  use dim, only:ind_timesteps
+#ifdef GPU
  use io,  only:iprint
  character(len=16) :: val
  integer :: ln,ierr
  logical, save :: switch_done = .false.
+#endif
 
  if (checked) return
  checked = .true.
@@ -458,16 +466,22 @@ end subroutine compare
 !+
 !-----------------------------------------------------------------------
 subroutine rs_start_step(npart,istepfrac,nbinmax,nactive,nalive,nactivetot,nalivetot)
+#ifdef GPU
  use timestep_ind, only:ibinnow
+#endif
  use dim,          only:use_dust
+#ifdef GPU
  use part,         only:all_active
+#endif
  use mpiutils,     only:reduceall_mpi
  integer,         intent(in)    :: npart,istepfrac
  integer(kind=1), intent(in)    :: nbinmax
  integer,         intent(inout) :: nactive,nalive
  integer(kind=8), intent(inout) :: nactivetot,nalivetot
+#ifdef GPU
  integer :: ncount,i
  integer(c_int) :: nalive_dev
+#endif
 
  call rs_init_switch()
  if (.not.gpu_mirror .or. npart <= 0) return
@@ -486,7 +500,7 @@ subroutine rs_start_step(npart,istepfrac,nbinmax,nactive,nalive,nactivetot,naliv
     call put(rs_ibin,npart,force=.true.)
     call put(rs_ibinold,npart,force=.true.)
     call put(rs_ibinwake,npart,force=.true.)
-#ifdef MPI
+#if defined(MPI) && defined(GPU)
     !--the puts reach owned slots only: the same fields to every halo copy (a full exchange)
     if (gpu_domain_on) call cosmo_dom_exchange_after_force(1_c_int)
 #endif
@@ -596,16 +610,25 @@ subroutine rs_after_get_force(npart,ntypes,nptmass,xyzmh_ptmass,fxyz_ptmass,fonr
  use dim,              only:use_sinktree,gr
  use options,          only:iexternalforce
  use damping,          only:idamp
- use ptmass,           only:isink_potential,use_regnbody,dtfacphi2
+ use ptmass,           only:isink_potential,use_regnbody
+#ifdef GPU
+ use ptmass,           only:dtfacphi2
+#endif
  use ptmass_radiation, only:isink_radiation
- use part,             only:ihsoft,iJ2,massoftype,igas,maxtypes
+ use part,             only:ihsoft,iJ2,igas,maxtypes
+#ifdef GPU
+ use part,             only:massoftype
+#endif
  integer, intent(in)    :: npart,ntypes,nptmass
  real,    intent(in)    :: xyzmh_ptmass(:,:)
  real,    intent(inout) :: fxyz_ptmass(:,:),fonrmax,dtphi2
  real,    intent(in), optional :: extrapfac,fsink_old(:,:)
  real(c_double), allocatable :: sink(:),sinkacc(:)
- real(c_double) :: fonrmax_dev,dtphi2_dev
+ real(c_double) :: fonrmax_dev
+#ifdef GPU
+ real(c_double) :: dtphi2_dev
  real    :: fhost(3),scale
+#endif
  integer :: j
  logical :: twin
 
@@ -677,9 +700,15 @@ end subroutine rs_after_get_force
 subroutine rs_after_accretion(npart,ntypes,nptmass,xyzmh_ptmass,pxyz_ptmass,dptmass,naccreted,nlive,nbinmax)
  use dim,         only:use_apr
  use options,     only:iexternalforce
- use ptmass,      only:icreate_sinks,f_acc
+ use ptmass,      only:icreate_sinks
+#ifdef GPU
+ use ptmass,      only:f_acc
+#endif
  use ptmass_tree, only:nfastacc
- use part,        only:ihacc,massoftype,maxtypes
+ use part,        only:ihacc,maxtypes
+#ifdef GPU
+ use part,        only:massoftype
+#endif
  use kernel,      only:radkern2
  integer,         intent(in)    :: npart,ntypes,nptmass
  real,            intent(in)    :: xyzmh_ptmass(:,:),pxyz_ptmass(:,:)
@@ -688,7 +717,9 @@ subroutine rs_after_accretion(npart,ntypes,nptmass,xyzmh_ptmass,pxyz_ptmass,dptm
  integer(kind=1), intent(in), optional :: nbinmax
  real(c_double), allocatable :: sink(:),dd(:)
  integer :: j,nacc
+#ifdef GPU
  real    :: scale
+#endif
  logical :: twin
 
  if (.not.gpu_mirror .or. npart <= 0) return
@@ -731,14 +762,17 @@ end subroutine rs_after_accretion
 !--after predict_sph: h, the predicted velocity, the viscosity switch
 subroutine rs_after_predict_sph(npart,dtsph,timei,ufloor)
  use dim,             only:maxalpha,maxp,nalpha
- use shock_capturing, only:avdecayconst,alpha,alphamax
+ use shock_capturing, only:avdecayconst
+#ifdef GPU
+ use shock_capturing, only:alpha,alphamax
+#endif
  use timestep_ind,    only:nbinmax
-#ifdef MPI
+#if defined(MPI) && defined(GPU)
  use timestep_ind,    only:ibinnow
 #endif
  integer, intent(inout) :: npart   ! MPI: the rank's owned count after the sync
  real,    intent(in) :: dtsph,timei,ufloor
-#ifdef MPI
+#if defined(MPI) && defined(GPU)
  integer(kind=8) :: wc0,wc1,wcrate
 #endif
  integer :: amode
@@ -755,7 +789,7 @@ subroutine rs_after_predict_sph(npart,dtsph,timei,ufloor)
  call compare(4,rs_vpred,npart)
  if (amode > 0) call compare(4,rs_alpha1,npart)
 #endif
-#ifdef MPI
+#if defined(MPI) && defined(GPU)
  !--the positions have drifted and derivs is next: re-decompose and find the halos when the
  !  coarse bins are active (the coarsest active bin is within sync_levels of the finest),
  !  or when the displacement guard says the halo margin may no longer hold
@@ -786,21 +820,25 @@ end subroutine rs_after_predict_sph
 subroutine rs_after_force(npart)
  use mpiutils, only:reduceall_mpi
  use dim,             only:use_dust,maxvxyzu,gr,driving
+#ifdef GPU
  use timestep,        only:dtmax,C_cour,C_force
  use timestep_ind,    only:nbinmax,istepfrac,ibinnow
  use shock_capturing, only:alpha
  use options,         only:icooling
  use cooling,         only:cooling_in_step
  use eos,             only:ieos
+#endif
  integer, intent(in) :: npart
-#ifdef MPI
+#if defined(MPI) && defined(GPU)
  interface
   subroutine cosmo_dom_reverse_wake() bind(C)
   end subroutine cosmo_dom_reverse_wake
  end interface
-#endif
+#ifdef GPU
  integer :: nbm
  logical :: force_twin,limit_u
+#endif
+#endif
  if (.not.gpu_mirror .or. npart <= 0 .or. .not.started) return
 #ifdef GPU
  force_twin = .not.driving .and. .not.(maxvxyzu >= 4 .and. icooling > 0 .and. .not.cooling_in_step)
@@ -817,7 +855,7 @@ subroutine rs_after_force(npart)
                          merge(1_c_int,0_c_int,use_dust),merge(1_c_int,0_c_int,limit_u))
  call compare(9,rs_ibin,npart)
  call compare(9,rs_ibinwake,npart)
-#ifdef MPI
+#if defined(MPI) && defined(GPU)
  !--the wake-up flags set on halo copies back to their owners, then the owners' new forces,
  !  bins and flags to the copies, before the corrector reads them
  !  (one call: the reverse wake and the forces share an MPI round, then the forward wake)
@@ -873,15 +911,22 @@ end subroutine rs_after_derivs
 !+
 !-----------------------------------------------------------------------
 subroutine rs_download_all(npart)
- use dim,  only:maxalpha,maxp,nalpha,use_dust
+ use dim,  only:nalpha,use_dust
+#ifdef GPU
+ use dim,  only:maxalpha,maxp
+#endif
  use part, only:recount_npartoftype
-#ifdef MPI
+#if defined(MPI) && defined(GPU)
+#ifdef GPU
  use io,   only:id
 #endif
+#endif
  integer, intent(in) :: npart
+#ifdef GPU
  integer :: f,nf
  integer(kind=8) :: ic0,ic1,ica,icb,icopy,crate
  character(len=8) :: statsenv
+#endif
  if (.not.resident_mode .or. npart <= 0) return
 #ifdef GPU
  call system_clock(ic0,crate)
@@ -908,7 +953,7 @@ subroutine rs_download_all(npart)
     ' ms=',1.e3*real(ic1-ic0)/real(crate),' of which copies=',1.e3*real(icopy)/real(crate)
  if (len_trim(statsenv) > 0 .and. gpu_domain_on) write(0,'(a,i8,a,f10.3)') 'COSMO_DOMAIN syncs=',nsync, &
     ' s=',tsync_tot
-#ifdef MPI
+#if defined(MPI) && defined(GPU)
  call get_environment_variable('COSMO_DOMTIME',statsenv)
  if (len_trim(statsenv) > 0 .and. gpu_domain_on) call cosmo_dom_report()
  if (len_trim(statsenv) > 0 .and. gpu_domain_on) write(0,'(a,i4,a,f9.3,a)') 'COSMO_SYNCWALL rank',id, &
@@ -918,6 +963,7 @@ subroutine rs_download_all(npart)
 end subroutine rs_download_all
 
 !--the inverse of pack: dbuf (ncomp runs of npart doubles) into the host field
+#ifdef GPU
 subroutine unpack(field,npart)
  use part, only:xyzh,vxyzu,vpred,fxyzu,twas,ibin,ibin_old,ibin_wake,iphase,iamtype, &
                 divcurlv,eos_vars,ics,alphaind,fext,rho,gradh,igasP,isetphase, &
@@ -1089,6 +1135,7 @@ subroutine unpack(field,npart)
  !$omp end parallel
 
 end subroutine unpack
+#endif
 
 !-----------------------------------------------------------------------
 !+
@@ -1102,7 +1149,10 @@ end subroutine unpack
 !-----------------------------------------------------------------------
 subroutine rs_after_cons2prim(npart)
  use dim,  only:nalpha,use_dust
- use part, only:massoftype,maxtypes,hfact
+ use part, only:maxtypes
+#ifdef GPU
+ use part, only:massoftype,hfact
+#endif
  integer, intent(in) :: npart
  if (.not.gpu_mirror .or. npart <= 0 .or. .not.started) return
  if (resident_feed) then
@@ -1132,11 +1182,17 @@ end subroutine rs_after_cons2prim
 !  fields are re-sent.  ieos 3 is compared to 4 ulps (pow).
 !+
 !-----------------------------------------------------------------------
+#ifdef GPU
 subroutine rs_cons2prim_twin(npart)
  use dim,             only:maxalpha,maxp,nalpha,maxvxyzu,do_radiation,do_nucleation,update_muGamma,use_krome
- use eos,             only:ieos,polyk,gamma,qfacdisc,cs_min,isink
+ use eos,             only:ieos,isink
+#ifdef GPU
+ use eos,             only:polyk,gamma,qfacdisc,cs_min
+#endif
  use options,         only:use_dustfrac,use_var_comp
+#ifdef GPU
  use shock_capturing, only:alpha,alphamax
+#endif
  use part,            only:xyzmh_ptmass,nptmass
  integer, intent(in) :: npart
  logical :: twin,aloc
@@ -1168,6 +1224,7 @@ subroutine rs_cons2prim_twin(npart)
  if (aloc) call compare(12,rs_alphaloc,npart,tolulp)
 
 end subroutine rs_cons2prim_twin
+#endif
 
 !--after the corrector: v, twas, and the bins after waking
 subroutine rs_after_corrector(npart,timei,ibin_dts,nbins,ithdt,ittwas,nbinmax,ufloor,icooling)
@@ -1186,7 +1243,7 @@ subroutine rs_after_corrector(npart,timei,ibin_dts,nbins,ithdt,ittwas,nbinmax,uf
  call compare(5,rs_twas,npart)
  call compare(5,rs_ibin,npart)
  call compare(5,rs_ibinwake,npart)
-#ifdef MPI
+#if defined(MPI) && defined(GPU)
  if (gpu_domain_on) call cosmo_dom_check_halos(int(10*nstep+2,c_int))   ! COSMO_DOMAIN_DEBUG=3 only
 #endif
 #endif
@@ -1210,8 +1267,10 @@ end subroutine rs_after_corrector
 !-----------------------------------------------------------------------
 subroutine rs_first_send(npart,everything)
  use dim,  only:use_dust
+#ifdef GPU
  use io,   only:nprocs
  use part, only:vpred,vxyzu
+#endif
  integer, intent(in) :: npart
  logical, intent(in) :: everything
  integer :: f
@@ -1231,7 +1290,7 @@ subroutine rs_first_send(npart,everything)
  enddo
  started = .true.
  resident_feed = gpu_feed
-#ifdef MPI
+#if defined(MPI) && defined(GPU)
  !--the device Domain over the state (GPU_MPI_PLAN.md Phase 2); its first sync moves nothing
  if (gpu_feed .and. nprocs > 1) call dom_start(npart)
 #endif
@@ -1268,7 +1327,7 @@ end subroutine rs_prime
 !  and densities on the halos too (div_a for the Cullen-Dehnen switch reads a neighbour's f)
 subroutine rs_resync(npart)
  integer, intent(inout) :: npart
-#ifdef MPI
+#if defined(MPI) && defined(GPU)
  if (gpu_domain_on .and. resident_mode) call dom_sync(npart,.false.)
 #else
  if (npart < 0) npart = 0   ! nothing to do
@@ -1290,7 +1349,7 @@ subroutine rs_put_alpha1(npart)
 #endif
 end subroutine rs_put_alpha1
 
-#ifdef MPI
+#if defined(MPI) && defined(GPU)
 !-----------------------------------------------------------------------
 !+
 !  MPI (GPU_MPI_PLAN.md Phase 2): the device Domain over the resident
@@ -1302,6 +1361,7 @@ end subroutine rs_put_alpha1
 !  mode): the ids are refreshed here, the rest by rs_download_all.
 !+
 !-----------------------------------------------------------------------
+#ifdef GPU
 subroutine dom_start(npart)
  use mpi
  use io,       only:nprocs
@@ -1335,6 +1395,7 @@ subroutine dom_start(npart)
  call dom_sync(np,.true.)
 
 end subroutine dom_start
+#endif
 
 subroutine dom_sync(npart,first)
  use io,       only:id,master,iprint,fatal

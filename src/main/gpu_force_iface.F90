@@ -102,24 +102,45 @@ contains
 !+
 !-----------------------------------------------------------------------
 subroutine force_gpu(npart,xyzh,vxyzu,eos_vars,alphaind,fxyzu,divcurlv,dt)
- use part,    only:massoftype,igas
+ use part,    only:igas
+#ifdef GPU
+ use part,    only:massoftype
  use options, only:beta,alphau,alpha
  use dim,     only:maxalpha,maxp
- use dim,     only:maxvxyzu,driving,disc_viscosity,track_lum,h2chemistry,store_dust_temperature
+#endif
+ use dim,     only:maxvxyzu,driving
+#ifdef GPU
+ use dim,     only:disc_viscosity,track_lum,h2chemistry,store_dust_temperature
+#endif
  use dim,     only:ind_timesteps,igradzeta,igradomega
- use part,    only:gradh,ibin_old,iactive
+ use part,    only:iactive
+#ifdef GPU
+ use part,    only:gradh,ibin_old
+#endif
  use io,      only:fatal
- use part,    only:ien_type,ien_entropy,ien_entropy_s,rho,isdead_or_accreted
+ use part,    only:ien_entropy,ien_entropy_s,isdead_or_accreted
+#ifdef GPU
+ use part,    only:ien_type,rho
  use eos,     only:icooling,ipdv_heating,ishock_heating
- use cooling, only:energ_cooling,cooling_in_step
+#endif
+ use cooling, only:energ_cooling
+#ifdef GPU
+ use cooling, only:cooling_in_step
  use part,    only:nptmass,xyzmh_ptmass
+#endif
  use part,    only:sinks_have_heating
  use dim,     only:use_dust
- use part,    only:iphase,iamtype,idust,grainsize,graindens,tstop,fxyz_drag,fxyz_dragold
+ use part,    only:iamtype,idust
+#ifdef GPU
+ use part,    only:iphase,grainsize,graindens,tstop,fxyz_drag,fxyz_dragold
  use part,    only:ndusttypes
  use dust,    only:idrag,irecon,drag_implicit,icut_backreaction,K_code,seff,coeff_gei_1,cste_mu
+#endif
  use timestep,only:bignumber
- use io,      only:iverbose,warning,id,master
+ use io,      only:warning,master
+#ifdef GPU
+ use io,      only:iverbose,id
+#endif
  use io_summary, only:summary_variable,iosumdgs,iosumdge
  use iso_c_binding, only:c_long_long
 
@@ -432,6 +453,7 @@ end subroutine force_gpu
 !  buffers.  No MHD/radiation/physical viscosity branch of get_stress.
 !+
 !-----------------------------------------------------------------------
+#ifdef GPU
 subroutine prepare_pro2_gpu(npart,xyzh,vxyzu,eos_vars,alphaind, &
                             pro2_8,spsound_8,alphaAV_8,u_8)
  use dim,     only:maxalpha,maxp,maxvxyzu
@@ -477,6 +499,7 @@ subroutine prepare_pro2_gpu(npart,xyzh,vxyzu,eos_vars,alphaind, &
  !$omp end parallel do
 
 end subroutine prepare_pro2_gpu
+#endif
 
 !-----------------------------------------------------------------------
 !+
@@ -484,6 +507,7 @@ end subroutine prepare_pro2_gpu
 !  and the sound speed come from the staging buffers the kernel just filled.
 !+
 !-----------------------------------------------------------------------
+#ifdef GPU
 subroutine finish_gpu_force_timesteps(npart,xyzh,vxyzu,fxyzu, &
                                       fx8,fy8,fz8,vsigmax8,spsound_8,tsmin8)
  use options,  only:alpha
@@ -590,6 +614,7 @@ subroutine finish_gpu_force_timesteps(npart,xyzh,vxyzu,fxyzu, &
  if (ndustres > 0) call summary_variable('dust',iosumdgr,ndustres,dustresfacmean/real(ndustres),dustresfacmax)
 
 end subroutine finish_gpu_force_timesteps
+#endif
 
 !-----------------------------------------------------------------------
 !+
@@ -601,6 +626,7 @@ end subroutine finish_gpu_force_timesteps
 !  Gas, and two-fluid dust with explicit drag (the drag timestep).
 !+
 !-----------------------------------------------------------------------
+#ifdef GPU
 subroutine finish_gpu_force_bins(npart,xyzh,vxyzu,fxyzu, &
                                  fx8,fy8,fz8,vsigmax8,spsound_8,tsmin8,ibn8,touch8)
  use options,      only:alpha
@@ -717,6 +743,7 @@ subroutine finish_gpu_force_bins(npart,xyzh,vxyzu,fxyzu, &
  if (ndustres > 0) call summary_variable('dust',iosumdgr,ndustres,dustresfacmean/real(ndustres),dustresfacmax)
 
 end subroutine finish_gpu_force_bins
+#endif
 
 !-----------------------------------------------------------------------
 !+

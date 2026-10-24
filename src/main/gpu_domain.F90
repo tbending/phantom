@@ -34,7 +34,7 @@ contains
 !+
 !-----------------------------------------------------------------------
 subroutine gpu_domain_assign(npart)
-#ifdef MPI
+#if defined(MPI) && defined(GPU)
  use mpi
  use iso_c_binding, only:c_int,c_double,c_long_long
  use io,            only:id,master,nprocs,iprint,fatal
@@ -103,7 +103,7 @@ end subroutine gpu_domain_assign
 !+
 !-----------------------------------------------------------------------
 subroutine gpu_domain_check(npart)
-#ifdef MPI
+#if defined(MPI) && defined(GPU)
  use mpi
  use iso_c_binding, only:c_int,c_double
  use io,            only:id,master,nprocs,iprint,fatal
