@@ -85,6 +85,8 @@ module gpu_resident
   end subroutine cosmo_dom_exchange_after_force
   subroutine cosmo_dom_report() bind(C)
   end subroutine cosmo_dom_report
+  subroutine cosmo_dom_after_force_all() bind(C)
+  end subroutine cosmo_dom_after_force_all
   subroutine cosmo_dom_check_halos(sub) bind(C)
    import c_int
    integer(c_int), value :: sub
@@ -459,6 +461,7 @@ subroutine rs_start_step(npart,istepfrac,nbinmax,nactive,nalive,nactivetot,naliv
  use timestep_ind, only:ibinnow
  use dim,          only:use_dust
  use part,         only:all_active
+ use mpiutils,     only:reduceall_mpi
  integer,         intent(in)    :: npart,istepfrac
  integer(kind=1), intent(in)    :: nbinmax
  integer,         intent(inout) :: nactive,nalive
@@ -494,7 +497,10 @@ subroutine rs_start_step(npart,istepfrac,nbinmax,nactive,nalive,nactivetot,naliv
  if (resident_mode) then
     !--the host skipped set_active_particles: its counts and ibinnow from here
     nactive = ncount; nalive = nalive_dev
-    nactivetot = ncount; nalivetot = nalive_dev
+    !--the totals over every rank, as set_active_particles does: evolve decides from them when
+    !  to write the .ev file (collective), and rank-local counts let the ranks disagree and
+    !  deadlock (1M disc, P = 2: one rank in compute_energies, the other in the next substep)
+    nactivetot = reduceall_mpi('+',ncount); nalivetot = reduceall_mpi('+',int(nalive_dev))
     ibinnow = nbinmax
     i = 0
     do while (ibinnow == nbinmax .and. i < nbinmax)
@@ -809,8 +815,8 @@ subroutine rs_after_force(npart)
 #ifdef MPI
  !--the wake-up flags set on halo copies back to their owners, then the owners' new forces,
  !  bins and flags to the copies, before the corrector reads them
- if (gpu_domain_on) call cosmo_dom_reverse_wake()
- if (gpu_domain_on) call cosmo_dom_exchange_after_force(0_c_int)
+ !  (one call: the reverse wake and the forces share an MPI round, then the forward wake)
+ if (gpu_domain_on) call cosmo_dom_after_force_all()
  if (gpu_domain_on) call cosmo_dom_check_halos(int(10*nstep+1,c_int))   ! COSMO_DOMAIN_DEBUG=3 only
 #endif
  ! the bins are global: every rank must take the same substeps (MPI; no-op otherwise)
@@ -1177,8 +1183,11 @@ subroutine rs_after_corrector(npart,timei,ibin_dts,nbins,ithdt,ittwas,nbinmax,uf
  if (gpu_domain_on) call cosmo_dom_check_halos(int(10*nstep+2,c_int))   ! COSMO_DOMAIN_DEBUG=3 only
 #endif
 #endif
- !--one line per step: the mismatching particles of each check
- write(iprint,'(a,i8,13(1x,a,i8,a,i3),a,f6.2)') ' COSMO_MIRROR step',nstep, &
+ !--one line per step: the mismatching particles of each check (resident mode compares
+ !  nothing: every 1000th step only, as a sign of life; a formatted line per substep on
+ !  every rank, through mpirun, sat in the step's critical path)
+ if (.not.resident_mode .or. mod(nstep,1000) == 0) &
+    write(iprint,'(a,i8,13(1x,a,i8,a,i3),a,f6.2)') ' COSMO_MIRROR step',nstep, &
     (trim(checkname(f))//'=',int(nbad(f)),'/',nrun(f),f=1,nchecks),' maxulp=',maxulp_step
  nbadtot = nbadtot + nbad
 end subroutine rs_after_corrector
@@ -1307,8 +1316,12 @@ subroutine dom_start(npart)
  ntot   = reduceall_mpi('+',npart)
  bucket = int(max(64_8, ntot/(100_8*int(nprocs,kind=8))))   ! as gpu_domain_assign
  box    = (/xmin,xmax,ymin,ymax,zmin,zmax/)
- !--dust: the record carries dvdx (a partner's drag reconstruction reads it)
- call cosmo_dom_init(int(bucket,c_int),64_c_int,merge(1_c_int,0_c_int,periodic),box,int(MPI_COMM_WORLD,c_int), &
+ !--focus bucket 64 (no larger than the global bucket, which Cornerstone requires).
+ !  COSMO_BUCKET_FOCUS=256 makes the halo search ~40% cheaper for ~18% more halos (16M disc,
+ !  P = 4: 9.49 -> 9.17 s), but with it the 1M disc at P = 4 aborted in UCX rocm_ipc after
+ !  ~400-550 syncs, 4 times out of 4 (64: the whole dtmax cycle, 1660 syncs).  Dust: the record
+ !  carries dvdx (a partner's drag reconstruction reads it)
+ call cosmo_dom_init(int(bucket,c_int),int(min(64,bucket),c_int),merge(1_c_int,0_c_int,periodic),box,int(MPI_COMM_WORLD,c_int), &
                      merge(1_c_int,0_c_int,use_dust))
  gpu_domain_on = .true.
  np = npart
