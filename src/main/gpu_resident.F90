@@ -70,6 +70,24 @@ module gpu_resident
  integer(kind=8), save :: nbad(nchecks) = 0, nbadtot(nchecks) = 0
  integer, save :: nsync = 0          ! device Domain syncs so far (MPI)
  logical, save :: priming = .false.  ! rs_prime sent the state; the first step's bookkeeping is still to come
+ !--MPI: a full Domain sync only when the coarsest active bin is within sync_levels of the
+ !  finest (COSMO_SYNC_LEVELS, default 4: at most every 16 substeps), or the guard fires
+ integer, save :: sync_levels = 4
+#ifdef MPI
+ interface
+  integer(c_int) function cosmo_dom_need_sync() bind(C)
+   import c_int
+  end function cosmo_dom_need_sync
+  subroutine cosmo_dom_exchange_after_force() bind(C)
+  end subroutine cosmo_dom_exchange_after_force
+  subroutine cosmo_dom_report() bind(C)
+  end subroutine cosmo_dom_report
+  subroutine cosmo_dom_check_halos(sub) bind(C)
+   import c_int
+   integer(c_int), value :: sub
+  end subroutine cosmo_dom_check_halos
+ end interface
+#endif
  real,    save :: tsync_tot = 0.     ! and the seconds they took, this rank
  integer, save :: nrun(nchecks) = 0   ! comparisons made this step, per check
  integer, save :: nstep = 0
@@ -205,6 +223,8 @@ subroutine rs_init_switch()
     gpu_mirror = .true.
     write(iprint,'(a)') ' cosmoSPHere: COSMO_RESIDENT, the device is the truth between dumps'
  endif
+ call get_environment_variable('COSMO_SYNC_LEVELS',val,ln,ierr)
+ if (ierr == 0 .and. ln > 0) read(val,*,iostat=ierr) sync_levels
  call get_environment_variable('COSMO_RESIDENT_FEED',val,ln,ierr)
  gpu_feed = gpu_mirror .and. ((ierr == 0 .and. ln > 0) .or. gpu_resident_on)
  if (gpu_feed) write(iprint,'(a)') ' cosmoSPHere: COSMO_RESIDENT_FEED, the GPU passes read the resident state'
@@ -455,6 +475,10 @@ subroutine rs_start_step(npart,istepfrac,nbinmax,nactive,nalive,nactivetot,naliv
     call put(rs_ibin,npart,force=.true.)
     call put(rs_ibinold,npart,force=.true.)
     call put(rs_ibinwake,npart,force=.true.)
+#ifdef MPI
+    !--the puts reach owned slots only: the same fields to the halo copies
+    if (gpu_domain_on) call cosmo_dom_exchange_after_force()
+#endif
     priming = .false.
  endif
  ncount = cosmo_rs_set_active(int(npart,c_int),int(istepfrac,c_int),int(nbinmax,c_int),nalive_dev)
@@ -694,7 +718,7 @@ end subroutine rs_after_accretion
 subroutine rs_after_predict_sph(npart,dtsph,timei,ufloor)
  use dim,             only:maxalpha,maxp,nalpha
  use shock_capturing, only:avdecayconst,alpha,alphamax
- use timestep_ind,    only:nbinmax
+ use timestep_ind,    only:nbinmax,ibinnow
  integer, intent(inout) :: npart   ! MPI: the rank's owned count after the sync
  real,    intent(in) :: dtsph,timei,ufloor
  integer :: amode
@@ -712,8 +736,18 @@ subroutine rs_after_predict_sph(npart,dtsph,timei,ufloor)
  if (amode > 0) call compare(4,rs_alpha1,npart)
 #endif
 #ifdef MPI
- !--the positions have drifted and derivs is next: re-decompose, find the halos
- if (gpu_domain_on .and. resident_mode) call dom_sync(npart,.false.)
+ !--the positions have drifted and derivs is next: re-decompose and find the halos when the
+ !  coarse bins are active (the coarsest active bin is within sync_levels of the finest),
+ !  or when the displacement guard says the halo margin may no longer hold
+ if (gpu_domain_on .and. resident_mode) then
+    if (int(ibinnow) <= int(nbinmax) - sync_levels) then
+       call dom_sync(npart,.false.)
+    elseif (cosmo_dom_need_sync() /= 0) then
+       call dom_sync(npart,.false.)
+    else
+       call cosmo_dom_check_halos(int(nstep,c_int))   ! COSMO_DOMAIN_DEBUG=3 only
+    endif
+ endif
 #endif
 end subroutine rs_after_predict_sph
 
@@ -761,8 +795,11 @@ subroutine rs_after_force(npart)
  call compare(9,rs_ibin,npart)
  call compare(9,rs_ibinwake,npart)
 #ifdef MPI
- !--the wake-up flags set on halo copies back to their owners, before the corrector reads them
+ !--the wake-up flags set on halo copies back to their owners, then the owners' new forces,
+ !  bins and flags to the copies, before the corrector reads them
  if (gpu_domain_on) call cosmo_dom_reverse_wake()
+ if (gpu_domain_on) call cosmo_dom_exchange_after_force()
+ if (gpu_domain_on) call cosmo_dom_check_halos(int(10*nstep+1,c_int))   ! COSMO_DOMAIN_DEBUG=3 only
 #endif
  ! the bins are global: every rank must take the same substeps (MPI; no-op otherwise)
  nbm = int(reduceall_mpi('max',int(nbm)),kind=c_int)
@@ -845,6 +882,10 @@ subroutine rs_download_all(npart)
     ' ms=',1.e3*real(ic1-ic0)/real(crate),' of which copies=',1.e3*real(icopy)/real(crate)
  if (len_trim(statsenv) > 0 .and. gpu_domain_on) write(0,'(a,i8,a,f10.3)') 'COSMO_DOMAIN syncs=',nsync, &
     ' s=',tsync_tot
+#ifdef MPI
+ call get_environment_variable('COSMO_DOMTIME',statsenv)
+ if (len_trim(statsenv) > 0 .and. gpu_domain_on) call cosmo_dom_report()
+#endif
 #endif
 end subroutine rs_download_all
 
@@ -1117,6 +1158,9 @@ subroutine rs_after_corrector(npart,timei,ibin_dts,nbins,ithdt,ittwas,nbinmax,uf
  call compare(5,rs_twas,npart)
  call compare(5,rs_ibin,npart)
  call compare(5,rs_ibinwake,npart)
+#ifdef MPI
+ if (gpu_domain_on) call cosmo_dom_check_halos(int(10*nstep+2,c_int))   ! COSMO_DOMAIN_DEBUG=3 only
+#endif
 #endif
  !--one line per step: the mismatching particles of each check
  write(iprint,'(a,i8,13(1x,a,i8,a,i3),a,f6.2)') ' COSMO_MIRROR step',nstep, &
@@ -1298,5 +1342,6 @@ subroutine dom_sync(npart,first)
 
 end subroutine dom_sync
 #endif
+
 
 end module gpu_resident
