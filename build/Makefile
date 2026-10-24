@@ -247,7 +247,8 @@ ifeq ($(GPU_BACKEND), cuda)
     CUDA_HOME ?= $(CUDA_INSTALL_PATH)
     LDFLAGS   += -L$(CUDA_HOME)/lib64 -lcudart -lstdc++ -ldl
 else ifeq ($(GPU_BACKEND), hip)
-    LDFLAGS   += -L$(ROCM_PATH)/lib -lamdhip64 -lstdc++
+    # rocPRIM queries the device properties on every scan: cached (cosmoSPHere hip_props_cache.cpp)
+    LDFLAGS   += -L$(ROCM_PATH)/lib -lamdhip64 -lstdc++ -Wl,--wrap=hipGetDevicePropertiesR0600
 else
     $(error Unknown GPU_BACKEND=$(GPU_BACKEND) -- use 'cuda' or 'hip')
 endif

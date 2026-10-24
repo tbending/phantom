@@ -341,12 +341,20 @@ subroutine gpu_arrays_init(n)
     endif
  enddo
 
+ !--a regrow (MPI: a rank's owned count drifts from sync to sync) reuses the arena when it
+ !  is big enough and otherwise takes 1/8 headroom: re-pinning ~0.8 GB costs ~190 ms, and
+ !  the other ranks wait for it at the next collective
  if (allocated(arena)) then
-    call unpin_buffer(arena)
-    deallocate(arena)
+    if (size(arena) < off-1) then
+       call unpin_buffer(arena)
+       deallocate(arena)
+       allocate(arena((off-1) + (off-1)/8))
+       call pin_buffer(arena)
+    endif
+ else
+    allocate(arena(off-1))
+    call pin_buffer(arena)
  endif
- allocate(arena(off-1))
- call pin_buffer(arena)
 #ifdef GPU
  !--size the device side to match, in one call, from the same n
  call cosmo_arrays_init(int(n, kind=c_int))

@@ -73,12 +73,15 @@ module gpu_resident
  !--MPI: a full Domain sync only when the coarsest active bin is within sync_levels of the
  !  finest (COSMO_SYNC_LEVELS, default 4: at most every 16 substeps), or the guard fires
  integer, save :: sync_levels = 4
+ real(kind=8), save :: wall_syncstep = 0.d0   ! host wall in the sync decision + syncs (COSMO_DOMTIME)
 #ifdef MPI
  interface
   integer(c_int) function cosmo_dom_need_sync() bind(C)
    import c_int
   end function cosmo_dom_need_sync
-  subroutine cosmo_dom_exchange_after_force() bind(C)
+  subroutine cosmo_dom_exchange_after_force(full) bind(C)
+   import c_int
+   integer(c_int), value :: full
   end subroutine cosmo_dom_exchange_after_force
   subroutine cosmo_dom_report() bind(C)
   end subroutine cosmo_dom_report
@@ -255,6 +258,8 @@ subroutine grow(n)
  use iso_c_binding, only:c_loc,c_size_t,c_sizeof
 #endif
  integer, intent(in) :: n
+ integer :: nalloc
+ nalloc = n
  if (allocated(hbuf)) then
     if (size(hbuf) >= 4*n) return
 #ifdef GPU
@@ -262,8 +267,11 @@ subroutine grow(n)
     call cosmo_unpin_host(c_loc(dbuf(1)))
 #endif
     deallocate(hbuf,dbuf)
+    !--a regrow (MPI: the owned count drifts between syncs): headroom, as re-pinning two
+    !  4n-double buffers costs ~250 ms on 4M particles
+    nalloc = n + n/8
  endif
- allocate(hbuf(4*n),dbuf(4*n))
+ allocate(hbuf(4*nalloc),dbuf(4*nalloc))
 #ifdef GPU
  !--registered with the driver: the whole-state copies (.ev writes, dumps) go at pinned
  !  speed rather than through pageable staging (19.2M particles: ~17 ms per field)
@@ -476,8 +484,8 @@ subroutine rs_start_step(npart,istepfrac,nbinmax,nactive,nalive,nactivetot,naliv
     call put(rs_ibinold,npart,force=.true.)
     call put(rs_ibinwake,npart,force=.true.)
 #ifdef MPI
-    !--the puts reach owned slots only: the same fields to the halo copies
-    if (gpu_domain_on) call cosmo_dom_exchange_after_force()
+    !--the puts reach owned slots only: the same fields to every halo copy (a full exchange)
+    if (gpu_domain_on) call cosmo_dom_exchange_after_force(1_c_int)
 #endif
     priming = .false.
  endif
@@ -721,6 +729,7 @@ subroutine rs_after_predict_sph(npart,dtsph,timei,ufloor)
  use timestep_ind,    only:nbinmax,ibinnow
  integer, intent(inout) :: npart   ! MPI: the rank's owned count after the sync
  real,    intent(in) :: dtsph,timei,ufloor
+ integer(kind=8) :: wc0,wc1,wcrate
  integer :: amode
  if (.not.gpu_mirror .or. npart <= 0) return
  !--derivs is next, and the force pass changes nbinmax; the new-bins twin needs it before
@@ -740,6 +749,7 @@ subroutine rs_after_predict_sph(npart,dtsph,timei,ufloor)
  !  coarse bins are active (the coarsest active bin is within sync_levels of the finest),
  !  or when the displacement guard says the halo margin may no longer hold
  if (gpu_domain_on .and. resident_mode) then
+    call system_clock(wc0,wcrate)
     if (int(ibinnow) <= int(nbinmax) - sync_levels) then
        call dom_sync(npart,.false.)
     elseif (cosmo_dom_need_sync() /= 0) then
@@ -747,6 +757,8 @@ subroutine rs_after_predict_sph(npart,dtsph,timei,ufloor)
     else
        call cosmo_dom_check_halos(int(nstep,c_int))   ! COSMO_DOMAIN_DEBUG=3 only
     endif
+    call system_clock(wc1)
+    wall_syncstep = wall_syncstep + real(wc1-wc0,kind=8)/real(wcrate,kind=8)
  endif
 #endif
 end subroutine rs_after_predict_sph
@@ -798,7 +810,7 @@ subroutine rs_after_force(npart)
  !--the wake-up flags set on halo copies back to their owners, then the owners' new forces,
  !  bins and flags to the copies, before the corrector reads them
  if (gpu_domain_on) call cosmo_dom_reverse_wake()
- if (gpu_domain_on) call cosmo_dom_exchange_after_force()
+ if (gpu_domain_on) call cosmo_dom_exchange_after_force(0_c_int)
  if (gpu_domain_on) call cosmo_dom_check_halos(int(10*nstep+1,c_int))   ! COSMO_DOMAIN_DEBUG=3 only
 #endif
  ! the bins are global: every rank must take the same substeps (MPI; no-op otherwise)
@@ -852,6 +864,7 @@ end subroutine rs_after_derivs
 subroutine rs_download_all(npart)
  use dim,  only:maxalpha,maxp,nalpha,use_dust
  use part, only:recount_npartoftype
+ use io,   only:id
  integer, intent(in) :: npart
  integer :: f,nf
  integer(kind=8) :: ic0,ic1,ica,icb,icopy,crate
@@ -885,6 +898,8 @@ subroutine rs_download_all(npart)
 #ifdef MPI
  call get_environment_variable('COSMO_DOMTIME',statsenv)
  if (len_trim(statsenv) > 0 .and. gpu_domain_on) call cosmo_dom_report()
+ if (len_trim(statsenv) > 0 .and. gpu_domain_on) write(0,'(a,i4,a,f9.3,a)') 'COSMO_SYNCWALL rank',id, &
+    ' sync decision + syncs, host wall ',wall_syncstep,' s'
 #endif
 #endif
 end subroutine rs_download_all
@@ -1303,35 +1318,38 @@ end subroutine dom_start
 
 subroutine dom_sync(npart,first)
  use io,       only:id,master,iprint,fatal
- use part,     only:iorig
+ use timestep,     only:dtmax
+ use timestep_ind, only:nbinmax
  use mpiutils, only:reduceall_mpi
  integer, intent(inout) :: npart
  logical, intent(in)    :: first
  interface
-  subroutine cosmo_dom_sync(first,nown,nhalo,tsync) bind(C)
+  subroutine cosmo_dom_sync(first,nown,nhalo,tsync,tnext) bind(C)
    import c_int,c_double
    integer(c_int), value :: first
    integer(c_int)        :: nown,nhalo
    real(c_double)        :: tsync
+   real(c_double), value :: tnext
   end subroutine cosmo_dom_sync
  end interface
+ real(c_double)  :: tnext
  integer(c_int)  :: nown,nhalo
  real(c_double)  :: tsync
  integer(kind=8) :: nhalotot,ntot
- integer         :: i
 
- call cosmo_dom_sync(merge(1_c_int,0_c_int,first),nown,nhalo,tsync)
+ !--the time to the next planned sync (the coarse bins' step): every particle's search radius
+ !  covers what it can travel in it (the guard catches the rest)
+ tnext = dtmax/2.0_c_double**max(0,int(nbinmax) - sync_levels)
+ if (first .or. nbinmax <= 0) tnext = 0.   ! in initial the bins are not set yet: no margin
+ call cosmo_dom_sync(merge(1_c_int,0_c_int,first),nown,nhalo,tsync,real(tnext,c_double))
  if (first .and. nown /= npart) call fatal('gpu_resident','the first device sync changed the owned count', &
                                            ival=int(nown))
  npart     = int(nown)
  nsync     = nsync + 1
  tsync_tot = tsync_tot + real(tsync)
- !--the ids follow the particles; the rest of the host copy waits for rs_download_all
+ !--the host copy (ids included) is stale between dumps by design: rs_download_all fetches it,
+ !  through dbuf, which must hold the owned count's 4-component fields (no-op unless it grew)
  call grow(npart)
- call cosmo_rs_get(int(rs_iorig,c_int),dbuf,int(npart,c_int))
- do i=1,npart
-    iorig(i) = nint(dbuf(i),kind=8)
- enddo
  if (first .or. mod(nsync,1000) == 0) then
     ntot     = reduceall_mpi('+',int(npart,kind=8))
     nhalotot = reduceall_mpi('+',int(nhalo,kind=8))
