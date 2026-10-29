@@ -862,8 +862,10 @@ subroutine rs_after_force(npart)
  if (gpu_domain_on) call cosmo_dom_after_force_all()
  if (gpu_domain_on) call cosmo_dom_check_halos(int(10*nstep+1,c_int))   ! COSMO_DOMAIN_DEBUG=3 only
 #endif
- ! the bins are global: every rank must take the same substeps (MPI; no-op otherwise)
+ ! the bins are global: every rank must take the same substeps (MPI; no-op otherwise).
+ ! -1 = nothing active on that rank; nothing active anywhere keeps nbinmax (force.F90)
  nbm = int(reduceall_mpi('max',int(nbm)),kind=c_int)
+ if (nbm < 0) nbm = int(nbinmax_before_derivs,kind=c_int)
  if (resident_mode) then
     nbinmax = int(nbm,kind=1)
  elseif (nbm /= int(nbinmax)) then

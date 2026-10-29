@@ -757,9 +757,12 @@ subroutine force(icall,npart,xyzh,vxyzu,fxyzu,divcurlv,divcurlB,Bevol,dBevol,&
  ! are dead/inactive, e.g. after sink creation or if all
  ! have moved to a higher ibin; the following step on the
  ! higher ibin will yeild non-zero and modify nbinmax
- ! appropriately
+ ! appropriately.  No opinion (-1) rather than the old nbinmax: under MPI a rank with
+ ! nothing active this substep would otherwise hold nbinmax at its old value for every
+ ! rank (the max below), and the substeps would depend on the number of ranks (any
+ ! particle on the finest bin is active on every substep, so an idle rank holds none)
  if (ncheckbin==0) then
-    nbinmaxnew    = nbinmax
+    nbinmaxnew    = -1
  endif
 #endif
 
@@ -796,7 +799,8 @@ subroutine force(icall,npart,xyzh,vxyzu,fxyzu,divcurlv,divcurlB,Bevol,dBevol,&
 #endif
 
 #ifdef IND_TIMESTEPS
- nbinmax    = int(reduceall_mpi('max',nbinmaxnew),kind=1)
+ nbinmaxnew = int(reduceall_mpi('max',nbinmaxnew))
+ if (nbinmaxnew >= 0) nbinmax = int(nbinmaxnew,kind=1)
  ndtforce   = int(reduce_mpi('+',ndtforce))
  ndtforceng = int(reduce_mpi('+',ndtforceng))
  ndtcool    = int(reduce_mpi('+',ndtcool))
