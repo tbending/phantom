@@ -34,10 +34,20 @@ module neighkdtree
  integer,      public,  allocatable :: leaf_is_active(:) ! : 0 internal node or empty cell, : 1 active cell, :- inactive cell
  integer,      public,  allocatable :: active_leaves(:)  ! the cells with leaf_is_active > 0, in order (set by build_tree)
  integer,      public               :: nactive_leaves = 0
+ ! number of active leaves handed to a thread at a time in the density and force loops:
+ ! cells nearby in the list share neighbours, so small chunks keep them on one thread,
+ ! but with self-gravity the cost per cell varies widely, so the cells are handed out one at a time
+ integer,      parameter, public    :: ncellchunk = merge(1,16,gravity)
  integer,      public , allocatable :: listneigh(:)
  integer,      public , allocatable :: listneigh_global(:)
 !-- dual tree cache arrays
- integer,               allocatable :: cachestate(:)
+! cachestate is read without an atomic in the tree walks, which read it for every node visited:
+! some compilers (e.g. aocc) put every OpenMP atomic behind one global lock, which serialises
+! the walk. This is safe because the state of a node only increases during a walk (0 -> 1 -> 2 -> 3),
+! it is written with an atomic and a flush after the data it refers to, and readers flush before
+! using cached data: a reader seeing an old value just computes the interaction instead of reusing it.
+! It is volatile so that every read is a fresh load from memory
+ integer, volatile,     allocatable :: cachestate(:)
  integer,               allocatable :: neighnodecount_branch(:)
  integer,               allocatable :: neighnode_branch(:,:)
  integer,               allocatable :: neighnodecache(:)
@@ -56,6 +66,10 @@ module neighkdtree
  integer,         parameter         :: maxnodecache_local = 512
  integer,         parameter         :: maxneigh_per_node  = 16
  integer,         parameter         :: maxstacksize = 2048
+ ! revise rather than rebuild the tree if fewer than this fraction of particles are active,
+ ! until the particles have had about one step each since the tree was built
+ real,            parameter         :: frac_active_revtree = 0.1
+ integer(kind=8)                    :: nactive_since_build = 0
  integer                            :: globallevel,refinelevels
 
  public :: allocate_neigh, deallocate_neigh
@@ -225,7 +239,7 @@ end subroutine get_distance_from_centre_of_mass
 !-----------------------------------------------------------------------
 subroutine build_tree(npart,nactive,xyzh,vxyzu,for_apr)
  use io,           only:nprocs
- use kdtree,       only:maketree,maketreeglobal!,revtree
+ use kdtree,       only:maketree,maketreeglobal,revtree
  use dim,          only:mpi,use_sinktree
  use part,         only:nptmass,xyzmh_ptmass,maxp
  use allocutils,   only:allocate_array
@@ -234,7 +248,7 @@ subroutine build_tree(npart,nactive,xyzh,vxyzu,for_apr)
  real,    intent(inout) :: xyzh(:,:)
  real,    intent(in)    :: vxyzu(:,:)
  logical, intent(in), optional :: for_apr
- logical :: apr_tree
+ logical :: apr_tree,revised
 
  apr_tree = .false.
  if (present(for_apr)) apr_tree = for_apr
@@ -260,13 +274,18 @@ subroutine build_tree(npart,nactive,xyzh,vxyzu,for_apr)
     if (use_sinktree) then
        call maketree(node,xyzh,npart,leaf_is_active,ncells,apr_tree,nptmass=nptmass,xyzmh_ptmass=xyzmh_ptmass)
     else
-       ! use revtree for small numbers of active particles to avoid tree rebuild overhead
-       ! threshold: use revtree if < 0.1% of total particles
-       !if (npart > 0 .and. nactive < 0.001*npart) then
-       !   call revtree(node,xyzh,leaf_is_active,ncells)
-       !else
-       call maketree(node,xyzh,npart,leaf_is_active,ncells,apr_tree)
-       !endif
+       ! with few active particles, revise the last tree for the new positions
+       ! rather than rebuilding it: the nodes are looser, but only the active
+       ! particles have to find their neighbours in it
+       revised = .false.
+       nactive_since_build = nactive_since_build + nactive
+       if (.not.apr_tree .and. nactive < frac_active_revtree*npart .and. nactive_since_build < npart) then
+          call revtree(node,xyzh,npart,leaf_is_active,ncells,revised)
+       endif
+       if (.not.revised) then
+          call maketree(node,xyzh,npart,leaf_is_active,ncells,apr_tree)
+          nactive_since_build = 0
+       endif
     endif
  endif
  call list_active_leaves()
@@ -766,9 +785,7 @@ subroutine getneigh_dual(node,xpos,xsizei,rcuti,listneigh,nneigh,xyzcache,ixyzca
     iparent = branch(i)
     ! -- Cache node if first thread to reach it or fetch fnode in memory
     if (use_dualcache) then
-       !$omp atomic read
-       nodestate = cachestate(iparent)
-       !$omp end atomic
+       nodestate = cachestate(iparent) ! no atomic needed, see declaration of cachestate
        if (nodestate == 0) then ! first fence to avoid capture collision
           !$omp atomic capture
           nodestate = cachestate(iparent)
@@ -898,9 +915,7 @@ subroutine get_list_of_parent_nodes(inode,node,parents,nparents,startwith)
     j = node(j)%parent
     nparents = nparents + 1
     parents(nparents) = j
-    !$omp atomic read
-    nodestate = cachestate(j)
-    !$omp end atomic
+    nodestate = cachestate(j) ! no atomic needed, see declaration of cachestate
     if (nodestate==3 .and. startwith(2)==0) then
        ! deepest fully-cached ancestor: candidate pruned start
        startwith(1) = j
@@ -1081,9 +1096,7 @@ subroutine node_interaction(idst,node_dst,node_src,tree_acc2,fnode,stackit,xoffs
  call get_node_size(node_dst,node_src,size_dst,size_src,rcut_dst,rcut_src)
 
  if (use_dualcache) then
-    !$omp atomic read
-    dststate = cachestate(idst)
-    !$omp end atomic
+    dststate = cachestate(idst) ! no atomic needed, see declaration of cachestate
  else
     dststate = 0
  endif

@@ -72,7 +72,7 @@ subroutine derivs(icall,npart,nactive,xyzh,vxyzu,fxyzu,fext,divcurlv,divcurlB,&
                   dens,metrics,apr_level)
  use dim,            only:mhd,fast_divcurlB,gr,periodic,do_radiation,driving,&
                           sink_radiation,use_dustgrowth,ind_timesteps,isothermal,nalpha,mpi
- use io,             only:iprint,fatal,error
+ use io,             only:iprint,fatal,error,nprocs
  use neighkdtree,    only:build_tree
  use densityforce,   only:densityiterate
  use ptmass,         only:ipart_rhomax,ptmass_calc_enclosed_mass,ptmass_boundary_crossing,get_pressure_on_sinks
@@ -147,7 +147,7 @@ subroutine derivs(icall,npart,nactive,xyzh,vxyzu,fxyzu,fext,divcurlv,divcurlB,&
 
     if (gr) then
        ! update time-dependent metric (e.g. binary BH) and repack at particle positions
-       if (mpi .or. metric_is_time_dependent()) then
+       if ((mpi .and. nprocs > 1) .or. metric_is_time_dependent()) then
           ! also the derivatives, if the metric changes with time or
           ! particles may have moved between ranks (derivatives are not sent)
           call init_metric(npart,xyzh,metrics,metricderivs,time=time)
@@ -207,7 +207,7 @@ subroutine derivs(icall,npart,nactive,xyzh,vxyzu,fxyzu,fext,divcurlv,divcurlB,&
  ! implicit radiation update
  !
  if (do_radiation .and. implicit_radiation .and. dt > 0.) then
-    call do_radiation_implicit(dt,npart,rad,xyzh,vxyzu,radprop,drad,ierr)
+    call do_radiation_implicit(dt,time,npart,rad,xyzh,vxyzu,radprop,drad,ierr)
     if (ierr /= 0 .and. ierr /= ierr_failed_to_converge) call fatal('radiation','Failed in radiation')
     call do_timing('radiation',tlast,tcpulast)
  endif
@@ -286,9 +286,10 @@ subroutine get_derivs_global(tused,dt_new,dt,icall)
  use part,         only:npart,xyzh,vxyzu,fxyzu,fext,divcurlv,divcurlB,&
                         Bevol,dBevol,rad,drad,radprop,dustprop,ddustprop,filfac,&
                         dustfrac,ddustevol,eos_vars,pxyzu,dens,metrics,dustevol,gr,&
-                        apr_level
+                        apr_level,sync_aprmassoftype,itlastrad
  use timing,       only:printused,getused
  use io,           only:id,master
+ use dim,          only:do_radiation
  use cons2prim,    only:prim2consall
  use metric_tools, only:init_metric
  real(kind=4), intent(out), optional :: tused
@@ -312,6 +313,12 @@ subroutine get_derivs_global(tused,dt_new,dt,icall)
     call init_metric(npart,xyzh,metrics,time=time)
     call prim2consall(npart,xyzh,metrics,vxyzu,pxyzu,dens=dens)
  endif
+
+ ! masses at each refinement level, in case massoftype has been changed
+ call sync_aprmassoftype()
+
+ ! implicit radiation integrates each particle from its last update: make that one dt ago
+ if (do_radiation .and. dti > 0.) radprop(itlastrad,1:npart) = time - dti
 
  ! evaluate derivatives
  call derivs(icalli,npart,npart,xyzh,vxyzu,fxyzu,fext,divcurlv,divcurlB,Bevol,dBevol,&
@@ -337,7 +344,7 @@ end subroutine get_derivs_global
 !--------------------------------------
 subroutine get_density_global(icall,nactive,zero_fxyzu,make_tree)
  use part,         only:npart,xyzh,vxyzu,fxyzu,fext,divcurlv,divcurlB,&
-                        Bevol,alphaind,gradh,rad,radprop,dvdx,apr_level
+                        Bevol,alphaind,gradh,rad,radprop,dvdx,apr_level,sync_aprmassoftype
  use densityforce, only:densityiterate
  use neighkdtree,  only:build_tree
  integer, intent(in) :: icall
@@ -353,6 +360,9 @@ subroutine get_density_global(icall,nactive,zero_fxyzu,make_tree)
 
  do_tree = .true.
  if (present(make_tree)) do_tree = make_tree
+
+ ! masses at each refinement level, in case massoftype has been changed
+ call sync_aprmassoftype()
 
  ! build tree to prepare neighbour finding (if requested)
  if (do_tree) call build_tree(npart,nactivei,xyzh,vxyzu)

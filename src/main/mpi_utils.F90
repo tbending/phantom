@@ -63,6 +63,9 @@ module mpiutils
  integer, public :: status(MPI_STATUS_SIZE)
  integer, public :: MPI_DEFAULT_REAL
  integer, public :: comm_cellexchange,comm_cellcount,comm_balance,comm_balancecount
+#ifdef MPI
+ integer, private :: fh_dump = -1   ! the dump file's MPI-IO handle (mpiio_open)
+#endif
 
 !
 !--generic interface reduce_mpi
@@ -117,6 +120,8 @@ module mpiutils
  public :: reduce_mpi, reduceall_mpi, reduce_in_place_mpi
  public :: bcast_mpi
  public :: barrier_mpi
+ public :: exscan_mpi_int8
+ public :: mpiio_open,mpiio_write_at,mpiio_close,mpiio_error_string
  public :: fill_buffer, unfill_buf
  public :: reduceloc_mpi
  public :: waitmyturn,endmyturn
@@ -295,6 +300,131 @@ subroutine end_threadwrite(id)
 #endif
 
 end subroutine end_threadwrite
+
+!--------------------------------------------------------------------
+!+
+!  exclusive prefix sum over the MPI tasks: the sum of ival over the
+!  tasks below this one (0 on the first, and without MPI)
+!+
+!--------------------------------------------------------------------
+function exscan_mpi_int8(ival) result(isum)
+#ifdef MPI
+ use io, only:fatal,id,master
+#endif
+ integer(kind=8), intent(in) :: ival
+ integer(kind=8) :: isum
+#ifdef MPI
+ isum = 0_8
+ call MPI_EXSCAN(ival,isum,1,MPI_INTEGER8,MPI_SUM,MPI_COMM_WORLD,mpierr)
+ if (mpierr /= 0) call fatal('exscan','error in mpi_exscan')
+ if (id == master) isum = 0_8   ! undefined there in MPI
+#else
+ isum = 0_8
+#endif
+
+end function exscan_mpi_int8
+
+!--------------------------------------------------------------------
+!+
+!  MPI-IO on one file shared by all the MPI tasks: open an existing file
+!  for writing with the ROMIO hint direct_write, and say whether direct I/O
+!  is in effect (direct): the MPI library reports direct_write true on its
+!  Lustre driver (ROMIO-based MPI-IO: Intel MPI, MPICH, Open MPI with
+!  --mca io romio341; Open MPI's default OMPIO reports no hints, ROMIO's
+!  generic driver does no direct I/O).  Write bytes at a 0-based offset;
+!  close.  ierr is the MPI error code (0 = success); without MPI they
+!  return ierr=1.
+!+
+!--------------------------------------------------------------------
+subroutine mpiio_open(filename,ierr,direct)
+ character(len=*), intent(in)  :: filename
+ integer,          intent(out) :: ierr
+ logical,          intent(out) :: direct
+#ifdef MPI
+ integer :: info,infoused,ierrinfo
+ logical :: got
+ character(len=64) :: val
+
+ direct = .false.
+ call MPI_INFO_CREATE(info,ierrinfo)
+ if (ierrinfo == MPI_SUCCESS) then
+    call MPI_INFO_SET(info,'direct_write','true',ierrinfo)
+ else
+    info = MPI_INFO_NULL
+ endif
+ call MPI_FILE_open(MPI_COMM_WORLD,filename,MPI_MODE_WRONLY,info,fh_dump,ierr)
+ if (info /= MPI_INFO_NULL) call MPI_INFO_FREE(info,ierrinfo)
+ if (ierr /= MPI_SUCCESS) then
+    fh_dump = -1
+    return
+ endif
+ call MPI_FILE_GET_INFO(fh_dump,infoused,ierrinfo)
+ if (ierrinfo /= MPI_SUCCESS) return
+ call MPI_INFO_GET(infoused,'direct_write',len(val),val,got,ierrinfo)
+ direct = got .and. trim(val) == 'true'
+ if (direct) then
+    call MPI_INFO_GET(infoused,'romio_filesystem_type',len(val),val,got,ierrinfo)
+    direct = got .and. index(val,'LUSTRE') == 1
+ endif
+ call MPI_INFO_FREE(infoused,ierrinfo)
+#else
+ ierr   = 1
+ direct = .false.
+#endif
+
+end subroutine mpiio_open
+
+subroutine mpiio_write_at(off,b,ierr)
+ integer(kind=8), intent(in)  :: off
+ integer(kind=1), intent(in), contiguous :: b(:)
+ integer,         intent(out) :: ierr
+#ifdef MPI
+ integer(kind=MPI_OFFSET_KIND) :: moff
+ integer(kind=8) :: n,done,c
+ integer :: st(MPI_STATUS_SIZE)
+
+ ierr = 0
+ n    = size(b,kind=8)
+ done = 0
+ do while (done < n .and. ierr == 0)
+    c    = min(n - done,1073741824_8)
+    moff = int(off + done,kind=MPI_OFFSET_KIND)
+    call MPI_FILE_WRITE_AT(fh_dump,moff,b(done+1:done+c),int(c),MPI_BYTE,st,ierr)
+    done = done + c
+ enddo
+#else
+ ierr = 1
+#endif
+
+end subroutine mpiio_write_at
+
+subroutine mpiio_close(ierr)
+ integer, intent(out) :: ierr
+#ifdef MPI
+ ierr = 0
+ if (fh_dump /= -1) call MPI_FILE_close(fh_dump,ierr)
+ fh_dump = -1
+#else
+ ierr = 0
+#endif
+
+end subroutine mpiio_close
+
+! the MPI library's description of an MPI error code
+function mpiio_error_string(ierr) result(string)
+ integer, intent(in) :: ierr
+ character(len=256)  :: string
+#ifdef MPI
+ integer :: lenstring,ierr2
+
+ string = ' '
+ call MPI_ERROR_STRING(ierr,string,lenstring,ierr2)
+ if (ierr2 /= MPI_SUCCESS) write(string,'(a,i0)') 'MPI error code ',ierr
+#else
+ write(string,'(a,i0)') 'error code ',ierr
+#endif
+
+end function mpiio_error_string
 
 !--------------------------------------------------------------------
 !+

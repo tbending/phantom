@@ -41,8 +41,8 @@ module forces
 !
 ! :Dependencies: boundary, cooling, derivutils, dim, dust, eos, eos_shen,
 !   eos_stamatellos, growth, io, io_summary, kdtree, kernel, metric_tools,
-!   mpiderivs, mpiforce, mpimemory, mpiutils, neighkdtree, nicil, omputils,
-!   options, part, physcon, ptmass, ptmass_heating, radiation_utils,
+!   mpiderivs, mpiforce, mpimemory, mpiutils, neighkdtree, nicil, options,
+!   part, physcon, ptmass, ptmass_heating, radiation_utils,
 !   shock_capturing, timestep, timestep_ind, timing, units, utils_gr,
 !   viscosity
 !
@@ -203,7 +203,7 @@ subroutine force(icall,npart,xyzh,vxyzu,fxyzu,divcurlv,divcurlB,Bevol,dBevol,&
  use dim,          only:maxvxyzu,mhd,mhd_nonideal,mpi,use_dust,use_apr,use_sinktree
  use io,           only:iprint,fatal,iverbose,id,master,real4,warning,error,nprocs
  use neighkdtree,  only:get_neighbour_list,get_hmaxcell,get_cell_location,listneigh,&
-                        active_leaves,nactive_leaves
+                        active_leaves,nactive_leaves,ncellchunk
  use part,         only:alphaind,iactive,gradh,&
                         iphase,igas,maxgradh,dvdx,eta_nimhd,deltav,poten,iamtype,&
                         dragreg,filfac,fxyz_dragold,nptmass,shortsinktree,&
@@ -233,15 +233,16 @@ subroutine force(icall,npart,xyzh,vxyzu,fxyzu,divcurlv,divcurlB,Bevol,dBevol,&
 #endif
  use dust,         only:drag_implicit
  use nicil,        only:nimhd_get_jcbcb
- use mpiderivs,    only:send_cell,recv_cells,check_send_finished,init_cell_exchange,&
-                        finish_cell_exchange,recv_while_wait,reset_cell_counters,cell_counters,&
-                        init_send_requests
+ use mpiderivs,    only:send_cell,recv_cells,init_cell_exchange,record_send_wait,&
+                        finish_cell_exchange,recv_while_wait,reset_cell_counters,cell_counters
  use mpimemory,    only:reserve_stack,reset_stacks,get_cell,write_cell
  use mpimemory,    only:stack_remote  => force_stack_1
+ use mpimemory,    only:force_pool,get_packed_cell,clear_pool
  use mpimemory,    only:stack_waiting => force_stack_2
  use io_summary,   only:iosumdtr
- use timing,       only:increment_timer,get_timings,itimer_force_local,itimer_force_remote
- use omputils,     only:omp_thread_num,omp_num_threads
+ use timing,       only:increment_timer,get_timings,itimer_force_local,itimer_force_remote,&
+                        itimer_force_lcomp,itimer_force_rcomp,&
+                        itimer_force_lsend,itimer_force_rsend
  use eos,          only:iresistive_heating
 
  integer,         intent(in)    :: icall,npart
@@ -297,13 +298,12 @@ subroutine force(icall,npart,xyzh,vxyzu,fxyzu,divcurlv,divcurlB,Bevol,dBevol,&
 #endif
  integer(kind=1)           :: ibinnow_m1
 
- type(cellforce)           :: cell,xsendbuf,xrecvbuf(nprocs)
- integer                   :: mpitype
- logical                   :: remote_export(nprocs),do_export,idone(nprocs),thread_complete(omp_num_threads)
- integer                   :: irequestsend(nprocs),irequestrecv(nprocs)
- integer                   :: ncomplete_mpi
+ type(cellforce)           :: cell
+ logical                   :: remote_export(nprocs),do_export
+ logical                   :: exchange ! whether cells are exchanged with other MPI tasks
 
  real(kind=4)              :: t1,t2,tcpu1,tcpu2
+ real(kind=4)              :: tc1,tcpuc1,tc2,tcpuc2 ! start and end of the compute loops
 
 #ifdef IND_TIMESTEPS
  nbinmaxnew      = 0
@@ -400,7 +400,9 @@ subroutine force(icall,npart,xyzh,vxyzu,fxyzu,divcurlv,divcurlB,Bevol,dBevol,&
  rhomax        = 0.
 #endif
 
- if (mpi) then
+ !--the cell exchange is only needed with more than one MPI task
+ exchange = mpi .and. nprocs > 1
+ if (exchange) then
     call reset_stacks
     call reset_cell_counters(cell_counters)
  endif
@@ -447,9 +449,7 @@ subroutine force(icall,npart,xyzh,vxyzu,fxyzu,divcurlv,divcurlB,Bevol,dBevol,&
 !$omp private(icell,i,ia) &
 !$omp private(cell) &
 !$omp private(remote_export) &
-!$omp private(idone) &
 !$omp private(nneigh) &
-!$omp private(mpitype) &
 !$omp shared(dens) &
 !$omp shared(metrics) &
 !$omp shared(apr_level) &
@@ -464,14 +464,8 @@ subroutine force(icall,npart,xyzh,vxyzu,fxyzu,divcurlv,divcurlB,Bevol,dBevol,&
 #endif
 !$omp shared(id) &
 !$omp private(do_export) &
-!$omp private(irequestrecv) &
-!$omp private(irequestsend) &
-!$omp private(xrecvbuf) &
-!$omp private(xsendbuf) &
-!$omp shared(cell_counters) &
-!$omp shared(thread_complete) &
-!$omp shared(ncomplete_mpi) &
-!$omp shared(stack_remote) &
+!$omp shared(cell_counters,exchange) &
+!$omp shared(stack_remote,force_pool) &
 !$omp shared(stack_waiting) &
 #ifdef IND_TIMESTEPS
 !$omp shared(nbinmax) &
@@ -497,18 +491,16 @@ subroutine force(icall,npart,xyzh,vxyzu,fxyzu,divcurlv,divcurlB,Bevol,dBevol,&
 !$omp shared(t1) &
 !$omp shared(t2) &
 !$omp shared(tcpu1) &
-!$omp shared(tcpu2)
+!$omp shared(tcpu2) &
+!$omp shared(tc1,tcpuc1,tc2,tcpuc2)
 
- call init_cell_exchange(xrecvbuf,irequestrecv,thread_complete,ncomplete_mpi,mpitype)
+ if (exchange) call init_cell_exchange(stack_remote)
 
  !$omp single
  call get_timings(t1,tcpu1)
  !$omp end single
 
- !--initialise send requests to null
- call init_send_requests(irequestsend)
-
- !$omp do schedule(runtime)
+ !$omp do schedule(dynamic,ncellchunk)
  over_cells: do ia=1,nactive_leaves
     icell = active_leaves(ia)
 
@@ -531,19 +523,11 @@ subroutine force(icall,npart,xyzh,vxyzu,fxyzu,divcurlv,divcurlB,Bevol,dBevol,&
     cell%owner = id
     do_export = any(remote_export)
 
-    if (mpi) then
-       call recv_cells(stack_remote,xrecvbuf,irequestrecv,cell_counters)
+    if (exchange) then
+       call recv_cells(stack_remote,cell_counters)
        if (do_export) then
-          if (stack_waiting%n > 0) then
-             !--wait for broadcast to complete, continue to receive whilst doing so
-             idone(:) = .false.
-             do while(.not.all(idone))
-                call check_send_finished(irequestsend,idone)
-                call recv_cells(stack_remote,xrecvbuf,irequestrecv,cell_counters)
-             enddo
-          endif
           call reserve_stack(stack_waiting,cell%waiting_index)
-          call send_cell(cell,remote_export,irequestsend,xsendbuf,cell_counters,mpitype)  ! send to remote
+          call send_cell(cell,remote_export,stack_remote,cell_counters)  ! send to remote
        endif
     endif
 
@@ -576,18 +560,16 @@ subroutine force(icall,npart,xyzh,vxyzu,fxyzu,divcurlv,divcurlB,Bevol,dBevol,&
 
  enddo over_cells
  !$omp enddo
-
- if (stack_waiting%n > 0) then
-    idone(:) = .false.
-    do while(.not.all(idone))
-       call check_send_finished(irequestsend,idone)
-       call recv_cells(stack_remote,xrecvbuf,irequestrecv,cell_counters)
-    enddo
+ !$omp single
+ call get_timings(tc2,tcpuc2)
+ if (exchange) then
+    call increment_timer(itimer_force_lcomp,tc2-t1,tcpuc2-tcpu1)
+    call record_send_wait(itimer_force_lsend)
  endif
+ !$omp end single
 
- if (mpi) then
-    call recv_while_wait(stack_remote,xrecvbuf,irequestrecv,&
-         irequestsend,thread_complete,cell_counters,ncomplete_mpi)
+ if (exchange) then
+    call recv_while_wait(stack_remote,cell_counters)
     call reset_cell_counters(cell_counters)
  endif
 
@@ -598,10 +580,13 @@ subroutine force(icall,npart,xyzh,vxyzu,fxyzu,divcurlv,divcurlB,Bevol,dBevol,&
  !$omp end single
  !$omp barrier
 
- igot_remote: if (mpi .and. stack_remote%n > 0) then
-    !$omp do schedule(runtime)
-    over_remote: do i = 1,stack_remote%n
-       cell = get_cell(stack_remote,i)
+ igot_remote: if (exchange .and. force_pool%n > 0) then
+    !$omp single
+    call get_timings(tc1,tcpuc1)
+    !$omp end single
+    !$omp do schedule(dynamic,ncellchunk)
+    over_remote: do i = 1,force_pool%n
+       call get_packed_cell(force_pool,i,cell)
 
        call get_neighbour_list(-1,listneigh,nneigh,xyzh,xyzcache,maxcellcache, &
                                getj=.true.,f=cell%fgrav,&
@@ -615,34 +600,26 @@ subroutine force(icall,npart,xyzh,vxyzu,fxyzu,divcurlv,divcurlB,Bevol,dBevol,&
        remote_export = .false.
        remote_export(cell%owner+1) = .true. ! use remote_export array to send back to the owner
 
-       idone(:) = .false.
-       do while(.not.all(idone))
-          call check_send_finished(irequestsend,idone)
-          call recv_cells(stack_waiting,xrecvbuf,irequestrecv,cell_counters)
-       enddo
-
-       call send_cell(cell,remote_export,irequestsend,xsendbuf,cell_counters,mpitype) ! send the cell back to owner
+       call send_cell(cell,remote_export,stack_waiting,cell_counters) ! send the cell back to owner
 
     enddo over_remote
     !$omp enddo
-
     !$omp single
-    stack_remote%n = 0
+    call get_timings(tc2,tcpuc2)
+    call increment_timer(itimer_force_rcomp,tc2-tc1,tcpuc2-tcpuc1)
+    call record_send_wait(itimer_force_rsend)
     !$omp end single
 
-    idone(:) = .false.
-    do while(.not.all(idone))
-       call check_send_finished(irequestsend,idone)
-       call recv_cells(stack_waiting,xrecvbuf,irequestrecv,cell_counters)
-    enddo
+    !$omp single
+    call clear_pool(force_pool,release=.false.)
+    !$omp end single
 
  endif igot_remote
 
- if (mpi) call recv_while_wait(stack_waiting,xrecvbuf,irequestrecv,&
-          irequestsend,thread_complete,cell_counters,ncomplete_mpi)
+ if (exchange) call recv_while_wait(stack_waiting,cell_counters)
 
- iam_waiting: if (mpi .and. stack_waiting%n > 0) then
-    !$omp do schedule(runtime)
+ iam_waiting: if (exchange .and. stack_waiting%n > 0) then
+    !$omp do schedule(dynamic,ncellchunk)
     over_waiting: do i = 1, stack_waiting%n
        cell = get_cell(stack_waiting,i)
 
@@ -672,7 +649,7 @@ subroutine force(icall,npart,xyzh,vxyzu,fxyzu,divcurlv,divcurlB,Bevol,dBevol,&
 
  endif iam_waiting
 
- call finish_cell_exchange(irequestrecv,xsendbuf,mpitype)
+ if (exchange) call finish_cell_exchange(stack_remote)
 
 !$omp single
  call get_timings(t2,tcpu2)
@@ -683,7 +660,7 @@ subroutine force(icall,npart,xyzh,vxyzu,fxyzu,divcurlv,divcurlB,Bevol,dBevol,&
  if (icreate_sinks > 0) then
     rhomax_thread = 0.
     ipart_rhomax_thread = 0
-    !$omp do schedule(runtime)
+    !$omp do
     over_parts: do i=1,npart
        hi = xyzh(4,i)
 #ifdef IND_TIMESTEPS
@@ -757,8 +734,9 @@ subroutine force(icall,npart,xyzh,vxyzu,fxyzu,divcurlv,divcurlB,Bevol,dBevol,&
  ! are dead/inactive, e.g. after sink creation or if all
  ! have moved to a higher ibin; the following step on the
  ! higher ibin will yeild non-zero and modify nbinmax
- ! appropriately
- if (ncheckbin==0) then
+ ! appropriately. With MPI this must be a global check, otherwise
+ ! a task with no active particles would stop nbinmax decreasing
+ if (reduceall_mpi('+',ncheckbin)==0) then
     nbinmaxnew    = nbinmax
  endif
 #endif
@@ -1018,7 +996,7 @@ subroutine compute_forces(i,iamgasi,iamdusti,xpartveci,hi,hi1,hi21,hi41,gradhi,g
  real    :: gradpj,pro2j,projsxj,projsyj,projszj,sxxj,sxyj,sxzj,syyj,syzj,szzj,dBrhoterm
  real    :: visctermisoj,visctermanisoj,enj,hj,alphaj,pmassj,rho1j
  real    :: rhoj,prj,rhoav1
- real    :: hj1,hj21,q2j,qj,vwavej,divvj
+ real    :: hj1,hj21,q2j,qj,vwavej
  real    :: dvdxi(9),dvdxj(9)
 #ifdef GRAVITY
  real    :: fmi,fmj,dsofti,dsoftj,hsoft1,hsoft21,q2softi
@@ -1202,7 +1180,6 @@ subroutine compute_forces(i,iamgasi,iamdusti,xpartveci,hi,hi1,hi21,hi41,gradhi,g
  usej      = .false.
  grkernj   = 0.
  alphaj    = alphai
- divvj     = 0.
  dvdxj(:)  = 0.
  rhoj      = 0.
  rho1j     = 0.
@@ -1228,7 +1205,7 @@ subroutine compute_forces(i,iamgasi,iamdusti,xpartveci,hi,hi1,hi21,hi41,gradhi,g
  fgravyi = 0.
  fgravzi = 0.
  if (icooling == 9) then
-    gradP_cool(i) = 0.
+    if (ignoreself) gradP_cool(i) = 0.   ! only on the owner of particle i
     gradpx = 0.
     gradpy = 0.
     gradpz = 0.
@@ -1506,7 +1483,6 @@ subroutine compute_forces(i,iamgasi,iamdusti,xpartveci,hi,hi1,hi21,hi41,gradhi,g
           if (maxdvdx==maxp) dvdxj(:) = dvdx(:,j)
 
           if (iamgasj) then
-             divvj = divcurlv(1,j)
              if (use_dustfrac) then
                 dustfracj(:) = dustfrac(:,j)
                 dustfracjsum = sum(dustfracj(:))
@@ -1532,7 +1508,7 @@ subroutine compute_forces(i,iamgasi,iamdusti,xpartveci,hi,hi1,hi21,hi41,gradhi,g
              call get_stress(prj,spsoundj,rhoj,rho1j,xj,yj,zj,Bxj,Byj,Bzj, &
                         pro2j,vwavej, &
                         sxxj,sxyj,sxzj,syyj,syzj,szzj,visctermisoj,visctermanisoj, &
-                        realviscosity,divvj,bulkvisc,dvdxj,stressmax,radPj)
+                        realviscosity,bulkvisc,dvdxj,stressmax,radPj)
 
              ! shock conductivity / resistivity (mass applied in pair loop)
              autermj  = 0.5*rho1j*alphau
@@ -1771,7 +1747,7 @@ subroutine compute_forces(i,iamgasi,iamdusti,xpartveci,hi,hi1,hi21,hi41,gradhi,g
           endif
 
           !--calculate divv for use in du, h prediction, av switch etc.
-          fsum(idrhodti) = fsum(idrhodti) + projv*grkerni
+          fsum(idrhodti) = fsum(idrhodti) + pmassj*projv*grkerni
 
           if (maxvxyzu >= 4 .or. track_lum) then
              !--viscous heating
@@ -1939,6 +1915,7 @@ subroutine compute_forces(i,iamgasi,iamdusti,xpartveci,hi,hi1,hi21,hi41,gradhi,g
                 if (iregime > 2)  nstokes = nstokes + 1
                 if (iregime == 2) nsuper = nsuper + 1
                 if (drag_implicit) then
+                   ! implicit drag, slightly modified version of Loren-Aguilar & Bate 2014, 2015
                    if (ind_timesteps) then
                       call get_drag_terms(tsijtmp,dti,sdrag1,sdrag2,fxi_drag,fyi_drag,fzi_drag,&
                                        runix,runiy,runiz,fxyz_drag(:,j),projf_drag)
@@ -1946,9 +1923,6 @@ subroutine compute_forces(i,iamgasi,iamdusti,xpartveci,hi,hi1,hi21,hi41,gradhi,g
                       call get_drag_terms(tsijtmp,dt,sdrag1,sdrag2,fxi_drag,fyi_drag,fzi_drag,&
                                        runix,runiy,runiz,fxyz_drag(:,j),projf_drag)
                    endif
-                   ! implicit drag, slightly modified version of Loren-Aguilar & Bate 2014, 2015
-                   call get_drag_terms(tsijtmp,dt,sdrag1,sdrag2,fxi_drag,fyi_drag,fzi_drag,&
-                                       runix,runiy,runiz,fxyz_drag(:,j),projf_drag)
                    dragterm = 3.*pmassj*(sdrag1*projvstar - sdrag2*projf_drag)/(rhoi + rhoj)*wdrag
                 else
                    ! explicit drag, with timestep condition
@@ -2106,7 +2080,7 @@ subroutine compute_forces(i,iamgasi,iamdusti,xpartveci,hi,hi1,hi21,hi41,gradhi,g
 
  enddo loop_over_neighbours2
 
- if (icooling == 9) gradP_cool(i) = sqrt(gradpx*gradpx + gradpy*gradpy + gradpz*gradpz)
+ if (icooling == 9 .and. ignoreself) gradP_cool(i) = sqrt(gradpx*gradpx + gradpy*gradpy + gradpz*gradpz)
 
 end subroutine compute_forces
 
@@ -2120,7 +2094,7 @@ subroutine get_stress(pri,spsoundi,rhoi,rho1i,xi,yi,zi, &
                  Bxi,Byi,Bzi, &
                  pro2i,vwavei, &
                  sxxi,sxyi,sxzi,syyi,syzi,szzi,visctermiso,visctermaniso, &
-                 realviscosity,divvi,bulkvisc,dvdx,stressmax, &
+                 realviscosity,bulkvisc,dvdx,stressmax, &
                  radPi)
 
  use dim,             only:maxdvdx,maxp
@@ -2133,7 +2107,7 @@ subroutine get_stress(pri,spsoundi,rhoi,rho1i,xi,yi,zi, &
  real,    intent(out) :: sxxi,sxyi,sxzi,syyi,syzi,szzi
  real,    intent(out) :: visctermiso,visctermaniso
  logical, intent(in)  :: realviscosity
- real,    intent(in)  :: divvi,bulkvisc,stressmax
+ real,    intent(in)  :: bulkvisc,stressmax
  real,    intent(in)  :: dvdx(9)
  real,    intent(in)  :: radPi
 
@@ -2169,7 +2143,9 @@ subroutine get_stress(pri,spsoundi,rhoi,rho1i,xi,yi,zi, &
        syyi = term*strain(4)
        syzi = term*strain(5)
        szzi = term*strain(6)
-       stressiso = (2./3.*shearvisc - bulkvisc)*divvi*rho1i + stressmax
+       ! div v from the trace of dvdx, which (unlike divcurlv) is not updated during
+       ! the force calculation, so both particles in a pair see the same value
+       stressiso = (2./3.*shearvisc - bulkvisc)*(dvdx(1) + dvdx(5) + dvdx(9))*rho1i + stressmax
     else
        graddivvcoeff = 0.5*(bulkvisc*rhoi + etavisc/3.)   ! 0.5 here is because we
        del2vcoeff    = 0.5*etavisc                   ! average between particle pairs
@@ -2266,7 +2242,6 @@ subroutine start_cell(cell,iphase,xyzh,vxyzu,gradh,divcurlv,divcurlB,dvdx,Bevol,
  real         :: radRi
  real         :: radPi
 
- real         :: divvi
  real         :: dvdxi(9),curlBi(3),jcbcbi(3),jcbi(3)
  real         :: hi,rhoi,rho1i,pmassi,eni
  real(kind=8) :: hi1
@@ -2334,7 +2309,6 @@ subroutine start_cell(cell,iphase,xyzh,vxyzu,gradh,divcurlv,divcurlB,dvdx,Bevol,
     endif
 
     if (iamgasi) then
-       divvi = real(divcurlv(1,i),kind=kind(divvi))
        if (maxvxyzu >= 4) then
           eni = vxyzu(4,i)
        else
@@ -2388,7 +2362,7 @@ subroutine start_cell(cell,iphase,xyzh,vxyzu,gradh,divcurlv,divcurlB,dvdx,Bevol,
                   Bxi,Byi,Bzi, &
                   pro2i, &
                   vwavei,sxxi,sxyi,sxzi,syyi,syzi,szzi, &
-                  visctermiso,visctermaniso,realviscosity,divvi,bulkvisc,dvdxi,stressmax, &
+                  visctermiso,visctermaniso,realviscosity,bulkvisc,dvdxi,stressmax, &
                   radPi)
 
        !
@@ -2663,9 +2637,17 @@ subroutine compute_cell(cell,listneigh,nneigh,Bevol,xyzh,vxyzu,fxyzu, &
        if (hi == 0.) hi1 = 0
        gradhi = 0.
        gradsofti = 0.
+    endif
+    !--sink indices are the same on every task (used to flag sink pairs in shortsinktree);
+    !  gas indices are only known on the owner (used to exclude self and store gradP)
+    if (iamsinki) then
        i = cell%arr_index(ip)
+    elseif (cell%owner /= id) then
+       i = 0
     else
        i = inodeparts(cell%arr_index(ip))
+    endif
+    if (.not.iamsinki) then
        if (cell%xpartvec(igradhi1,ip) > 0.) then
           gradhi = cell%xpartvec(igradhi1,ip)
        else
@@ -3051,7 +3033,7 @@ subroutine finish_cell_and_store_results(icall,cell,fxyzu,xyzh,vxyzu,poten,dt,dv
        fonrmaxi   = fsum(ifonrmaxi)
     endif
 
-    drhodti = pmassi*fsum(idrhodti)
+    drhodti = fsum(idrhodti)
 
     isgas: if (iamgasi) then
        divvi = -drhodti*rho1i

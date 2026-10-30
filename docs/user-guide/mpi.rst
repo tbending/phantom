@@ -40,6 +40,16 @@ This is the same as usual but pre-pended by "mpiexec -np 4" where 4 is the numbe
 
    ./mpiexec -np 4 ./phantom disc.in
    
+Writing dumps with MPI
+----------------------
+Where MPI-IO can write with direct I/O, all MPI tasks write a full dump at the same time, each at its own offset in the file. This needs an MPI-IO built on ROMIO and a Lustre file system:
+
+- Open MPI: ``mpiexec --mca io romio341 -np 4 ./phantom disc.in``
+- Intel MPI: ``export I_MPI_EXTRA_FILESYSTEM=1 I_MPI_EXTRA_FILESYSTEM_FORCE=lustre``
+- MPICH: if it was built with Lustre support
+
+It helps most when the run directory is striped over many storage targets, e.g. ``lfs setstripe -c 16 -S 1M .`` before the dumps are written. Otherwise the tasks take turns, as they also do with ``export PHANTOM_DUMP_PARALLEL=no``. The file is the same either way.
+
 Running on a cluster
 --------------------
 On a supercomputing cluster, you can amend your queue script as necessary by writing it with MPI=yes. 

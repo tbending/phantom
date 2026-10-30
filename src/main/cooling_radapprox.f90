@@ -18,8 +18,6 @@ module cooling_radapprox
 !
 ! :Dependencies: eos_stamatellos, infile_utils, io, part, physcon, units
 !
- use, intrinsic :: ieee_arithmetic, only:ieee_is_nan
-
  implicit none
  real  :: Lstar = 0. ! in units of L_sun
  integer :: isink_star ! index of sink to use as illuminating star
@@ -58,6 +56,7 @@ subroutine init_star()
 end subroutine init_star
 
 subroutine radcool_evolve_ui(ui,dt,i,Tfloor,rhoi,uout)
+ use, intrinsic :: ieee_arithmetic, only:ieee_is_nan
  use eos_stamatellos, only:ttherm_store,ueqi_store,getintenerg_opdep
  use io,              only:warning
  use units,           only:unit_density,unit_ergg
@@ -110,6 +109,7 @@ end subroutine radcool_evolve_ui
 !
 ! update tthermi and ueqi for ui update
 subroutine radcool_update_du(i,xi,yi,zi,rhoi,ui,duhydro,Tfloor)
+ use, intrinsic :: ieee_arithmetic, only:ieee_is_nan
  use io,       only:warning
  use physcon,  only:steboltz,pi,solarl,kb_on_mh,piontwo,rpiontwo
  use units,    only:umass,udist,unit_density,unit_ergg,utime,unit_pressure
@@ -219,7 +219,7 @@ subroutine write_options_cooling_radapprox(iunit)
 end subroutine write_options_cooling_radapprox
 
 subroutine read_options_cooling_radapprox(db,nerr)
- use io,              only:fatal
+ use io,              only:error
  use eos_stamatellos, only:eos_file
  use infile_utils,    only:inopts,read_inopt
  type(inopts), intent(inout) :: db(:)
@@ -230,7 +230,10 @@ subroutine read_options_cooling_radapprox(db,nerr)
  call read_inopt(eos_file,'EOS_file',db,errcount=nerr)
  call read_inopt(ieosread,'ieos',db,errcount=nerr,min=1,default=24)
 
- if (ieosread /= 24) call fatal('ieosread','For icooling=9, you need ieos=24')
+ if (ieosread /= 24) then
+    call error('ieosread','For icooling=9, you need ieos=24')
+    nerr = nerr + 1
+ endif
 
 end subroutine read_options_cooling_radapprox
 
