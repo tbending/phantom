@@ -46,6 +46,7 @@ module gpu_resident
  public :: rs_after_force,rs_download_all
  public :: rs_after_kick,rs_after_subdrift,rs_after_get_force,rs_after_accretion,rs_before_gas_loop
  public :: rs_prime,rs_put_alpha1,rs_resync
+ public :: rs_startup_keep_h,rs_startup_redo,rs_startup_done
  public :: rs_mark,rs_lean
 
  private
@@ -99,6 +100,15 @@ module gpu_resident
    import c_int
    integer(c_int), value :: sub
   end subroutine cosmo_dom_check_halos
+  subroutine cosmo_dom_startup_keep_h() bind(C)
+  end subroutine cosmo_dom_startup_keep_h
+  integer(c_int) function cosmo_dom_startup_violated() bind(C)
+   import c_int
+  end function cosmo_dom_startup_violated
+  subroutine cosmo_dom_startup_restore() bind(C)
+  end subroutine cosmo_dom_startup_restore
+  subroutine cosmo_dom_startup_done() bind(C)
+  end subroutine cosmo_dom_startup_done
  end interface
 #endif
  integer, save :: nrun(nchecks) = 0   ! comparisons made this step, per check
@@ -1393,6 +1403,50 @@ subroutine rs_resync(npart)
  if (npart < 0) npart = 0   ! nothing to do
 #endif
 end subroutine rs_resync
+
+!-----------------------------------------------------------------------
+!+
+!  MPI: initial's first derivs starts from the dump's h, which on fresh
+!  setup files the density pass grows 2-3x, past the halo margin: seam
+!  particles then miss neighbours, and their force feeds the viscosity
+!  switch of the second call.  rs_startup_keep_h before the first call;
+!  after it rs_startup_redo says (collectively) whether any rank went past
+!  the guard's bound, and if so re-syncs with the grown h and puts back the
+!  starting h and the zero forces, so the caller redoes the call as one
+!  rank would have done it.  rs_startup_done after the calls.
+!+
+!-----------------------------------------------------------------------
+subroutine rs_startup_keep_h()
+#if defined(MPI) && defined(GPU)
+ if (gpu_domain_on .and. resident_mode) call cosmo_dom_startup_keep_h()
+#endif
+end subroutine rs_startup_keep_h
+
+subroutine rs_startup_redo(npart,redo)
+#if defined(MPI) && defined(GPU)
+ use io, only:iprint,id,master
+#endif
+ integer, intent(inout) :: npart
+ logical, intent(out)   :: redo
+ redo = .false.
+#if defined(MPI) && defined(GPU)
+ if (.not.(gpu_domain_on .and. resident_mode)) return
+ redo = (cosmo_dom_startup_violated() /= 0)
+ if (redo) then
+    call dom_sync(npart,.false.)
+    call cosmo_dom_startup_restore()
+    if (id==master) write(iprint,'(a)') ' gpu_domain: h outgrew the halos in the first derivs: re-synced, redoing it'
+ endif
+#else
+ if (npart < 0) npart = 0
+#endif
+end subroutine rs_startup_redo
+
+subroutine rs_startup_done()
+#if defined(MPI) && defined(GPU)
+ if (gpu_domain_on .and. resident_mode) call cosmo_dom_startup_done()
+#endif
+end subroutine rs_startup_done
 
 !--initial's alpha = max(alpha, alphaloc) after the first derivs, on the device's copy
 subroutine rs_put_alpha1(npart)

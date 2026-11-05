@@ -696,7 +696,8 @@ end subroutine initialise_sink_particle_forces
 !+
 !----------------------------------------------------------------
 subroutine get_derivs_initial(time,dumpfile,ntot,dtnew_first,ierr)
- use gpu_resident,     only:rs_prime,rs_download_all,rs_put_alpha1,rs_resync
+ use gpu_resident,     only:rs_prime,rs_download_all,rs_put_alpha1,rs_resync, &
+                             rs_startup_keep_h,rs_startup_redo,rs_startup_done
  use dim,              only:maxalpha,maxp,nalpha,do_radiation
  use part,             only:npart,fxyzu,alphaind
  use deriv,            only:get_derivs_global,get_density_global
@@ -713,7 +714,8 @@ subroutine get_derivs_initial(time,dumpfile,ntot,dtnew_first,ierr)
  integer(kind=8), intent(in)  :: ntot
  real,            intent(out) :: dtnew_first
  integer,         intent(out) :: ierr
- integer :: i,j,nderivinit,ialphaloc
+ integer :: i,j,nderivinit,ialphaloc,nredo
+ logical :: redo
 
  ierr = 0
  dtnew_first = dtmax  ! necessary in case ntot = 0
@@ -731,7 +733,9 @@ subroutine get_derivs_initial(time,dumpfile,ntot,dtnew_first,ierr)
 
  !--MPI, GPU resident: the device state and Domain before derivs, so it runs with halos
  call rs_prime(npart)
- do j=1,nderivinit
+ call rs_startup_keep_h()   ! MPI resident: the starting h, for a redo of the first call
+ j = 1; nredo = 0
+ do while (j <= nderivinit)
     if (j > 1) call rs_resync(npart)   ! MPI: the halos' f and rho from the first call
     if (ntot > 0) call get_derivs_global(dt_new=dtnew_first,dt=0.,icall=1)
 #ifdef LIVE_ANALYSIS
@@ -740,7 +744,17 @@ subroutine get_derivs_initial(time,dumpfile,ntot,dtnew_first,ierr)
     call get_derivs_global(dt_new=dtnew_first,dt=0.,icall=1)
     if (do_radiation) call set_radiation_and_gas_temperature_equal(npart,vxyzu,rho,rad)
 #endif
+    !--MPI resident: if h outgrew the halos in the first call, re-sync and redo it
+    if (j == 1 .and. nredo < 3) then
+       call rs_startup_redo(npart,redo)
+       if (redo) then
+          nredo = nredo + 1
+          cycle
+       endif
+    endif
+    j = j + 1
  enddo
+ call rs_startup_done()
 
  !--resident: the host copy from the device, for the alpha update, energies and the dump
  call rs_download_all(npart)
