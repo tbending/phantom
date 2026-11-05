@@ -121,7 +121,7 @@ subroutine step(npart,nactive,t,dtsph,dtextforce,dtnew)
  use dynamic_dtmax,  only:dtmax_ifactor
  use timestep_ind,   only:get_dt,nbinmax,decrease_dtmax,dt_too_small
  use gpu_resident,   only:gpu_mirror,rs_after_predictor,rs_after_substep,rs_after_predict_sph,&
-                          rs_after_derivs,rs_after_corrector
+                          rs_after_derivs,rs_after_corrector,rs_mark
  use gpu_arrays,     only:resident_mode
  use metric_tools,   only:imet_minkowski,imetric
  use cons2prim,      only:cons2primall,cons2primall_sink
@@ -157,6 +157,7 @@ subroutine step(npart,nactive,t,dtsph,dtextforce,dtnew)
 !
 ! set initial quantities
 !
+ call rs_mark('F:predictor',1)
  timei  = t
  hdtsph = 0.5*dtsph
  nloop_rs = npart
@@ -268,6 +269,8 @@ subroutine step(npart,nactive,t,dtsph,dtextforce,dtnew)
 ! substepping with external and sink particle forces, using dtextforce
 ! accretion onto sinks/potentials also happens during substepping
 !----------------------------------------------------------------------
+ call rs_mark('F:predictor',-1)
+ call rs_mark('F:substep',1)
  call get_timings(t1,tcpu1)
  if (gr) then
     call cons2primall(npart,xyzh,metrics,pxyzu,vxyzu,dens,eos_vars)
@@ -296,6 +299,8 @@ subroutine step(npart,nactive,t,dtsph,dtextforce,dtnew)
  endif
  call get_timings(t2,tcpu2)
  call increment_timer(itimer_substep,t2-t1,tcpu2-tcpu1)
+ call rs_mark('F:substep',-1)
+ call rs_mark('F:predict_sph',1)
 
  timei = timei + dtsph
  nvfloorps  = 0
@@ -423,6 +428,8 @@ subroutine step(npart,nactive,t,dtsph,dtextforce,dtnew)
  if ((iexternalforce /= 0 .or. nptmass > 0) .and. id==master .and. iverbose >= 2) &
    write(iprint,"(a,f14.6,/)") '> full step            : t=',timei
 
+ call rs_mark('F:predict_sph',-1)
+ call rs_mark('F:derivs',1)
  if (npart > 0) then
     if (gr) vpred = vxyzu ! Need primitive utherm as a guess in cons2prim
     dt_too_small = .false.
@@ -445,6 +452,8 @@ subroutine step(npart,nactive,t,dtsph,dtextforce,dtnew)
     endif
     if (gpu_mirror) call rs_after_derivs(npart)
  endif
+ call rs_mark('F:derivs',-1)
+ call rs_mark('F:corrector',1)
 
 !
 ! determine what dt will be used on the next loop
@@ -739,6 +748,8 @@ subroutine step(npart,nactive,t,dtsph,dtextforce,dtnew)
     endif
  enddo iterations
  if (gpu_mirror) call rs_after_corrector(npart,timei,ibin_dts,maxbins,ithdt,ittwas,nbinmax,ufloor,icooling)
+ call rs_mark('F:corrector',-1)
+ call rs_mark('F:step_tail',1)
 
  !
  ! 2nd ptmass kick (no need to predict vel ptmass as they are not coupled to any vel dep force)
@@ -770,6 +781,8 @@ subroutine step(npart,nactive,t,dtsph,dtextforce,dtnew)
  endif
 
  if (gr) call cons2primall(npart,xyzh,metrics,pxyzu,vxyzu,dens,eos_vars)
+
+ call rs_mark('F:step_tail',-1)
 
 end subroutine step
 

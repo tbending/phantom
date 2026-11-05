@@ -105,6 +105,7 @@ end subroutine evol_init
 !----------------------------------------------------------------
 subroutine evol(infile,logfile,evfile,dumpfile,flag)
  use dim,              only:do_radiation,use_dustgrowth_coala
+ use gpu_resident,     only:rs_mark
  use io_control,       only:at_simulation_end
  use part,             only:npart,xyzh,fxyzu,vxyzu,rad,radprop,rho
  use part,             only:grainsize,dustevol,deltav,eos_vars,fext,dustfrac
@@ -133,7 +134,9 @@ subroutine evol(infile,logfile,evfile,dumpfile,flag)
  !
  timestepping: do while (.not. at_simulation_end(time,nsteps,rhomaxnow))
 
+    call rs_mark('F:prestep',1)
     call evol_prestep(time,dtmax,dt,t1,tcpu1,nactive,present(flag))
+    call rs_mark('F:prestep',-1)
     !
     ! Strang splitting: implicit update for half step
     !
@@ -142,7 +145,9 @@ subroutine evol(infile,logfile,evfile,dumpfile,flag)
     !--evolve data for one timestep
     !  for individual timesteps this is the shortest timestep
     !
+    call rs_mark('F:step',1)
     call step(npart,nactive,time,dt,dtextforce,dtnew)
+    call rs_mark('F:step',-1)
     if (use_gpu_dens) call gpu_xfer_report()
     !
     ! Strang splitting: implicit update for another half step
@@ -152,8 +157,10 @@ subroutine evol(infile,logfile,evfile,dumpfile,flag)
     if (use_dustgrowth_coala) call get_growth_rate_coala(npart,xyzh,vxyzu,rho,fxyzu,fext,&
                                grainsize,dustfrac,dustevol,deltav,dt,eos_vars)
 
+    call rs_mark('F:poststep',1)
     call evol_poststep(infile,logfile,evfile,dumpfile,&
                        time,t1,tcpu1,dt,dtmax,nactive,abortrun)
+    call rs_mark('F:poststep',-1)
     if (abortrun) exit
 
  enddo timestepping
@@ -182,7 +189,7 @@ subroutine evol_prestep(time,dtmax,dt,t1,tcpu1,nactive,inject_flag_present)
  use ptmass,       only:icreate_sinks,ipart_createstars
  use timestep,     only:dtextforce,dtinject,rhomaxnow
  use timestep_ind, only:istepfrac,nbinmax,set_active_particles,write_binsummary,nactivetot,maxbins
- use gpu_resident,     only:rs_start_step
+ use gpu_resident,     only:rs_start_step,rs_mark
  use gpu_arrays,       only:resident_mode
  use timing,       only:get_timings,timers,itimer_lastdump
  real,         intent(in)    :: time
@@ -192,6 +199,7 @@ subroutine evol_prestep(time,dtmax,dt,t1,tcpu1,nactive,inject_flag_present)
  logical,      intent(in)    :: inject_flag_present
  real(kind=4) :: twallperdump
  integer :: npart_old,nalive,istepHII
+ character(len=40) :: actmark
  !
  ! injection of new particles into simulation
  !
@@ -230,7 +238,11 @@ subroutine evol_prestep(time,dtmax,dt,t1,tcpu1,nactive,inject_flag_present)
     !  (COSMO_RESIDENT: by the device, whose counts rs_start_step returns)
     if (.not.resident_mode) call set_active_particles(npart,nactive,nalive,nactivetot,nalivetot,iphase,ibin,xyzh)
     !--GPU individual timesteps: the device's twin (COSMO_MIRROR, COSMO_RESIDENT)
+    call rs_mark('F:pre_start_step',1)
     call rs_start_step(npart,istepfrac,nbinmax,nactive,nalive,nactivetot,nalivetot)
+    call rs_mark('F:pre_start_step',-1)
+    write(actmark,'(a,i0)') 'nact=',nactivetot   ! a point mark for rocprofv3 (COSMO_ROCTX)
+    call rs_mark(trim(actmark),0)
     nskip = int(nactivetot)
 
     !--print summary of timestep bins
@@ -246,7 +258,9 @@ subroutine evol_prestep(time,dtmax,dt,t1,tcpu1,nactive,inject_flag_present)
     nactive = npart
  endif
 
+ call rs_mark('F:pre_sinks',1)
  if (gravity .and. icreate_sinks > 0) call ptmass_create_and_update_forces(time,dtextforce)
+ call rs_mark('F:pre_sinks',-1)
 
  if (iH2R > 0) then
     istepHII = 1
@@ -285,7 +299,7 @@ subroutine evol_poststep(infile,logfile,evfile,dumpfile,time,t1,tcpu1,dt,dtmax,n
  use timestep,        only:nsteps,rhomaxnow,use_divb_proj,divb_tol,divb_maxit
  use timestep_ind,    only:istepfrac
  use divb_projection, only:project_divb
- use gpu_resident,    only:rs_download_all
+ use gpu_resident,    only:rs_download_all,rs_mark
  use gpu_arrays,      only:resident_mode
  use io,              only:iverbose
  character(len=*), intent(in)    :: infile
@@ -302,19 +316,25 @@ subroutine evol_poststep(infile,logfile,evfile,dumpfile,time,t1,tcpu1,dt,dtmax,n
  abortrun =.false.
 
  !--timings for step call
+ call rs_mark('F:post_timers',1)
  call get_timings(t2,tcpu2)
  call increment_timer(itimer_step,t2-t1,tcpu2-tcpu1)
  call summary_counter(iosum_nreal,t2-t1)
+ call rs_mark('F:post_timers',-1)
  !
  !--update time = time + dt, update step counters, and get the dt for the next timestep
  !
+ call rs_mark('F:post_time',1)
  call update_time_and_dt(nsteps,time,dtmax,dtmaxold,rhomaxnow,tlast,tcheck,tprint,dt,tall,t2-t1,tcpu2-tcpu1,&
                          istepfrac,nbinmaxprev,ntot,nalivetot,nmovedtot,at_dump_time)
+ call rs_mark('F:post_time',-1)
  !
  !--Update timer from last dump to see if dtmax needs to be reduced
  !
+ call rs_mark('F:post_timers',1)
  call get_timings(t2,tcpu2)
  call increment_timer(itimer_lastdump,t2-t1,tcpu2-tcpu1)
+ call rs_mark('F:post_timers',-1)
  !
  !--div B projection to zero, once per dtmax
  !
@@ -330,11 +350,13 @@ subroutine evol_poststep(infile,logfile,evfile,dumpfile,time,t1,tcpu1,dt,dtmax,n
  !
  !  (COSMO_RESIDENT: the host's particle arrays are refreshed from the device first,
  !  under write_ev_files' own condition, which also covers the dumps)
+ call rs_mark('F:post_ev',1)
  if (resident_mode) then
     if (nskipped + nskip >= int(1.99*ntot,kind=8) .or. at_dump_time .or. iverbose == 5) &
        call rs_download_all(npart)
  endif
  call write_ev_files(ntot,time,dt,nskip,nskipped,nskipped_sink,at_dump_time)
+ call rs_mark('F:post_ev',-1)
  !
  !--write to data file if time is right
  !
@@ -382,12 +404,18 @@ subroutine evol_poststep(infile,logfile,evfile,dumpfile,time,t1,tcpu1,dt,dtmax,n
 
  if (driving .and. correct_bulk_motion) call correct_bulk_motions()
 
+ call rs_mark('F:post_flush',1)
  call flush(iprint)
+ call rs_mark('F:post_flush',-1)
  !--Write out log file prematurely (if requested based upon nstep, walltime)
+ call rs_mark('F:post_summary',1)
  if ( summary_printnow() ) call summary_printout(iprint,nptmass)
+ call rs_mark('F:post_summary',-1)
 
  !--???
+ call rs_mark('F:post_egg',1)
  inquire(file='egg.txt',exist=iexist)
+ call rs_mark('F:post_egg',-1)
  if (iexist .and. .not.egged) then
     call bring_the_egg
     egged = .true.

@@ -46,6 +46,7 @@ module gpu_resident
  public :: rs_after_force,rs_download_all
  public :: rs_after_kick,rs_after_subdrift,rs_after_get_force,rs_after_accretion,rs_before_gas_loop
  public :: rs_prime,rs_put_alpha1,rs_resync
+ public :: rs_mark
 
  private
 
@@ -206,6 +207,32 @@ module gpu_resident
 #endif
 
 contains
+
+!-----------------------------------------------------------------------
+!+
+!  A named mark on the host timeline (cosmo_trace_mark, phase_timer.cu):
+!  sign 1 opens the stretch, -1 closes it, 0 is a point.  Only does
+!  anything under COSMO_TRACE (synchronising) or COSMO_ROCTX (roctx
+!  ranges for rocprofv3 --marker-trace, no synchronisation).
+!+
+!-----------------------------------------------------------------------
+subroutine rs_mark(name,sign)
+#ifdef GPU
+ use iso_c_binding, only:c_char,c_null_char
+#endif
+ character(len=*), intent(in) :: name
+ integer,          intent(in) :: sign
+#ifdef GPU
+ interface
+  subroutine cosmo_trace_mark(nm,sg) bind(C)
+   import c_char,c_int
+   character(kind=c_char), intent(in) :: nm(*)
+   integer(c_int), value :: sg
+  end subroutine cosmo_trace_mark
+ end interface
+ call cosmo_trace_mark(trim(name)//c_null_char,int(sign,c_int))
+#endif
+end subroutine rs_mark
 
 !-----------------------------------------------------------------------
 !+
@@ -514,7 +541,9 @@ subroutine rs_start_step(npart,istepfrac,nbinmax,nactive,nalive,nactivetot,naliv
     !--the totals over every rank, as set_active_particles does: evolve decides from them when
     !  to write the .ev file (collective), and rank-local counts let the ranks disagree and
     !  deadlock (1M disc, P = 2: one rank in compute_energies, the other in the next substep)
+    call rs_mark('F:count_allreduce',1)
     nactivetot = reduceall_mpi('+',ncount); nalivetot = reduceall_mpi('+',int(nalive_dev))
+    call rs_mark('F:count_allreduce',-1)
     ibinnow = nbinmax
     i = 0
     do while (ibinnow == nbinmax .and. i < nbinmax)

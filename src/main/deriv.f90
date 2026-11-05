@@ -47,7 +47,7 @@ subroutine derivs(icall,npart,nactive,xyzh,vxyzu,fxyzu,fext,divcurlv,divcurlB,&
  use gpu_dens_iface,  only:gpu_dens_mirror,gpu_dens_mirror_before,gpu_dens_mirror_after
  use gpu_force_iface, only:force_gpu,gpu_force_mirror_before,gpu_force_mirror_after
  use gpu_dens_iface,  only:gpu_force_mirror
- use gpu_resident,    only:rs_after_cons2prim,rs_after_force
+ use gpu_resident,    only:rs_after_cons2prim,rs_after_force,rs_mark
  use gpu_arrays,      only:resident_mode
  use ptmass,         only:ipart_rhomax,ptmass_calc_enclosed_mass,ptmass_boundary_crossing,get_pressure_on_sinks
  use externalforces, only:externalforce
@@ -145,7 +145,9 @@ subroutine derivs(icall,npart,nactive,xyzh,vxyzu,fxyzu,fext,divcurlv,divcurlB,&
     if (use_gpu_dens) then
        !--GPU path: cosmoSPHere solves h, gradh(1,i)=1/omega, divv, the xi limiter
        !  and ddivvdt in one pass, so no CPU sweep over the kd-tree is needed here
+       call rs_mark('F:density',1)
        call densityiterate_gpu(npart,xyzh,vxyzu,fxyzu,fext,gradh,divcurlv,alphaind)
+       call rs_mark('F:density',-1)
     else
        !--CPU path: original phantom behaviour, unchanged
        !  (DEV HATCH, Phase 1.1: COSMO_DENS_MIRROR runs the GPU solve alongside)
@@ -183,7 +185,9 @@ subroutine derivs(icall,npart,nactive,xyzh,vxyzu,fxyzu,fext,divcurlv,divcurlB,&
        call cons2prim_everything(npart,xyzh,vxyzu,dvdx,rad,eos_vars,radprop,Bevol,Bxyz,dustevol,dustfrac,alphaind,&
                                  xi_limiter_in=xi_gpu)
     !--GPU individual timesteps, Phase 2/3: the device's twins (COSMO_MIRROR)
+    call rs_mark('F:cons2prim',1)
     call rs_after_cons2prim(npart)
+    call rs_mark('F:cons2prim',-1)
  else
     call cons2prim_everything(npart,xyzh,vxyzu,dvdx,rad,eos_vars,radprop,Bevol,Bxyz,dustevol,dustfrac,alphaind)
  endif
@@ -216,10 +220,14 @@ subroutine derivs(icall,npart,nactive,xyzh,vxyzu,fxyzu,fext,divcurlv,divcurlB,&
  !  on use_gpu_dens because it consumes the octree and hmax that densityiterate_gpu
  !  leaves behind; it becomes its own switch in due course.
  if (use_gpu_dens) then
+    call rs_mark('F:force',1)
     call force_gpu(npart,xyzh,vxyzu,eos_vars,alphaind,fxyzu,divcurlv,dt)
+    call rs_mark('F:force',-1)
     !--GPU individual timesteps: the force writeback and new-bins twins (sets nbinmax
     !  under COSMO_RESIDENT, read just below)
+    call rs_mark('F:after_force',1)
     call rs_after_force(npart)
+    call rs_mark('F:after_force',-1)
  else
     !--(DEV HATCH, Phase 1.2: COSMO_FORCE_MIRROR runs the GPU force alongside)
     if (gpu_force_mirror .and. icall==1) &
