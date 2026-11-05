@@ -46,7 +46,7 @@ module gpu_resident
  public :: rs_after_force,rs_download_all
  public :: rs_after_kick,rs_after_subdrift,rs_after_get_force,rs_after_accretion,rs_before_gas_loop
  public :: rs_prime,rs_put_alpha1,rs_resync
- public :: rs_mark
+ public :: rs_mark,rs_lean
 
  private
 
@@ -207,6 +207,27 @@ module gpu_resident
 #endif
 
 contains
+
+!-----------------------------------------------------------------------
+!+
+!  COSMO_LEAN_STEP=1: the per-substep housekeeping that is not needed
+!  every substep (the time-consistency allreduce, flush of the log, the
+!  egg.txt inquire) runs only every nlean substeps and at the end of each
+!  dtmax step; the two count allreduces of rs_start_step become one.
+!  Read once; the same on every rank (it decides collectives).
+!+
+!-----------------------------------------------------------------------
+logical function rs_lean()
+ logical, save :: done = .false., lean = .false.
+ character(len=8) :: v
+ integer :: l
+ if (.not.done) then
+    call get_environment_variable('COSMO_LEAN_STEP',v,length=l)
+    lean = (l > 0 .and. v(1:1) /= '0')
+    done = .true.
+ endif
+ rs_lean = lean
+end function rs_lean
 
 !-----------------------------------------------------------------------
 !+
@@ -500,7 +521,7 @@ subroutine rs_start_step(npart,istepfrac,nbinmax,nactive,nalive,nactivetot,naliv
 #ifdef GPU
  use part,         only:all_active
 #endif
- use mpiutils,     only:reduceall_mpi
+ use mpiutils,     only:reduceall_mpi,reduce_in_place_mpi
  integer,         intent(in)    :: npart,istepfrac
  integer(kind=1), intent(in)    :: nbinmax
  integer,         intent(inout) :: nactive,nalive
@@ -508,6 +529,7 @@ subroutine rs_start_step(npart,istepfrac,nbinmax,nactive,nalive,nactivetot,naliv
 #ifdef GPU
  integer :: ncount,i
  integer(c_int) :: nalive_dev
+ real(kind=8) :: cnt2(2)
 #endif
 
  call rs_init_switch()
@@ -542,7 +564,14 @@ subroutine rs_start_step(npart,istepfrac,nbinmax,nactive,nalive,nactivetot,naliv
     !  to write the .ev file (collective), and rank-local counts let the ranks disagree and
     !  deadlock (1M disc, P = 2: one rank in compute_energies, the other in the next substep)
     call rs_mark('F:count_allreduce',1)
-    nactivetot = reduceall_mpi('+',ncount); nalivetot = reduceall_mpi('+',int(nalive_dev))
+    if (rs_lean()) then
+       !--both totals in one collective (exact in a double up to 2^53)
+       cnt2(1) = real(ncount,kind=8); cnt2(2) = real(nalive_dev,kind=8)
+       call reduce_in_place_mpi('+',cnt2,2)
+       nactivetot = nint(cnt2(1),kind=8); nalivetot = nint(cnt2(2),kind=8)
+    else
+       nactivetot = reduceall_mpi('+',ncount); nalivetot = reduceall_mpi('+',int(nalive_dev))
+    endif
     call rs_mark('F:count_allreduce',-1)
     ibinnow = nbinmax
     i = 0

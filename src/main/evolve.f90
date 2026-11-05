@@ -299,7 +299,7 @@ subroutine evol_poststep(infile,logfile,evfile,dumpfile,time,t1,tcpu1,dt,dtmax,n
  use timestep,        only:nsteps,rhomaxnow,use_divb_proj,divb_tol,divb_maxit
  use timestep_ind,    only:istepfrac
  use divb_projection, only:project_divb
- use gpu_resident,    only:rs_download_all,rs_mark
+ use gpu_resident,    only:rs_download_all,rs_mark,rs_lean
  use gpu_arrays,      only:resident_mode
  use io,              only:iverbose
  character(len=*), intent(in)    :: infile
@@ -404,23 +404,28 @@ subroutine evol_poststep(infile,logfile,evfile,dumpfile,time,t1,tcpu1,dt,dtmax,n
 
  if (driving .and. correct_bulk_motion) call correct_bulk_motions()
 
- call rs_mark('F:post_flush',1)
- call flush(iprint)
- call rs_mark('F:post_flush',-1)
+ !--(COSMO_LEAN_STEP: the flush and the egg.txt inquire every 256 substeps and at dumps only)
+ if (.not.rs_lean() .or. at_dump_time .or. mod(nsteps,256) == 0) then
+    call rs_mark('F:post_flush',1)
+    call flush(iprint)
+    call rs_mark('F:post_flush',-1)
+ endif
  !--Write out log file prematurely (if requested based upon nstep, walltime)
  call rs_mark('F:post_summary',1)
  if ( summary_printnow() ) call summary_printout(iprint,nptmass)
  call rs_mark('F:post_summary',-1)
 
  !--???
- call rs_mark('F:post_egg',1)
- inquire(file='egg.txt',exist=iexist)
- call rs_mark('F:post_egg',-1)
- if (iexist .and. .not.egged) then
-    call bring_the_egg
-    egged = .true.
+ if (.not.rs_lean() .or. at_dump_time .or. mod(nsteps,256) == 0) then
+    call rs_mark('F:post_egg',1)
+    inquire(file='egg.txt',exist=iexist)
+    call rs_mark('F:post_egg',-1)
+    if (iexist .and. .not.egged) then
+       call bring_the_egg
+       egged = .true.
+    endif
+    if (.not.iexist) egged = .false.
  endif
- if (.not.iexist) egged = .false.
 
 end subroutine evol_poststep
 

@@ -44,7 +44,7 @@ subroutine update_time_and_dt(nsteps,time,dtmax,dtmaxold,rhomaxnow,tlast,tcheck,
  use io_control,    only:at_simulation_end
  use dynamic_dtmax, only:dtmax_ifactor
  use mpiutils,      only:bcast_mpi,reduceall_mpi
- use gpu_resident,  only:rs_mark
+ use gpu_resident,  only:rs_lean,rs_mark
  use timestep,      only:dtrad,dtforce,dtinject,dtcourant,dterr,print_dtlog,tmax
  use timestep_ind,  only:print_dtind_efficiency,update_time_per_bin,print_dtlog_ind,change_nbinmax,&
                          nactivetot,nbinmax
@@ -107,11 +107,14 @@ subroutine update_time_and_dt(nsteps,time,dtmax,dtmaxold,rhomaxnow,tlast,tcheck,
  endif
 
  !   check that MPI threads are synchronised in time
- call rs_mark('F:time_allreduce',1)
- timecheck = reduceall_mpi('+',time)
- call rs_mark('F:time_allreduce',-1)
- if (abs(timecheck/nprocs - time) > 1.e-13) then
-    call fatal('evolve','time differs between MPI threads',var='time',val=timecheck/nprocs)
+ !  (COSMO_LEAN_STEP: every 256 substeps and at the end of each dtmax step only)
+ if (.not.rs_lean() .or. .not.ind_timesteps .or. mod(nsteps,256) == 0 .or. istepfrac >= 2**nbinmax) then
+    call rs_mark('F:time_allreduce',1)
+    timecheck = reduceall_mpi('+',time)
+    call rs_mark('F:time_allreduce',-1)
+    if (abs(timecheck/nprocs - time) > 1.e-13) then
+       call fatal('evolve','time differs between MPI threads',var='time',val=timecheck/nprocs)
+    endif
  endif
 !
 !--Determine if this is the correct time to write to the data file, because:
