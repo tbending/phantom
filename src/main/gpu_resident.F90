@@ -73,6 +73,7 @@ module gpu_resident
  integer(kind=8), save :: nbad(nchecks) = 0, nbadtot(nchecks) = 0
 #ifdef GPU
  integer, save :: nsync = 0 ! device Domain syncs so far (MPI)
+ real,    save :: tsync_tot = 0. ! and the seconds they took, this rank
 #endif
  logical, save :: priming = .false.  ! rs_prime sent the state; the first step's bookkeeping is still to come
  !--MPI: a full Domain sync only when the coarsest active bin is within sync_levels of the
@@ -99,7 +100,6 @@ module gpu_resident
    integer(c_int), value :: sub
   end subroutine cosmo_dom_check_halos
  end interface
- real,    save :: tsync_tot = 0. ! and the seconds they took, this rank
 #endif
  integer, save :: nrun(nchecks) = 0   ! comparisons made this step, per check
  integer, save :: nstep = 0
@@ -892,10 +892,10 @@ subroutine rs_after_force(npart)
   subroutine cosmo_dom_reverse_wake() bind(C)
   end subroutine cosmo_dom_reverse_wake
  end interface
+#endif
 #ifdef GPU
  integer :: nbm
  logical :: force_twin,limit_u
-#endif
 #endif
  if (.not.gpu_mirror .or. npart <= 0 .or. .not.started) return
 #ifdef GPU
