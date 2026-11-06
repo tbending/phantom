@@ -78,9 +78,9 @@ module gpu_resident
 #endif
  logical, save :: priming = .false.  ! rs_prime sent the state; the first step's bookkeeping is still to come
  !--MPI: a full Domain sync only when the coarsest active bin is within sync_levels of the
- !  finest (COSMO_SYNC_LEVELS, default 4: at most every 16 substeps), or the guard fires
+ !  finest (COSMO_SYNC_LEVELS, default 5: at most every 32 substeps), or the guard fires
 #ifdef GPU
- integer, save :: sync_levels = 4
+ integer, save :: sync_levels = 5
 #endif
 #if defined(MPI) && defined(GPU)
  real(kind=8), save :: wall_syncstep = 0.d0   ! host wall in the sync decision + syncs (COSMO_DOMTIME)
