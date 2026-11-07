@@ -425,7 +425,11 @@ logical function dump_parallel_ok(dumpfile,hdrbytes) result(ok)
  hdrbytes = 0_8
  ok = mpi .and. nprocs > 1 .and. &
       (index(compiler_version(),'GCC') > 0 .or. index(compiler_version(),'Intel') > 0)
- dump_path = 'tasks in turn (one task, or a compiler without known record markers)'
+ if (.not.mpi .or. nprocs <= 1) then
+    dump_path = 'tasks in turn (one task)'
+ else
+    dump_path = 'tasks in turn (compiler without known record markers)'
+ endif
  call get_environment_variable('PHANTOM_DUMP_PARALLEL',val)
  if (ok .and. scan(val(1:1),'nN0fF') > 0) dump_path = 'tasks in turn (PHANTOM_DUMP_PARALLEL=no)'
  if (ok .and. dump_parallel_failed) dump_path = 'tasks in turn (a parallel write failed earlier)'
