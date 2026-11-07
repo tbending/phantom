@@ -30,6 +30,7 @@ module readwrite_dumps
  logical, public :: opened_full_dump
  ! set when a parallel write of a full dump fails: the tasks then take turns, for the rest of the run
  logical :: dump_parallel_failed = .false.
+ character(len=80) :: dump_path = ''   ! how the last full dump was written, and why
  logical, public :: dt_read_in
 
  integer, parameter :: maxphead = 256         ! max items in header
@@ -197,6 +198,7 @@ recursive subroutine write_fulldump(t,dumpfile,ntotal,iorder,sphNG)
  !  offset, or one task after another, each appending to the file
  !
  parallel_write = dump_parallel_ok(dumpfile,hdrbytes)
+ if (id==master) write(iprint,'(a)') ' write_fulldump: '//trim(dump_path)
  if (.not.parallel_write) call start_threadwrite(id,idump,dumpfile)
 
  nerr = 0
@@ -423,7 +425,10 @@ logical function dump_parallel_ok(dumpfile,hdrbytes) result(ok)
  hdrbytes = 0_8
  ok = mpi .and. nprocs > 1 .and. &
       (index(compiler_version(),'GCC') > 0 .or. index(compiler_version(),'Intel') > 0)
+ dump_path = 'tasks in turn (one task, or a compiler without known record markers)'
  call get_environment_variable('PHANTOM_DUMP_PARALLEL',val)
+ if (ok .and. scan(val(1:1),'nN0fF') > 0) dump_path = 'tasks in turn (PHANTOM_DUMP_PARALLEL=no)'
+ if (ok .and. dump_parallel_failed) dump_path = 'tasks in turn (a parallel write failed earlier)'
  if (scan(val(1:1),'nN0fF') > 0 .or. dump_parallel_failed) ok = .false.
  if (.not.ok) return
  if (id==master) then
@@ -441,9 +446,17 @@ logical function dump_parallel_ok(dumpfile,hdrbytes) result(ok)
  endif
  call bcast_mpi(ok)
  call bcast_mpi(hdrbytes)
+ dump_path = 'tasks in turn (header record markers not as expected)'
  if (ok) then
     call mpiio_open(dumpfile,ierrmpi,direct)
     ok = (reduceall_mpi('max',merge(1,0,ierrmpi /= 0 .or. .not.direct)) == 0)
+    if (reduceall_mpi('max',merge(1,0,ierrmpi /= 0)) > 0) then
+       dump_path = 'tasks in turn (MPI_File_open failed)'
+    elseif (.not.ok) then
+       dump_path = 'tasks in turn (MPI-IO reports no direct I/O on Lustre)'
+    else
+       dump_path = 'all tasks at once (MPI-IO, direct I/O on Lustre)'
+    endif
     if (.not.ok .and. ierrmpi == 0) call mpiio_close(ierr)
  endif
  if (.not.ok .and. id==master) then
